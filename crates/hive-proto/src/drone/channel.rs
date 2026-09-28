@@ -113,8 +113,16 @@ impl Channel {
         self.shared.closed.load(Ordering::Acquire)
     }
 
-    /// Opens a stream calling `method` with `request`.
+    /// Opens a stream calling `method` with `request`. The request must fit in one frame with
+    /// the method name. Anything bigger goes as data on the stream.
     pub async fn open(&self, method: &str, request: Bytes) -> Result<Stream, Error> {
+        let open = Open { method: method.to_string(), request };
+        if open.encoded_len() > MAX_PAYLOAD {
+            return Err(Error::new(
+                Reason::InvalidArgument,
+                format!("a request of {} bytes does not fit in one frame", open.encoded_len()),
+            ));
+        }
         let (id, stream) = {
             let mut streams = self.shared.table();
             if self.is_closed() {
@@ -129,7 +137,6 @@ impl Channel {
             }
             (id, register(&self.shared, &mut streams, id))
         };
-        let open = Open { method: method.to_string(), request };
         send(&self.shared, Frame::new(id, Kind::Open, open.encode_to_vec())).await?;
         Ok(stream)
     }

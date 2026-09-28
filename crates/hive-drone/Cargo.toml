@@ -15,3 +15,17 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+hive-proto.workspace = true
+hive-rt.workspace = true
+hive-types.workspace = true
+prost.workspace = true
+rustix = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { workspace = true, features = ["codec"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }

@@ -3,7 +3,11 @@
 //! Both ends hold a 32 byte secret that the workload cannot read. On first boot it is the nonce
 //! the node agent handed the guest agent out of band. After a successful handshake both ends
 //! derive a new secret from the old one and the transcript, and a reconnect after a node agent
-//! restart uses that. The exchange is three messages on stream 0:
+//! restart uses that. The guest moves to the new secret as soon as it sends its proof, but the
+//! node only moves once the proof arrives, so a connection that drops in between leaves them one
+//! secret apart. The guest therefore keeps its previous secret too and offers both to [`guest`],
+//! which accepts whichever one the node's MAC was made with. The exchange is three messages on
+//! stream 0:
 //!
 //! 1. The guest sends `Hello` with its versions, its capabilities and a fresh random nonce.
 //! 2. The node sends `Welcome` with the chosen version, its own nonce and a MAC over both.
@@ -42,10 +46,13 @@ pub struct Established {
     pub clock_unix_nanos: u64,
     /// The secret for the next handshake on this cell.
     pub next_secret: Secret,
+    /// Which of the secrets offered to [`guest`] the node used. Always 0 on the node side.
+    pub used: usize,
 }
 
-/// Runs the guest side of the handshake.
-pub async fn guest<S>(io: &mut S, secret: &Secret, hello: Hello) -> io::Result<Established>
+/// Runs the guest side of the handshake. `secrets` are the ones the node might be using, most
+/// likely first.
+pub async fn guest<S>(io: &mut S, secrets: &[Secret], hello: Hello) -> io::Result<Established>
 where
     S: futures::Sink<Frame, Error = io::Error> + futures::Stream<Item = io::Result<Frame>> + Unpin,
 {
@@ -54,10 +61,15 @@ where
     let frame = next(io, Kind::Welcome).await?;
     let welcome = Welcome::decode(frame.payload).map_err(bad)?;
     let unsigned = Welcome { mac: Vec::new(), ..welcome.clone() }.encode_to_vec();
-    let expect = mac(secret, NODE_LABEL, &hello_bytes, &unsigned);
-    if welcome.mac.len() != 32 || blake3::Hash::from_bytes(expect) != to_hash(&welcome.mac) {
-        return Err(denied("the node's proof does not match the secret"));
+    if welcome.mac.len() != 32 {
+        return Err(denied("the node's proof is not 32 bytes"));
     }
+    let got = to_hash(&welcome.mac);
+    let used = secrets
+        .iter()
+        .position(|s| blake3::Hash::from_bytes(mac(s, NODE_LABEL, &hello_bytes, &unsigned)) == got)
+        .ok_or_else(|| denied("the node's proof does not match the secret"))?;
+    let secret = &secrets[used];
     if !hello.versions.contains(&welcome.chosen) {
         return Err(bad(format!(
             "the node chose version {}, which was not offered",
@@ -72,6 +84,7 @@ where
         build: hello.build,
         clock_unix_nanos: welcome.clock_unix_nanos,
         next_secret: next_secret(secret, &hello_bytes, &unsigned),
+        used,
     })
 }
 
@@ -121,6 +134,7 @@ where
         build: hello.build,
         clock_unix_nanos,
         next_secret: next_secret(secret, &hello_bytes, &unsigned),
+        used: 0,
     })
 }
 
@@ -197,7 +211,7 @@ mod tests {
         let (a, b) = tokio::io::duplex(1 << 16);
         // Each side owns its end, so a side that gives up hangs up and the other one sees it.
         tokio::join!(
-            async move { guest(&mut Framed::new(a, FrameCodec), &guest_secret, hello()).await },
+            async move { guest(&mut Framed::new(a, FrameCodec), &[guest_secret], hello()).await },
             async move {
                 let mut io = Framed::new(b, FrameCodec);
                 node(&mut io, &node_secret, &["pty", "envd-compat"], 42, [1; 32]).await
@@ -210,6 +224,7 @@ mod tests {
         let (g, n) = run([7; 32], [7; 32]).await;
         let (g, n) = (g.unwrap(), n.unwrap());
         assert_eq!(g, n);
+        assert_eq!(g.used, 0);
         assert_eq!(g.version, 1);
         assert_eq!(g.caps, ["pty"]);
         assert_eq!(g.clock_unix_nanos, 42);
@@ -222,6 +237,18 @@ mod tests {
         assert_eq!(g.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         // The guest hangs up without a proof, so the node sees the connection end.
         assert!(n.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_guest_falls_back_to_its_previous_secret() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (g, n) = tokio::join!(
+            async move { guest(&mut Framed::new(a, FrameCodec), &[[9; 32], [7; 32]], hello()).await },
+            async move { node(&mut Framed::new(b, FrameCodec), &[7; 32], &[], 0, [1; 32]).await },
+        );
+        let (g, n) = (g.unwrap(), n.unwrap());
+        assert_eq!(g.used, 1);
+        assert_eq!(g.next_secret, n.next_secret);
     }
 
     #[tokio::test]
