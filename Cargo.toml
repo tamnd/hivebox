@@ -62,6 +62,7 @@ prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.53", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
