@@ -3,6 +3,7 @@
 //! ```text
 //! hive-drone --listen unix:/run/hive/drone.sock --secret-stdin [--shell /bin/sh]
 //!            [--session-shell /bin/bash] [--workdir /] [--uid N] [--gid N]
+//!            [--root PATH]...
 //! ```
 //!
 //! The first secret is read from stdin as 32 raw bytes, so it never shows up in the process list
@@ -14,7 +15,7 @@ use hive_drone::{Config, Drone};
 use std::io::Read;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: hive-drone --listen unix:PATH --secret-stdin [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N]";
+const USAGE: &str = "usage: hive-drone --listen unix:PATH --secret-stdin [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
 
 struct Args {
     listen: String,
@@ -25,6 +26,7 @@ fn parse() -> Result<Args, String> {
     let mut listen = None;
     let mut secret_stdin = false;
     let mut cfg = Config::default();
+    let mut roots = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -36,8 +38,18 @@ fn parse() -> Result<Args, String> {
             "--workdir" => cfg.workdir = value("--workdir")?.into(),
             "--uid" => cfg.uid = Some(value("--uid")?.parse().map_err(|e| format!("--uid: {e}"))?),
             "--gid" => cfg.gid = Some(value("--gid")?.parse().map_err(|e| format!("--gid: {e}"))?),
+            "--root" => {
+                let root: std::path::PathBuf = value("--root")?.into();
+                if !root.is_absolute() {
+                    return Err(format!("--root {} is not an absolute path", root.display()));
+                }
+                roots.push(root);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if !roots.is_empty() {
+        cfg.roots = roots;
     }
     if !secret_stdin {
         return Err("--secret-stdin is required".into());

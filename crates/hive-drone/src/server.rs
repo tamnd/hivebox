@@ -1,7 +1,8 @@
 use crate::session::Sessions;
-use crate::{Config, health, process};
+use crate::{Config, fs, health, process};
 use hive_proto::drone::api::{
-    self, Command, RunRequest, SessionCreate, SessionRef, SessionRun, SessionSend,
+    self, Command, FsChmod, FsList, FsMkdir, FsPath, FsRead, FsRename, FsWrite, RunRequest,
+    SessionCreate, SessionRef, SessionRun, SessionSend,
 };
 use hive_proto::drone::handshake::{self, Secret, VERSION};
 use hive_proto::drone::msg::{Hello, Status};
@@ -133,6 +134,49 @@ impl Drone {
             },
             api::SESSION_CLOSE => match SessionRef::decode(open.request) {
                 Ok(r) => self.sessions.close(&r.id).map(|()| Vec::new()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_READ => {
+                let done = match FsRead::decode(open.request) {
+                    Ok(req) => fs::read(&self.cfg, req, &mut stream).await,
+                    Err(e) => Err(bad_request(e)),
+                };
+                match done {
+                    Ok(()) => {
+                        if stream.finish().await.is_ok() {
+                            linger(stream).await;
+                        }
+                        return;
+                    }
+                    Err(e) => return stream.reset(Status::from(e)).await,
+                }
+            }
+            api::FS_WRITE => match FsWrite::decode(open.request) {
+                Ok(req) => fs::write(&self.cfg, req, &mut stream).await.map(|i| i.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_STAT => match FsPath::decode(open.request) {
+                Ok(req) => fs::stat(&self.cfg, req).await.map(|i| i.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_LIST => match FsList::decode(open.request) {
+                Ok(req) => fs::list(&self.cfg, req).await.map(|r| r.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_MKDIR => match FsMkdir::decode(open.request) {
+                Ok(req) => fs::mkdir(&self.cfg, req).await.map(|i| i.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_REMOVE => match FsPath::decode(open.request) {
+                Ok(req) => fs::remove(&self.cfg, req).await.map(|()| Vec::new()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_RENAME => match FsRename::decode(open.request) {
+                Ok(req) => fs::rename(&self.cfg, req).await.map(|i| i.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_CHMOD => match FsChmod::decode(open.request) {
+                Ok(req) => fs::chmod(&self.cfg, req).await.map(|i| i.encode_to_vec()),
                 Err(e) => Err(bad_request(e)),
             },
             other => Err(Error::new(Reason::InvalidArgument, format!("no method {other:?}"))),

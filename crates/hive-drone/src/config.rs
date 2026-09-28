@@ -16,6 +16,9 @@ pub struct Config {
     pub uid: Option<u32>,
     /// The group commands run as when they do not say. `None` keeps the drone's.
     pub gid: Option<u32>,
+    /// The directories file operations may reach, as absolute paths. A path resolves inside the
+    /// longest root it starts with, and symlinks and `..` never lead out of it.
+    pub roots: Vec<PathBuf>,
     /// How long a command may run when it does not say.
     pub default_timeout: Duration,
     /// Output kept per stream when a command does not say.
@@ -43,6 +46,7 @@ impl Default for Config {
             ],
             uid: None,
             gid: None,
+            roots: vec!["/".into()],
             default_timeout: Duration::from_secs(600),
             default_output: 1 << 20,
             max_output: 64 << 20,

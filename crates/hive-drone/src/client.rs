@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use hive_proto::drone::api::{
-    self, Command, Health, MAX_CHUNK, RunRequest, RunResult, SessionCreate, SessionInfo,
-    SessionRef, SessionRun, SessionRunResult, SessionSend, SessionSendResult, tag, tagged,
+    self, Command, FileInfo, FsChmod, FsList, FsListResult, FsMkdir, FsPath, FsRead, FsRename,
+    FsWrite, Health, MAX_CHUNK, RunRequest, RunResult, SessionCreate, SessionInfo, SessionRef,
+    SessionRun, SessionRunResult, SessionSend, SessionSendResult, tag, tagged,
 };
 use hive_proto::drone::handshake::{self, Established, Secret};
-use hive_proto::drone::{Channel, FrameCodec, RecvHalf, SendHalf, Side};
+use hive_proto::drone::{Channel, FrameCodec, RecvHalf, SendHalf, Side, Stream};
 use hive_types::{Error, Reason};
 use prost::Message;
 use std::io;
@@ -16,6 +17,12 @@ use tokio_util::codec::Framed;
 const INLINE_STDIN: usize = 32 * 1024;
 // Two streams at the drone's largest output limit, with room for the rest of the message.
 const RESULT_LIMIT: usize = 2 * (64 << 20) + (1 << 20);
+// File content up to this size goes in the open frame of fs.write.
+const INLINE_WRITE: usize = 32 * 1024;
+// One FileInfo, with room for a long path and symlink target.
+const INFO_LIMIT: usize = 64 * 1024;
+// A full listing is 100,000 entries, and each is well under a kilobyte.
+const LIST_LIMIT: usize = 128 << 20;
 
 /// The node agent's end of a drone channel.
 #[derive(Clone, Debug)]
@@ -125,11 +132,113 @@ impl Client {
         A::decode(answer).map_err(bad_answer)
     }
 
+    /// Reads a file, or the part of it `req` asks for, into memory. Fails with `OUTPUT_LIMIT`
+    /// past `limit` bytes. Use [`Client::fs_open`] for files too big to hold.
+    pub async fn fs_read(&self, req: &FsRead, limit: usize) -> Result<Bytes, Error> {
+        self.channel.call(api::FS_READ, req.encode_to_vec().into(), limit).await
+    }
+
+    /// Opens a file for streamed reading.
+    pub async fn fs_open(&self, req: &FsRead) -> Result<FileReader, Error> {
+        let mut stream = self.channel.open(api::FS_READ, req.encode_to_vec().into()).await?;
+        // The node sends nothing on a read, so its side ends right away.
+        stream.finish().await?;
+        Ok(FileReader { stream })
+    }
+
+    /// Writes a file whose content is all in `req.data`.
+    pub async fn fs_write(&self, req: &FsWrite) -> Result<FileInfo, Error> {
+        if req.data.len() <= INLINE_WRITE {
+            return self.unary(api::FS_WRITE, req, INFO_LIMIT).await;
+        }
+        let head = FsWrite { data: Bytes::new(), ..req.clone() };
+        let mut w = self.fs_create(&head).await?;
+        w.write(req.data.clone()).await?;
+        w.finish().await
+    }
+
+    /// Starts writing a file, with `req.data` as its first bytes and the rest to come through
+    /// the [`FileWriter`]. The file only changes once [`FileWriter::finish`] returns, and
+    /// dropping the writer before that leaves it as it was.
+    pub async fn fs_create(&self, req: &FsWrite) -> Result<FileWriter, Error> {
+        let stream = self.channel.open(api::FS_WRITE, req.encode_to_vec().into()).await?;
+        Ok(FileWriter { stream })
+    }
+
+    /// Describes a path.
+    pub async fn fs_stat(&self, req: &FsPath) -> Result<FileInfo, Error> {
+        self.unary(api::FS_STAT, req, INFO_LIMIT).await
+    }
+
+    /// Lists a directory.
+    pub async fn fs_list(&self, req: &FsList) -> Result<FsListResult, Error> {
+        self.unary(api::FS_LIST, req, LIST_LIMIT).await
+    }
+
+    /// Makes a directory.
+    pub async fn fs_mkdir(&self, req: &FsMkdir) -> Result<FileInfo, Error> {
+        self.unary(api::FS_MKDIR, req, INFO_LIMIT).await
+    }
+
+    /// Removes a path.
+    pub async fn fs_remove(&self, req: &FsPath) -> Result<(), Error> {
+        self.channel.call(api::FS_REMOVE, req.encode_to_vec().into(), 0).await.map(|_| ())
+    }
+
+    /// Moves a path.
+    pub async fn fs_rename(&self, req: &FsRename) -> Result<FileInfo, Error> {
+        self.unary(api::FS_RENAME, req, INFO_LIMIT).await
+    }
+
+    /// Changes permission bits.
+    pub async fn fs_chmod(&self, req: &FsChmod) -> Result<FileInfo, Error> {
+        self.unary(api::FS_CHMOD, req, INFO_LIMIT).await
+    }
+
     /// Starts a command with its input and output streamed.
     pub async fn start(&self, cmd: &Command) -> Result<Process, Error> {
         let stream = self.channel.open(api::PROCESS_START, cmd.encode_to_vec().into()).await?;
         let (tx, rx) = stream.split();
         Ok(Process { input: ProcessInput { tx }, output: ProcessOutput { rx, done: false } })
+    }
+}
+
+/// A file being read, from [`Client::fs_open`].
+#[derive(Debug)]
+pub struct FileReader {
+    stream: Stream,
+}
+
+impl FileReader {
+    /// The next part of the file, or `None` at the end.
+    pub async fn next(&mut self) -> Result<Option<Bytes>, Error> {
+        self.stream.recv().await
+    }
+}
+
+/// A file being written, from [`Client::fs_create`].
+#[derive(Debug)]
+pub struct FileWriter {
+    stream: Stream,
+}
+
+impl FileWriter {
+    /// Adds `data` to the file.
+    pub async fn write(&mut self, data: Bytes) -> Result<(), Error> {
+        self.stream.send(data).await
+    }
+
+    /// Ends the file and waits for the drone to put it in place.
+    pub async fn finish(mut self) -> Result<FileInfo, Error> {
+        self.stream.finish().await?;
+        let mut answer = Vec::new();
+        while let Some(chunk) = self.stream.recv().await? {
+            if answer.len() + chunk.len() > INFO_LIMIT {
+                return Err(Error::new(Reason::OutputLimit, "the answer is over the limit"));
+            }
+            answer.extend_from_slice(&chunk);
+        }
+        FileInfo::decode(&answer[..]).map_err(bad_answer)
     }
 }
 
