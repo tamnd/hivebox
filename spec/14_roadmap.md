@@ -1,6 +1,6 @@
 # Roadmap and Milestones
 
-> Build the node first and measure it on real hardware. Then add the control plane, then scale. Each milestone ends with a benchmark report checked into `docs/bench/`. The benchmark harness itself lives in the companion repository tamnd/hivebox-bench.
+> Build the node first and measure it on real hardware. Then add the control plane, then scale. Each milestone ends with a benchmark report, run by the harness in tamnd/hivebox-bench and checked into that repository under `reports/`.
 
 ## M0: Single-node core (weeks 0 to 8)
 
