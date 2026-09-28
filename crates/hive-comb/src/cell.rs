@@ -13,6 +13,7 @@ use hive_drone::Client;
 use hive_types::{Cause, CellId, CellSpec, CellState, Error, IdleAction, Reason};
 use prost::Message;
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -146,6 +147,8 @@ pub(crate) struct Actor {
     pub(crate) reservation: Option<Reservation>,
     record: Record,
     handle: Option<CellHandle>,
+    /// The cell's own cgroup, from the moment it is taken until the cell is over.
+    cgroup: Option<PathBuf>,
 }
 
 impl Actor {
@@ -157,7 +160,7 @@ impl Actor {
         reservation: Option<Reservation>,
         record: Record,
     ) -> Self {
-        Self { inner, cell, driver, rx, reservation, record, handle: None }
+        Self { inner, cell, driver, rx, reservation, record, handle: None, cgroup: None }
     }
 
     pub(crate) async fn run(mut self, start: Start) {
@@ -268,7 +271,7 @@ impl Actor {
     }
 
     async fn bring_up(&mut self, secret: [u8; 32]) -> Result<(), Error> {
-        let slot = self.slot(secret)?;
+        let slot = self.slot(secret).await?;
         let rootfs = self.inner.rootfs(&self.cell.spec, &slot)?;
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
         self.handle = Some(handle);
@@ -285,10 +288,19 @@ impl Actor {
         self.commit(CellState::Running, None, "").await
     }
 
-    fn slot(&self, secret: [u8; 32]) -> Result<Slot, Error> {
+    async fn slot(&mut self, secret: [u8; 32]) -> Result<Slot, Error> {
         let dir = self.inner.cell_dir(self.cell.id);
         std::fs::create_dir_all(&dir).map_err(|e| io_error("making the cell directory", &e))?;
-        Ok(Slot { cgroup: Default::default(), netns: None, dir, secret })
+        let mut cgroup = PathBuf::new();
+        if let Some(pool) = self.inner.cgroups.clone() {
+            let (qos, r) = (self.cell.spec.qos, self.cell.spec.resources);
+            let taken = tokio::task::spawn_blocking(move || pool.take(qos, &r))
+                .await
+                .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+            cgroup = taken.map_err(|e| io_error("setting up the cell's cgroup", &e))?;
+            self.cgroup = Some(cgroup.clone());
+        }
+        Ok(Slot { cgroup, netns: None, dir, secret })
     }
 
     /// Undoes whatever a failed create got as far as, and records the failure.
@@ -306,6 +318,8 @@ impl Actor {
     async fn recover(&mut self) -> bool {
         let backend = self.cell.spec.backend;
         self.handle = self.record.handle(self.cell.id, backend);
+        self.cgroup =
+            self.handle.as_ref().map(|h| h.cgroup.clone()).filter(|c| !c.as_os_str().is_empty());
         let state = self.record.cell_state().unwrap_or(CellState::Failed);
         if state.is_terminal() {
             // Already over and cleaned up. It only stays for others to see how it ended.
@@ -574,6 +588,15 @@ impl Actor {
     fn release(&mut self) {
         self.reservation = None;
         let _ = std::fs::remove_dir_all(self.inner.cell_dir(self.cell.id));
+        if let Some(dir) = self.cgroup.take() {
+            // Kills anything the driver left behind. A leaf that cannot go now is swept by the
+            // next comb.
+            tokio::spawn(async move {
+                if let Err(e) = crate::cgroups::remove(dir).await {
+                    eprintln!("hive-comb: removing a cell's cgroup: {e}");
+                }
+            });
+        }
     }
 
     /// Keeps an ended cell visible for a while, then forgets it.

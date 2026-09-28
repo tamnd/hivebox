@@ -2,6 +2,7 @@
 
 use crate::admit::{self, Admission};
 use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
+use crate::cgroups::Cgroups;
 use crate::config::Config;
 use crate::record::{Record, SEQ_KEY, Seq, time};
 use crate::wal::Wal;
@@ -11,7 +12,7 @@ use hive_proto::convert;
 use hive_rt::{OsRng, Rng};
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Source, is_name};
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -68,6 +69,7 @@ pub(crate) struct Inner {
     pub(crate) drivers: DriverRegistry,
     pub(crate) admission: Arc<Admission>,
     pub(crate) shutdown: CancellationToken,
+    pub(crate) cgroups: Option<Arc<Cgroups>>,
     shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
     seq: tokio::sync::Mutex<SeqBlock>,
@@ -104,6 +106,12 @@ impl Comb {
             .or_else(|| admit::mem_total().map(|t| t.saturating_sub(cfg.reserved_mem_mib << 20)))
             .unwrap_or(0);
         let admission = Arc::new(Admission::new(mem, cfg.max_cells, &cfg.create_limit));
+        let cgroups = match &cfg.cgroup_root {
+            Some(root) => Some(Arc::new(Cgroups::init(root, cfg.cgroup_depth).map_err(|e| {
+                io::Error::new(e.kind(), format!("setting up cgroups in {}: {e}", root.display()))
+            })?)),
+            None => None,
+        };
         let mut records = replay.records;
         let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
         let inner = Arc::new(Inner {
@@ -112,6 +120,7 @@ impl Comb {
             drivers,
             admission,
             shutdown: CancellationToken::new(),
+            cgroups,
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
             // Whatever was reserved before the restart may have been handed out, so the new block
@@ -121,14 +130,23 @@ impl Comb {
         });
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
         let comb = Self { inner };
-        comb.recover(records).await;
+        let claimed = comb.recover(records).await;
+        if let Some(pool) = &comb.inner.cgroups {
+            let swept = pool.sweep(&claimed).await?;
+            if swept > 0 {
+                eprintln!("hive-comb: removed {swept} cgroups no cell claims");
+            }
+            tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+        }
         Ok(comb)
     }
 
-    async fn recover(&self, records: HashMap<u128, bytes::Bytes>) {
+    /// Starts an actor for every cell in the WAL. Returns the cgroups the live ones hold.
+    async fn recover(&self, records: HashMap<u128, bytes::Bytes>) -> HashSet<PathBuf> {
         let inner = &self.inner;
         let mut waits = Vec::new();
-        let mut known = std::collections::HashSet::new();
+        let mut known = HashSet::new();
+        let mut claimed = HashSet::new();
         for (key, bytes) in records {
             let id = CellId::from_bits(key);
             known.insert(inner.cell_dir(id));
@@ -143,6 +161,11 @@ impl Comb {
                 continue;
             };
             let state = record.cell_state().unwrap_or(CellState::Failed);
+            if let Some(h) = record.handle.as_ref().filter(|h| !h.cgroup.is_empty())
+                && !state.is_terminal()
+            {
+                claimed.insert(PathBuf::from(&h.cgroup));
+            }
             let status = Status {
                 state,
                 cause: record.cell_cause(),
@@ -182,6 +205,7 @@ impl Comb {
                 }
             }
         }
+        claimed
     }
 
     /// Makes a cell and returns once it is running, or once it has failed.
@@ -346,6 +370,13 @@ impl Comb {
             syncs: stats.syncs.load(Ordering::Relaxed),
             compactions: stats.compactions.load(Ordering::Relaxed),
         }
+    }
+
+    /// Empty cgroups ready for new cells, per QoS class, latency first. `None` when the comb runs
+    /// without cgroups.
+    #[must_use]
+    pub fn spare_cgroups(&self) -> Option<[usize; 3]> {
+        self.inner.cgroups.as_ref().map(|c| c.depths())
     }
 
     /// Stops every actor and leaves every cell exactly as it is, for the next comb to take over.

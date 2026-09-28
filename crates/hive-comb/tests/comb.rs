@@ -54,6 +54,8 @@ impl Guest {
 struct Fake {
     guests: Mutex<HashMap<CellId, Guest>>,
     stops: AtomicU64,
+    // A real process per cell, put in the cell's cgroup when it has one.
+    workers: Mutex<HashMap<CellId, std::process::Child>>,
 }
 
 impl Fake {
@@ -141,6 +143,14 @@ impl CellDriver for Fake {
                 }
             });
             self.with(h.id, |g| g.listener = Some(task.abort_handle()));
+            if !h.cgroup.as_os_str().is_empty() {
+                let child = std::process::Command::new("sleep").arg("600").spawn().unwrap();
+                let pid = child.id();
+                // Kept before it is moved, so the test reaps it whatever happens here.
+                self.workers.lock().unwrap().insert(h.id, child);
+                hive_cell::cgroup::write(&h.cgroup, "cgroup.procs", &pid.to_string())
+                    .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+            }
             h.pid = Some(std::process::id());
             Ok(())
         })
@@ -220,6 +230,7 @@ fn config(dir: &Path) -> Config {
         create_deadline: Duration::from_secs(5),
         stop_grace: Duration::from_millis(100),
         keep_ended: Duration::from_secs(60),
+        cgroup_root: None,
         ..Config::default()
     }
 }
@@ -585,4 +596,121 @@ async fn churn() {
         );
         comb.shutdown().await;
     }
+}
+
+/// A cgroup tree of the test's own, or `None` when not running as root on cgroup v2.
+struct Tree(PathBuf);
+
+impl Tree {
+    fn new() -> Option<Self> {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let uid = status.lines().find_map(|l| l.strip_prefix("Uid:")).unwrap();
+        if uid.split_whitespace().nth(1) != Some("0")
+            || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+        {
+            eprintln!("skipped: needs root and cgroup v2");
+            return None;
+        }
+        Some(Self(PathBuf::from(format!("/sys/fs/cgroup/hive-comb-{}.slice", std::process::id()))))
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        fn clear(dir: &Path) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        clear(&e.path());
+                    }
+                }
+            }
+            let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+            for _ in 0..1000 {
+                if std::fs::remove_dir(dir).is_ok() || !dir.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        clear(&self.0);
+    }
+}
+
+/// The cgroup a process is in, from `/proc`.
+fn cgroup_of(pid: u32) -> PathBuf {
+    let line = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let rel = line.trim().strip_prefix("0::/").unwrap().to_owned();
+    Path::new("/sys/fs/cgroup").join(rel)
+}
+
+fn worker(fake: &Fake, id: CellId) -> u32 {
+    fake.workers.lock().unwrap()[&id].id()
+}
+
+/// Waits for the cell's worker to be killed, and fails the test after five seconds.
+async fn killed(fake: &Fake, id: CellId) {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = fake.workers.lock().unwrap().remove(&id).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.signal(), Some(9));
+            return;
+        }
+        assert!(Instant::now() < until, "the worker of {id} is still alive");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn gone(dir: &Path) {
+    let until = Instant::now() + Duration::from_secs(5);
+    while dir.exists() {
+        assert!(Instant::now() < until, "{} is still there", dir.display());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cells_live_in_cgroups_of_their_own() {
+    let Some(tree) = Tree::new() else { return };
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let cfg = Config { cgroup_root: Some(tree.0.clone()), cgroup_depth: 8, ..config(&s.0) };
+    let comb = open(cfg.clone(), &fake).await;
+
+    let mut fast = spec("python");
+    fast.qos = Qos::Latency;
+    fast.resources.vcpu_milli = 500;
+    let a = comb.create(request(fast)).await.unwrap().id;
+    let leaf = cgroup_of(worker(&fake, a));
+    assert!(leaf.starts_with(tree.0.join("latency.slice")), "{}", leaf.display());
+    let read = |f: &str| std::fs::read_to_string(leaf.join(f)).unwrap().trim().to_owned();
+    assert_eq!(read("memory.max"), (256u64 << 20).to_string());
+    assert_eq!(read("cpu.max"), "50000 100000");
+
+    // Stopping the cell kills everything in its cgroup, whatever the driver did.
+    comb.stop(a, None).await.unwrap();
+    killed(&fake, a).await;
+    gone(&leaf).await;
+
+    // A cgroup no record claims is swept on the next start, and a live cell keeps its own.
+    let b = comb.create(request(spec("python"))).await.unwrap().id;
+    let kept = cgroup_of(worker(&fake, b));
+    let stray = tree.0.join("standard.slice").join("cell-999999");
+    std::fs::create_dir(&stray).unwrap();
+    let mut orphan = std::process::Command::new("sleep").arg("600").spawn().unwrap();
+    std::fs::write(stray.join("cgroup.procs"), orphan.id().to_string()).unwrap();
+    comb.shutdown().await;
+    drop(comb);
+    let comb = open(cfg, &fake).await;
+    assert!(!stray.exists());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(orphan.wait().unwrap().signal(), Some(9));
+    assert_eq!(cgroup_of(worker(&fake, b)), kept);
+    reaches(&comb, b, CellState::Running).await;
+    comb.stop(b, None).await.unwrap();
+    killed(&fake, b).await;
+    gone(&kept).await;
+    comb.shutdown().await;
 }

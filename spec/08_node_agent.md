@@ -40,7 +40,7 @@ Pools are the real throughput lever.
 | Pool | Pre-created unit | Refill | Recycle |
 |---|---|---|---|
 | netns | netns + veth pair (container) or tap (microVM) wired to node bridge / eBPF, IP assigned | background, rate-limited to avoid RTNL storms (≤200/s), target depth = 2 s of burst | flush conntrack, reset eBPF map entries, return |
-| cgroup | pre-made `hive.slice/cell-<slot>` leaf with controllers enabled | batch mkdir | `cgroup.kill`, wait empty, reset limits |
+| cgroup | pre-made `hive.slice/<class>.slice/cell-<n>` leaf, limits set on take | batch mkdir | never reused: `cgroup.kill`, wait empty, rmdir, since a used leaf keeps its `cpu.stat` and `memory.peak` |
 | IP | /20 per node (4,094 addrs) IPv4 + ULA IPv6 | static | quarantine 30 s before reuse |
 | template VMs | per hot template: pre-restored paused Firecracker (warm pool) | per template demand EWMA | never recycled (destroy after use) |
 | uffd mappings | shared template memory file mapped once | n/a | n/a |
@@ -120,7 +120,7 @@ Config is TOML, and a subset of it is hot-reloadable.
 
 ```toml
 [node]      unit = "u1"; reserved_cores = "0-3"; data_dir = "/var/lib/hivebox"
-[pools]     netns_depth = 400; cgroup_depth = 800; refill_rate = 200
+[pools]     netns_depth = 400; cgroup_depth = 256; refill_rate = 200
 [density]   overcommit = { latency = 1.0, standard = 1.5, best_effort = 3.0 }; psi_stop_admit = 0.20
 [backends]  enabled = ["container", "microvm", "fncall"]; microvm.vmm = "firecracker"
 [cache]     l1_path = "/nvme/hive/l1"; l1_max = "6TiB"; pin = ["base:*"]
