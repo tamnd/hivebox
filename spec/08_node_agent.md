@@ -39,7 +39,7 @@ Pools are the real throughput lever.
 
 | Pool | Pre-created unit | Refill | Recycle |
 |---|---|---|---|
-| netns | netns + veth pair (container) or tap (microVM) wired to node bridge / eBPF, IP assigned | background, rate-limited to avoid RTNL storms (≤200/s), target depth = 2 s of burst | flush conntrack, reset eBPF map entries, return |
+| netns | netns + veth pair (container) or tap (microVM) wired to node bridge / eBPF, IP assigned | background, in batches of 32 spread over 4 threads, past which the kernel makes them no faster, so RTNL is not stormed, target depth = 2 s of burst | never reused: unmount and remove, since a used one keeps its `TIME_WAIT` sockets and sysctls; up to 64 removals run at once because they share the RCU grace period each unmount waits for |
 | cgroup | pre-made `hive.slice/<class>.slice/cell-<n>` leaf, limits set on take | batch mkdir | never reused: `cgroup.kill`, wait empty, rmdir, since a used leaf keeps its `cpu.stat` and `memory.peak` |
 | IP | /20 per node (4,094 addrs) IPv4 + ULA IPv6 | static | quarantine 30 s before reuse |
 | template VMs | per hot template: pre-restored paused Firecracker (warm pool) | per template demand EWMA | never recycled (destroy after use) |

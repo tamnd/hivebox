@@ -11,6 +11,8 @@ mod cell;
 mod cgroups;
 mod comb;
 mod config;
+mod netns;
+mod pool;
 mod record;
 mod wal;
 

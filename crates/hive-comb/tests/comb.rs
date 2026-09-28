@@ -119,6 +119,7 @@ impl CellDriver for Fake {
                 pid: None,
                 channel: GuestChannel::Unix(slot.dir.join("drone.sock")),
                 cgroup: slot.cgroup.clone(),
+                netns: slot.netns.clone(),
                 extra: Default::default(),
             })
         })
@@ -143,13 +144,36 @@ impl CellDriver for Fake {
                 }
             });
             self.with(h.id, |g| g.listener = Some(task.abort_handle()));
-            if !h.cgroup.as_os_str().is_empty() {
-                let child = std::process::Command::new("sleep").arg("600").spawn().unwrap();
+            if !h.cgroup.as_os_str().is_empty() || h.netns.is_some() {
+                let mut cmd = match &h.netns {
+                    Some(ns) => {
+                        let mut c = std::process::Command::new("nsenter");
+                        c.arg(format!("--net={}", ns.display())).args(["--", "sleep"]);
+                        c
+                    }
+                    None => std::process::Command::new("sleep"),
+                };
+                let child = cmd.arg("600").spawn().unwrap();
                 let pid = child.id();
                 // Kept before it is moved, so the test reaps it whatever happens here.
                 self.workers.lock().unwrap().insert(h.id, child);
-                hive_cell::cgroup::write(&h.cgroup, "cgroup.procs", &pid.to_string())
-                    .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+                if !h.cgroup.as_os_str().is_empty() {
+                    hive_cell::cgroup::write(&h.cgroup, "cgroup.procs", &pid.to_string())
+                        .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+                }
+                if let Some(ns) = &h.netns {
+                    // A real runtime has the cell in its namespace before start returns. nsenter
+                    // gets there a little later, and a cell stopped straight away would lose its
+                    // namespace first.
+                    let want = inode(ns);
+                    let until = Instant::now() + Duration::from_secs(10);
+                    while std::fs::read_link(format!("/proc/{pid}/ns/net"))
+                        .is_ok_and(|l| l.to_str() != Some(&format!("net:[{want}]")))
+                    {
+                        assert!(Instant::now() < until, "nsenter never joined {}", ns.display());
+                        tokio::time::sleep(Duration::from_micros(200)).await;
+                    }
+                }
             }
             h.pid = Some(std::process::id());
             Ok(())
@@ -219,6 +243,12 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        // Namespace files are mount points, which have to be unmounted before they can go.
+        if let Ok(entries) = std::fs::read_dir(self.0.join("netns")) {
+            for e in entries.flatten() {
+                let _ = hive_cell::netns::remove(&e.path());
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -231,6 +261,7 @@ fn config(dir: &Path) -> Config {
         stop_grace: Duration::from_millis(100),
         keep_ended: Duration::from_secs(60),
         cgroup_root: None,
+        netns_dir: None,
         ..Config::default()
     }
 }
@@ -355,6 +386,10 @@ async fn admission_and_bad_requests_leave_nothing_behind() {
     assert_eq!(e.reason, Reason::ImageUnavailable);
     let e = comb.create(request(spec("../images"))).await.unwrap_err();
     assert_eq!(e.reason, Reason::InvalidArgument);
+    let mut open_net = spec("python");
+    open_net.network_profile = "mirrors".into();
+    let e = comb.create(request(open_net)).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
     let microvm = CellSpec::new(Source::Image("python".into()), Backend::Microvm);
     let e = comb.create(request(microvm)).await.unwrap_err();
     assert_eq!(e.reason, Reason::CapacityUnavailable);
@@ -422,7 +457,16 @@ async fn a_dropped_channel_reconnects_and_a_dead_cell_is_stopped() {
     let ended = reaches(&comb, b, CellState::Stopped).await;
     assert_eq!(ended.status.cause, Some(Cause::Exited));
     assert_eq!(comb.committed().0, 1);
+
+    // Every reconnect wrote its new secret down, so a restarted comb still gets in, and so does
+    // one restarted after that.
     comb.shutdown().await;
+    drop(comb);
+    for round in 0..3 {
+        let comb = open(config(&s.0), &fake).await;
+        assert_eq!(echo(&comb, a, &format!("again{round}")).await, format!("again{round}\n"));
+        comb.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -435,8 +479,10 @@ async fn timers_expire_and_pause_cells() {
     hard.hard_ttl = Some(Duration::from_millis(300));
     let hard = comb.create(request(hard)).await.unwrap().id;
 
+    // Longer than the others, so a loaded test host that stalls between two requests does not
+    // pause it early.
     let mut idle = spec("python");
-    idle.idle_ttl = Some(Duration::from_millis(300));
+    idle.idle_ttl = Some(Duration::from_secs(1));
     idle.idle_action = IdleAction::Pause;
     let idle = comb.create(request(idle)).await.unwrap().id;
 
@@ -446,7 +492,7 @@ async fn timers_expire_and_pause_cells() {
     let idle_stop = comb.create(request(idle_stop)).await.unwrap().id;
 
     // Keep one idle cell busy past its ttl.
-    let busy_until = Instant::now() + Duration::from_millis(600);
+    let busy_until = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < busy_until {
         echo(&comb, idle, "busy").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -559,7 +605,29 @@ async fn churn() {
     {
         let s = Scratch::new();
         let fake = Arc::new(Fake::default());
-        let comb = Arc::new(open(Config { mem_mib: Some(1 << 20), ..config(&s.0) }, &fake).await);
+        let mut cfg = Config { mem_mib: Some(1 << 20), ..config(&s.0) };
+        // With HB_POOLS set, as root, every cell also gets a real process, in a real cgroup unless
+        // it is "netns" and in a real network namespace unless it is "cgroup".
+        let pools = std::env::var("HB_POOLS").ok();
+        let tree = pools.as_ref().map(|_| Tree::new().expect("needs root"));
+        if let (Some(t), Some(p)) = (&tree, &pools) {
+            if p != "netns" {
+                cfg.cgroup_root = Some(t.0.clone());
+            }
+            if p != "cgroup" {
+                cfg.netns_dir = Some(s.0.join("netns"));
+                cfg.netns_depth = Config::default().netns_depth;
+            }
+        }
+        let comb = Arc::new(open(cfg, &fake).await);
+        if tree.is_some() {
+            // Starts from full pools, as a node that has been up for a while would.
+            while comb.spare_netns().is_some_and(|d| d < Config::default().netns_depth)
+                || comb.spare_cgroups().is_some_and(|d| d[1] < Config::default().cgroup_depth)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         let total =
             std::env::var("HB_N").map_or(2048usize.max(concurrency * 8), |v| v.parse().unwrap());
         let started = Instant::now();
@@ -567,27 +635,44 @@ async fn churn() {
             .map(|_| {
                 let comb = comb.clone();
                 tokio::spawn(async move {
-                    let mut creates = Vec::new();
+                    let (mut creates, mut failed) = (Vec::new(), 0);
                     for _ in 0..total / concurrency {
                         let t = Instant::now();
-                        let id = comb.create(request(spec("python"))).await.unwrap().id;
-                        creates.push(t.elapsed());
-                        comb.stop(id, Some(Duration::ZERO)).await.unwrap();
+                        // A host too busy to start a cell inside its deadline fails the create,
+                        // which is counted rather than fatal.
+                        match comb.create(request(spec("python"))).await {
+                            Ok(cell) => {
+                                creates.push(t.elapsed());
+                                comb.stop(cell.id, Some(Duration::ZERO)).await.unwrap();
+                            }
+                            Err(e) => {
+                                assert!(
+                                    matches!(
+                                        e.reason,
+                                        Reason::DroneUnreachable | Reason::CapacityUnavailable
+                                    ),
+                                    "{e:?}"
+                                );
+                                failed += 1;
+                            }
+                        }
                     }
-                    creates
+                    (creates, failed)
                 })
             })
             .collect();
-        let mut creates = Vec::new();
+        let (mut creates, mut failed) = (Vec::new(), 0);
         for w in workers {
-            creates.extend(w.await.unwrap());
+            let (c, f) = w.await.unwrap();
+            creates.extend(c);
+            failed += f;
         }
         let took = started.elapsed();
         creates.sort();
         let p = |q: f64| creates[((creates.len() - 1) as f64 * q) as usize];
         let wal = comb.wal_stats();
         println!(
-            "concurrency {concurrency:>3}: {total} cells made and stopped in {took:?}, {:.0} per second, create p50 {:?} p99 {:?}, {} WAL writes in {} syncs",
+            "concurrency {concurrency:>3}: {total} cells made and stopped in {took:?}, {:.0} per second, {failed} failed, create p50 {:?} p99 {:?}, {} WAL writes in {} syncs",
             total as f64 / took.as_secs_f64(),
             p(0.5),
             p(0.99),
@@ -595,6 +680,10 @@ async fn churn() {
             wal.syncs,
         );
         comb.shutdown().await;
+        for (_, mut w) in fake.workers.lock().unwrap().drain() {
+            let _ = w.kill();
+            let _ = w.wait();
+        }
     }
 }
 
@@ -611,22 +700,27 @@ impl Tree {
             eprintln!("skipped: needs root and cgroup v2");
             return None;
         }
-        Some(Self(PathBuf::from(format!("/sys/fs/cgroup/hive-comb-{}.slice", std::process::id()))))
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let name = format!("hive-comb-{}-{n}.slice", std::process::id());
+        Some(Self(Path::new("/sys/fs/cgroup").join(name)))
     }
 }
 
 impl Drop for Tree {
     fn drop(&mut self) {
         fn clear(dir: &Path) {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for e in entries.flatten() {
-                    if e.file_type().is_ok_and(|t| t.is_dir()) {
-                        clear(&e.path());
+            // A refill batch still running on a blocking thread can add leaves after they were
+            // listed, so they are listed again on every try.
+            for _ in 0..1000 {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        if e.file_type().is_ok_and(|t| t.is_dir()) {
+                            clear(&e.path());
+                        }
                     }
                 }
-            }
-            let _ = std::fs::write(dir.join("cgroup.kill"), "1");
-            for _ in 0..1000 {
+                let _ = std::fs::write(dir.join("cgroup.kill"), "1");
                 if std::fs::remove_dir(dir).is_ok() || !dir.exists() {
                     return;
                 }
@@ -712,5 +806,67 @@ async fn cells_live_in_cgroups_of_their_own() {
     comb.stop(b, None).await.unwrap();
     killed(&fake, b).await;
     gone(&kept).await;
+    comb.shutdown().await;
+}
+
+/// The network namespace a process is in, as the inode `stat` gives for a namespace file.
+fn netns_of(pid: u32) -> u64 {
+    let link = std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+    let link = link.to_str().unwrap();
+    link.strip_prefix("net:[").and_then(|l| l.strip_suffix(']')).unwrap().parse().unwrap()
+}
+
+fn inode(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().ino()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cells_get_a_network_namespace_of_their_own() {
+    let Some(tree) = Tree::new() else { return };
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let dir = s.0.join("netns");
+    let cfg = Config {
+        cgroup_root: Some(tree.0.clone()),
+        netns_dir: Some(dir.clone()),
+        netns_depth: 4,
+        ..config(&s.0)
+    };
+    let comb = open(cfg.clone(), &fake).await;
+
+    let a = comb.create(request(spec("python"))).await.unwrap().id;
+    let b = comb.create(request(spec("python"))).await.unwrap().id;
+    let (pa, pb) = (worker(&fake, a), worker(&fake, b));
+    let host = netns_of(std::process::id());
+    assert_ne!(netns_of(pa), host);
+    assert_ne!(netns_of(pa), netns_of(pb));
+    let ns_a = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| inode(p) == netns_of(pa))
+        .expect("a's namespace is a file in the directory");
+
+    comb.stop(a, None).await.unwrap();
+    killed(&fake, a).await;
+    gone(&ns_a).await;
+
+    // A namespace no record claims is removed on the next start, and a live cell keeps its own.
+    let stray = dir.join("cell-999999");
+    hive_cell::netns::create(std::slice::from_ref(&stray)).pop().unwrap().unwrap();
+    comb.shutdown().await;
+    drop(comb);
+    let comb = open(cfg, &fake).await;
+    assert!(!stray.exists());
+    let kept: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| inode(p) == netns_of(pb))
+        .collect();
+    assert_eq!(kept.len(), 1);
+    reaches(&comb, b, CellState::Running).await;
+    comb.stop(b, None).await.unwrap();
+    killed(&fake, b).await;
+    gone(&kept[0]).await;
     comb.shutdown().await;
 }

@@ -4,6 +4,7 @@ use crate::admit::{self, Admission};
 use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
+use crate::netns::Namespaces;
 use crate::record::{Record, SEQ_KEY, Seq, time};
 use crate::wal::Wal;
 use hive_cell::{DriverRegistry, RootfsPlan, Slot};
@@ -70,6 +71,7 @@ pub(crate) struct Inner {
     pub(crate) admission: Arc<Admission>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) cgroups: Option<Arc<Cgroups>>,
+    pub(crate) netns: Option<Arc<Namespaces>>,
     shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
     seq: tokio::sync::Mutex<SeqBlock>,
@@ -112,6 +114,12 @@ impl Comb {
             })?)),
             None => None,
         };
+        let netns = match &cfg.netns_dir {
+            Some(dir) => Some(Arc::new(Namespaces::init(dir, cfg.netns_depth).map_err(|e| {
+                io::Error::new(e.kind(), format!("setting up {}: {e}", dir.display()))
+            })?)),
+            None => None,
+        };
         let mut records = replay.records;
         let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
         let inner = Arc::new(Inner {
@@ -121,6 +129,7 @@ impl Comb {
             admission,
             shutdown: CancellationToken::new(),
             cgroups,
+            netns,
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
             // Whatever was reserved before the restart may have been handed out, so the new block
@@ -130,7 +139,14 @@ impl Comb {
         });
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
         let comb = Self { inner };
-        let claimed = comb.recover(records).await;
+        let (claimed, claimed_netns) = comb.recover(records).await;
+        if let Some(pool) = &comb.inner.netns {
+            let swept = pool.sweep(&claimed_netns).await?;
+            if swept > 0 {
+                eprintln!("hive-comb: removed {swept} network namespaces no cell claims");
+            }
+            tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+        }
         if let Some(pool) = &comb.inner.cgroups {
             let swept = pool.sweep(&claimed).await?;
             if swept > 0 {
@@ -141,12 +157,17 @@ impl Comb {
         Ok(comb)
     }
 
-    /// Starts an actor for every cell in the WAL. Returns the cgroups the live ones hold.
-    async fn recover(&self, records: HashMap<u128, bytes::Bytes>) -> HashSet<PathBuf> {
+    /// Starts an actor for every cell in the WAL. Returns the cgroups and network namespaces the
+    /// live ones hold.
+    async fn recover(
+        &self,
+        records: HashMap<u128, bytes::Bytes>,
+    ) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
         let inner = &self.inner;
         let mut waits = Vec::new();
         let mut known = HashSet::new();
         let mut claimed = HashSet::new();
+        let mut claimed_netns = HashSet::new();
         for (key, bytes) in records {
             let id = CellId::from_bits(key);
             known.insert(inner.cell_dir(id));
@@ -161,10 +182,15 @@ impl Comb {
                 continue;
             };
             let state = record.cell_state().unwrap_or(CellState::Failed);
-            if let Some(h) = record.handle.as_ref().filter(|h| !h.cgroup.is_empty())
+            if let Some(h) = record.handle.as_ref()
                 && !state.is_terminal()
             {
-                claimed.insert(PathBuf::from(&h.cgroup));
+                if !h.cgroup.is_empty() {
+                    claimed.insert(PathBuf::from(&h.cgroup));
+                }
+                if !h.netns.is_empty() {
+                    claimed_netns.insert(PathBuf::from(&h.netns));
+                }
             }
             let status = Status {
                 state,
@@ -205,7 +231,7 @@ impl Comb {
                 }
             }
         }
-        claimed
+        (claimed, claimed_netns)
     }
 
     /// Makes a cell and returns once it is running, or once it has failed.
@@ -219,6 +245,12 @@ impl Comb {
             ));
         }
         image_name(&req.spec)?;
+        if req.spec.network_profile != "none" {
+            return Err(Error::new(
+                Reason::CapacityUnavailable,
+                format!("this node has no {:?} network profile", req.spec.network_profile),
+            ));
+        }
         let driver = inner.drivers.get(req.spec.backend).cloned().ok_or_else(|| {
             Error::new(
                 Reason::CapacityUnavailable,
@@ -377,6 +409,12 @@ impl Comb {
     #[must_use]
     pub fn spare_cgroups(&self) -> Option<[usize; 3]> {
         self.inner.cgroups.as_ref().map(|c| c.depths())
+    }
+
+    /// Network namespaces ready for new cells. `None` when cells run in the host's network.
+    #[must_use]
+    pub fn spare_netns(&self) -> Option<usize> {
+        self.inner.netns.as_ref().map(|n| n.depth())
     }
 
     /// Stops every actor and leaves every cell exactly as it is, for the next comb to take over.

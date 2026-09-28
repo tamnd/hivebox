@@ -35,6 +35,11 @@ pub struct Config {
     pub cgroup_root: Option<PathBuf>,
     /// Empty cgroups kept ready per QoS class, so a create does not wait on `mkdir`.
     pub cgroup_depth: usize,
+    /// Where the comb keeps its cells' network namespaces. `None` runs cells in the host's network,
+    /// which only suits tests.
+    pub netns_dir: Option<PathBuf>,
+    /// Network namespaces kept ready, so a create does not wait on making one.
+    pub netns_depth: usize,
 }
 
 impl Default for Config {
@@ -58,6 +63,8 @@ impl Default for Config {
             keep_ended: Duration::from_secs(600),
             cgroup_root: Some(PathBuf::from("/sys/fs/cgroup/hive.slice")),
             cgroup_depth: 256,
+            netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
+            netns_depth: 400,
         }
     }
 }

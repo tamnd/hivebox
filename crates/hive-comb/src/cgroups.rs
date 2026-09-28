@@ -135,23 +135,13 @@ impl Cgroups {
 
     /// Keeps every class topped up to its depth until `stop` fires.
     pub(crate) async fn refill(self: Arc<Self>, stop: CancellationToken) {
-        loop {
-            let this = self.clone();
-            // Blocking calls, but each only a few microseconds, and at most one batch at a time.
-            let full = tokio::task::spawn_blocking(move || this.fill_once()).await.unwrap_or(true);
-            if full {
-                tokio::select! {
-                    () = self.refill.notified() => {}
-                    () = stop.cancelled() => return,
-                }
-            } else if stop.is_cancelled() {
-                return;
-            }
-        }
+        let this = self.clone();
+        // Blocking calls, but each only a few microseconds, and at most one batch at a time.
+        crate::pool::refill("cgroup", move || this.fill_once(), &self.refill, &stop).await;
     }
 
     /// Makes up to one batch of leaves where they are short. Returns true if every class is full.
-    fn fill_once(&self) -> bool {
+    fn fill_once(&self) -> io::Result<bool> {
         let mut full = true;
         for class in &self.classes {
             let short = self.depth.saturating_sub(class.ready().len());
@@ -160,19 +150,13 @@ impl Cgroups {
             }
             full = false;
             for _ in 0..short.min(BATCH) {
-                match self.make(class, &PRESET) {
-                    Ok(dir) => class.ready().push(dir),
-                    Err(e) => {
-                        eprintln!(
-                            "hive-comb: making a spare cgroup in {}: {e}",
-                            class.dir.display()
-                        );
-                        return true;
-                    }
-                }
+                let dir = self.make(class, &PRESET).map_err(|e| {
+                    io::Error::new(e.kind(), format!("in {}: {e}", class.dir.display()))
+                })?;
+                class.ready().push(dir);
             }
         }
-        full
+        Ok(full)
     }
 }
 
@@ -291,15 +275,17 @@ pub(crate) mod tests {
     impl Drop for Tree {
         fn drop(&mut self) {
             fn clear(dir: &Path) {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for e in entries.flatten() {
-                        if e.file_type().is_ok_and(|t| t.is_dir()) {
-                            clear(&e.path());
+                // A refill batch still running can add leaves after they were listed, so they
+                // are listed again on every try.
+                for _ in 0..1000 {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for e in entries.flatten() {
+                            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                                clear(&e.path());
+                            }
                         }
                     }
-                }
-                let _ = cgroup::kill(dir);
-                for _ in 0..1000 {
+                    let _ = cgroup::kill(dir);
                     if std::fs::remove_dir(dir).is_ok() || !dir.exists() {
                         return;
                     }
@@ -355,7 +341,7 @@ pub(crate) mod tests {
 
         // A spare comes with the usual limits, and a take changes only the ones that differ.
         let c = Cgroups::init(&t.0, 2).unwrap();
-        c.fill_once();
+        c.fill_once().unwrap();
         let usual = c.take(Qos::Standard, &Resources::default()).unwrap();
         assert_eq!(read(&usual, "memory.max"), (2048u64 << 20).to_string());
         assert_eq!(read(&usual, "memory.oom.group"), "1");
@@ -388,8 +374,8 @@ pub(crate) mod tests {
     async fn the_sweep_removes_what_no_cell_claims() {
         let Some(t) = Tree::new() else { return };
         let c = Cgroups::init(&t.0, 2).unwrap();
-        assert!(!c.fill_once());
-        assert!(c.fill_once());
+        assert!(!c.fill_once().unwrap());
+        assert!(c.fill_once().unwrap());
         let kept = c.take(Qos::Standard, &Resources::default()).unwrap();
         let orphan = c.take(Qos::BestEffort, &Resources::default()).unwrap();
         let mut stray = sleeper_in(&orphan);
@@ -452,7 +438,7 @@ pub(crate) mod tests {
         let c = Cgroups::init(&t.0, N).unwrap();
         let mut made = Vec::new();
         let start = Instant::now();
-        while !c.fill_once() {}
+        while !c.fill_once().unwrap() {}
         eprintln!("filling {N} spares per class: {:?}", start.elapsed() / 3);
 
         let (mut warm, mut other, mut cold) = (Vec::new(), Vec::new(), Vec::new());
@@ -461,7 +447,7 @@ pub(crate) mod tests {
             made.push(c.take(Qos::Standard, &r).unwrap());
             warm.push(t0.elapsed());
         }
-        while !c.fill_once() {}
+        while !c.fill_once().unwrap() {}
         let small = Resources { mem_mib: 512, ..r };
         for _ in 0..N {
             let t0 = Instant::now();
