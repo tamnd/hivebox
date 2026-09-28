@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "hivebox/v1/cells.proto";
+import "hivebox/v1/types.proto";
+
+// Draft: lands with the snapshot work in M1 and M2. The shape is here so clients can plan for it.
+service Snapshots {
+  rpc Snapshot(SnapshotRequest) returns (SnapshotRef);
+  // Starts count cells from one snapshot.
+  rpc Restore(RestoreRequest) returns (stream CreateEvent);
+  // Copies a running cell count times, at most 16.
+  rpc Fork(ForkRequest) returns (stream CreateEvent);
+  // Turns a snapshot into an image that can be used as a source.
+  rpc Commit(CommitRequest) returns (ImageRef);
+  rpc Delete(SnapshotRef) returns (Empty);
+}
+
+enum SnapshotKind {
+  SNAPSHOT_KIND_UNSPECIFIED = 0;
+  SNAPSHOT_KIND_DISK = 1;
+  SNAPSHOT_KIND_DISK_MEM = 2;
+  SNAPSHOT_KIND_PROC = 3;
+}
+
+message SnapshotRequest {
+  string cell_id = 1;
+  SnapshotKind kind = 2;
+  map<string, string> labels = 3;
+}
+
+message RestoreRequest {
+  SnapshotRef snapshot = 1;
+  uint32 count = 2;
+  // Overrides applied on top of the snapshot's own spec. The source is ignored.
+  CellSpec spec = 3;
+  string idempotency_key = 4;
+}
+
+message ForkRequest {
+  string cell_id = 1;
+  uint32 count = 2;
+  map<string, string> labels = 3;
+  string idempotency_key = 4;
+}
+
+message CommitRequest {
+  SnapshotRef snapshot = 1;
+  string name = 2;
+}

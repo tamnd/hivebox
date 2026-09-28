@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/duration.proto";
+import "hivebox/v1/types.proto";
+
+// Draft: lands with the RL integration in M2.
+service Verify {
+  // Runs a verifier in a fresh cell against the changes of a subject cell, so the policy under training never sees the verifier.
+  rpc Run(VerifyRequest) returns (VerifyResult);
+}
+
+message VerifyRequest {
+  string subject_cell_id = 1;
+  CellSpec verifier = 2;
+  repeated string argv = 3;
+  google.protobuf.Duration timeout = 4;
+}
+
+message VerifyResult {
+  bool passed = 1;
+  int32 exit_code = 2;
+  bytes output = 3;
+  // Extra numbers the verifier printed, like tests passed and failed.
+  map<string, double> scores = 4;
+  Error error = 5;
+}

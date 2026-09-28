@@ -71,7 +71,7 @@ message CellSpec {
   oneof source { string template = 1; ImageRef image = 2; SnapshotRef snapshot = 3; }
   Backend backend = 4;              // FNCALL | CONTAINER | MICROVM | FULLVM | AUTO
   Resources resources = 5;          // vcpu (milli), mem_mib, disk_gib, pids, open_files
-  QoS qos = 6;                      // LATENCY | STANDARD | BEST_EFFORT
+  Qos qos = 6;                      // LATENCY | STANDARD | BEST_EFFORT
   string network_profile = 7;       // "none" (default) | "mirrors" | "llm" | custom
   Duration idle_ttl = 8;            // auto action on idle
   IdleAction idle_action = 9;       // PAUSE | STOP
