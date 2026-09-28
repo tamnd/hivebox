@@ -4,4 +4,15 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
-The workspace, with every crate from `spec/03_architecture.md` as a skeleton and a rank in `xtask/layers.toml`. `hive-types` has the cell id codec and the cell state machine, and `hive-cell` has the isolation tiers. CI runs formatting, the layer rule, the prose rules, clippy, tests on Linux and macOS, documentation, the msrv floor, cargo-deny, typos and zizmor on every commit.
+## 0.0.1
+
+The first pieces of M0.
+
+- `hive-types` gains the cell spec with its resource bounds and validation, the QoS classes, the stable error reasons with their gRPC codes and infra flags, and the stop causes (#11).
+- `hive-proto` has the drone channel: a 9 byte frame header, a mutual handshake with keyed BLAKE3, and multiplexed streams with per stream credit. It moves about 3 to 4 GiB/s over a Unix socket on the test box (#12).
+- `hive-rt` has clock, randomness and network traits, each with a tokio implementation and a deterministic simulated one (#13).
+- `hive-telemetry` has a metrics registry with a label allowlist and a series cap, exponential histograms, a `/metrics` endpoint and JSON log setup. An observation costs 12 to 19 ns (#14).
+- `hive-proto` has the first draft of `hivebox.v1`, built without protoc, and the conversions to `hive-types` including the ErrorInfo error model (#15).
+- `cargo xtask bump` moves the workspace, the internal pins and this file to a new version (#10).
+
+The workspace itself: every crate from `spec/03_architecture.md` as a skeleton with a rank in `xtask/layers.toml`, the cell id codec and the cell state machine in `hive-types`, and the isolation tiers in `hive-cell`. CI runs formatting, the layer rule, the prose rules, clippy, tests on Linux and macOS, documentation, the msrv floor, cargo-deny, typos and zizmor on every commit.
