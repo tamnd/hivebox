@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hivebox/v1/types.proto";
+
+// Draft: Import from an OCI reference lands in M0. The other sources and Compose come later.
+service Images {
+  rpc Import(ImportRequest) returns (stream BuildEvent);
+  rpc Get(ImageRef) returns (ImageManifest);
+  // Stacks a base image, a workspace and toolkits into one image without a build.
+  rpc Compose(ComposeRequest) returns (ImageRef);
+  // Pulls an image onto nodes ahead of a burst.
+  rpc Prefetch(PrefetchRequest) returns (Empty);
+}
+
+message ImportRequest {
+  oneof source {
+    string oci_ref = 1;
+    bytes tar = 2;
+    string dockerfile = 3;
+  }
+  // The name the image is known by afterwards.
+  string name = 4;
+}
+
+message BuildEvent {
+  oneof event {
+    string log = 1;
+    ImageManifest done = 2;
+    Error error = 3;
+  }
+}
+
+message ImageManifest {
+  ImageRef ref = 1;
+  // The digest of the hivebox image built from the source.
+  string digest = 2;
+  uint64 size_bytes = 3;
+  repeated string layers = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message ComposeRequest {
+  ImageRef base = 1;
+  repeated ImageRef overlays = 2;
+  string name = 3;
+}
+
+message PrefetchRequest {
+  repeated ImageRef images = 1;
+  // How many nodes should hold them. All nodes when zero.
+  uint32 nodes = 2;
+}

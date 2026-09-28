@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/duration.proto";
+import "hivebox/v1/types.proto";
+
+service Cells {
+  // Creates count cells from one spec and streams one event per cell as each is ready or fails.
+  rpc Create(CreateRequest) returns (stream CreateEvent);
+  rpc Get(GetCellRequest) returns (Cell);
+  rpc List(ListCellsRequest) returns (ListCellsResponse);
+  // Streams state transitions for the selected cells, starting with their current state.
+  rpc Watch(WatchCellsRequest) returns (stream CellEvent);
+  rpc Pause(CellSelector) returns (BulkResult);
+  rpc Resume(CellSelector) returns (BulkResult);
+  rpc Stop(StopRequest) returns (BulkResult);
+  rpc ExtendTtl(ExtendTtlRequest) returns (Cell);
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (Cell);
+  rpc ExposePort(ExposePortRequest) returns (PortEndpoint);
+}
+
+message Placement {
+  // Place near this cell if possible, for example a verifier next to its subject.
+  string affinity_cell_id = 1;
+  // Spread cells that share these label keys across nodes.
+  repeated string spread_labels = 2;
+}
+
+message CreateRequest {
+  CellSpec spec = 1;
+  // One when zero.
+  uint32 count = 2;
+  // A retry with the same key within 24 hours returns the same cells instead of creating more.
+  string idempotency_key = 3;
+  Placement placement = 4;
+}
+
+message CreateEvent {
+  // Which of the count cells this is, from zero.
+  uint32 index = 1;
+  oneof result {
+    Cell cell = 2;
+    Error error = 3;
+  }
+}
+
+message GetCellRequest {
+  string id = 1;
+}
+
+message ListCellsRequest {
+  LabelSelector selector = 1;
+  // Only cells in these states. All states when empty.
+  repeated CellState states = 2;
+  uint32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListCellsResponse {
+  repeated Cell cells = 1;
+  string next_page_token = 2;
+}
+
+message WatchCellsRequest {
+  CellSelector selector = 1;
+}
+
+message CellEvent {
+  Cell cell = 1;
+  CellState from = 2;
+}
+
+message StopRequest {
+  CellSelector selector = 1;
+  // Keep a disk snapshot of each cell before stopping it.
+  bool snapshot = 2;
+}
+
+message ExtendTtlRequest {
+  string id = 1;
+  google.protobuf.Duration hard_ttl = 2;
+  google.protobuf.Duration idle_ttl = 3;
+}
+
+message UpdatePolicyRequest {
+  string id = 1;
+  // Unchanged when empty.
+  string network_profile = 2;
+  // Unchanged when unset.
+  Limits limits = 3;
+}
+
+message ExposePortRequest {
+  string id = 1;
+  uint32 port = 2;
+}
+
+message PortEndpoint {
+  // A host name routed to the port through the gate.
+  string host = 1;
+  // A token the gate requires in the Authorization header, scoped to this port.
+  string token = 2;
+}

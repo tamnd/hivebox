@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// Where a cell runs. AUTO lets the scheduler pick the cheapest tier the template allows.
+enum Backend {
+  BACKEND_UNSPECIFIED = 0;
+  BACKEND_FNCALL = 1;
+  BACKEND_CONTAINER = 2;
+  BACKEND_MICROVM = 3;
+  BACKEND_FULLVM = 4;
+  BACKEND_AUTO = 5;
+}
+
+// How a cell is treated when the node is short of CPU or memory. Unspecified means STANDARD.
+enum Qos {
+  QOS_UNSPECIFIED = 0;
+  QOS_LATENCY = 1;
+  QOS_STANDARD = 2;
+  QOS_BEST_EFFORT = 3;
+}
+
+// What happens when a cell has been idle for its idle_ttl. Unspecified means PAUSE.
+enum IdleAction {
+  IDLE_ACTION_UNSPECIFIED = 0;
+  IDLE_ACTION_PAUSE = 1;
+  IDLE_ACTION_STOP = 2;
+}
+
+enum CellState {
+  CELL_STATE_UNSPECIFIED = 0;
+  CELL_STATE_PENDING = 1;
+  CELL_STATE_PREPARING = 2;
+  CELL_STATE_STARTING = 3;
+  CELL_STATE_RUNNING = 4;
+  CELL_STATE_PAUSING = 5;
+  CELL_STATE_PAUSED = 6;
+  CELL_STATE_STOPPING = 7;
+  CELL_STATE_STOPPED = 8;
+  CELL_STATE_FAILED = 9;
+  CELL_STATE_EXPIRED = 10;
+}
+
+// Why a cell stopped or failed.
+enum Cause {
+  CAUSE_UNSPECIFIED = 0;
+  CAUSE_REQUESTED = 1;
+  CAUSE_IDLE = 2;
+  CAUSE_HARD_TTL = 3;
+  CAUSE_EXITED = 4;
+  CAUSE_OOM = 5;
+  CAUSE_POLICY = 6;
+  CAUSE_START_FAILED = 7;
+  CAUSE_DRONE_LOST = 8;
+  CAUSE_NODE_LOST = 9;
+  CAUSE_RECOVERY = 10;
+}
+
+// Zero fields mean the server default.
+message Resources {
+  // Thousandths of a CPU.
+  uint32 vcpu_milli = 1;
+  uint32 mem_mib = 2;
+  uint32 disk_gib = 3;
+  uint32 pids = 4;
+  uint32 open_files = 5;
+}
+
+// Zero fields mean the server default.
+message Limits {
+  uint64 output_bytes = 1;
+  google.protobuf.Duration wall_time = 2;
+}
+
+message ImageRef {
+  // An OCI reference, like docker.io/library/python:3.12, or a hivebox image digest.
+  string ref = 1;
+}
+
+message SnapshotRef {
+  string id = 1;
+}
+
+message CheckpointPolicy {
+  oneof mode {
+    // Take no checkpoints. The default.
+    bool none = 1;
+    google.protobuf.Duration every = 2;
+    bool on_session_idle = 3;
+  }
+}
+
+message CellSpec {
+  oneof source {
+    string template = 1;
+    ImageRef image = 2;
+    SnapshotRef snapshot = 3;
+  }
+  Backend backend = 4;
+  Resources resources = 5;
+  Qos qos = 6;
+  // "none" when empty. Other built in profiles are "mirrors" and "llm".
+  string network_profile = 7;
+  google.protobuf.Duration idle_ttl = 8;
+  IdleAction idle_action = 9;
+  google.protobuf.Duration hard_ttl = 10;
+  map<string, string> labels = 11;
+  map<string, string> env = 12;
+  Limits limits = 13;
+  // False means a container runs inside a shield VM.
+  bool trusted_image = 14;
+  CheckpointPolicy checkpoint = 15;
+}
+
+message Cell {
+  string id = 1;
+  string project = 2;
+  CellState state = 3;
+  // Set once the cell is in a terminal state.
+  Cause cause = 4;
+  Backend backend = 5;
+  CellSpec spec = 6;
+  string node = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp state_since = 9;
+  // When the cell expires unless its TTL is extended.
+  google.protobuf.Timestamp expires_at = 10;
+  map<string, string> labels = 11;
+}
+
+// A failure for one item of a batch. Whole call failures use the gRPC status with the same reason in ErrorInfo.
+message Error {
+  // A stable code like CAPACITY_UNAVAILABLE. See the reason table in the API spec.
+  string reason = 1;
+  string message = 2;
+  // True when the failure is the platform's fault rather than the workload's, so a trainer can mask the sample.
+  bool is_infra_error = 3;
+  bool retryable = 4;
+}
+
+// Picks cells either by id or by label selector within the caller's project.
+message CellSelector {
+  oneof by {
+    string id = 1;
+    LabelSelector labels = 2;
+  }
+}
+
+// Every pair must match.
+message LabelSelector {
+  map<string, string> match = 1;
+}
+
+message BulkResult {
+  uint32 matched = 1;
+  uint32 succeeded = 2;
+  repeated BulkFailure failures = 3;
+}
+
+message BulkFailure {
+  string cell_id = 1;
+  Error error = 2;
+}
+
+message ResourceUsage {
+  google.protobuf.Duration cpu_user = 1;
+  google.protobuf.Duration cpu_system = 2;
+  uint64 peak_rss_bytes = 3;
+  uint64 io_read_bytes = 4;
+  uint64 io_write_bytes = 5;
+}
+
+message Empty {}

@@ -22,8 +22,16 @@ bytes.workspace = true
 futures.workspace = true
 hive-types.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt", "sync"] }
 tokio-util = { workspace = true, features = ["codec"] }
+tonic = { workspace = true, features = ["codegen"] }
+tonic-prost.workspace = true
+tonic-types.workspace = true
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hivebox/v1/types.proto";
+
+service Files {
+  rpc Read(ReadFileRequest) returns (stream Chunk);
+  // The first message must carry the header.
+  rpc Write(stream WriteFileChunk) returns (FileInfo);
+  rpc Stat(PathRequest) returns (FileInfo);
+  rpc List(ListDirRequest) returns (ListDirResponse);
+  rpc Remove(PathRequest) returns (Empty);
+  rpc Watch(WatchDirRequest) returns (stream FsEvent);
+  // The changes since the cell started, as a git diff or as a layer diff.
+  rpc Diff(DiffRequest) returns (DiffResult);
+  rpc Apply(ApplyRequest) returns (Empty);
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIR = 2;
+  FILE_TYPE_SYMLINK = 3;
+  FILE_TYPE_OTHER = 4;
+}
+
+message PathRequest {
+  string cell_id = 1;
+  string path = 2;
+  // For Remove: remove directories and what is in them.
+  bool recursive = 3;
+}
+
+message ReadFileRequest {
+  string cell_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  // To the end when zero.
+  uint64 length = 4;
+}
+
+message Chunk {
+  bytes data = 1;
+}
+
+message WriteFileHeader {
+  string cell_id = 1;
+  string path = 2;
+  // 0644 when zero.
+  uint32 mode = 3;
+  bool make_parents = 4;
+  // Add to the end instead of replacing.
+  bool append = 5;
+}
+
+message WriteFileChunk {
+  oneof part {
+    WriteFileHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message FileInfo {
+  string path = 1;
+  FileType type = 2;
+  uint64 size = 3;
+  uint32 mode = 4;
+  google.protobuf.Timestamp modified_at = 5;
+  string symlink_target = 6;
+}
+
+message ListDirRequest {
+  string cell_id = 1;
+  string path = 2;
+  // One means just the directory itself. Zero is treated as one.
+  uint32 depth = 3;
+}
+
+message ListDirResponse {
+  repeated FileInfo entries = 1;
+}
+
+message WatchDirRequest {
+  string cell_id = 1;
+  string path = 2;
+  bool recursive = 3;
+}
+
+enum FsEventKind {
+  FS_EVENT_KIND_UNSPECIFIED = 0;
+  FS_EVENT_KIND_CREATE = 1;
+  FS_EVENT_KIND_WRITE = 2;
+  FS_EVENT_KIND_REMOVE = 3;
+  FS_EVENT_KIND_RENAME = 4;
+  FS_EVENT_KIND_CHMOD = 5;
+}
+
+message FsEvent {
+  FsEventKind kind = 1;
+  string path = 2;
+}
+
+enum DiffMode {
+  DIFF_MODE_UNSPECIFIED = 0;
+  // git diff against HEAD in the given repository, including untracked files.
+  DIFF_MODE_GIT = 1;
+  // The upper layer of the root filesystem as a tar.
+  DIFF_MODE_LAYER = 2;
+}
+
+message DiffRequest {
+  string cell_id = 1;
+  DiffMode mode = 2;
+  // For git: the repository. For layer: a subtree to limit the diff to.
+  string path = 3;
+}
+
+message DiffResult {
+  bytes patch = 1;
+  uint32 files_changed = 2;
+}
+
+message ApplyRequest {
+  string cell_id = 1;
+  string path = 2;
+  oneof content {
+    // A unified diff applied with git apply.
+    bytes patch = 3;
+    // A tar unpacked at path.
+    bytes tar = 4;
+  }
+}

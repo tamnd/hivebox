@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/duration.proto";
+import "hivebox/v1/types.proto";
+
+service Exec {
+  // Runs one command to completion and returns its output, capped at max_output_bytes.
+  rpc Run(RunRequest) returns (RunResult);
+  // Runs a command with streamed input and output. The first message must be a start.
+  rpc Start(stream ProcessInput) returns (stream ProcessOutput);
+  rpc Signal(SignalRequest) returns (Empty);
+  // Opens a persistent shell whose state (cwd, env, background jobs) carries over between runs.
+  rpc SessionCreate(SessionCreateRequest) returns (Session);
+  rpc SessionRun(SessionRunRequest) returns (SessionRunResult);
+  rpc SessionInteract(stream SessionInput) returns (stream SessionOutput);
+  rpc SessionClose(SessionRef) returns (Empty);
+}
+
+message RunRequest {
+  string cell_id = 1;
+  // Run argv directly when set, otherwise run shell with sh -c.
+  repeated string argv = 2;
+  string shell = 3;
+  string cwd = 4;
+  map<string, string> env = 5;
+  bytes stdin = 6;
+  google.protobuf.Duration timeout = 7;
+  // The cell's output limit when zero.
+  uint64 max_output_bytes = 8;
+  string user = 9;
+  // A retry with the same key returns the first result instead of running again.
+  string idempotency_key = 10;
+}
+
+message RunResult {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  // True when output past max_output_bytes was dropped. The head is kept.
+  bool truncated = 4;
+  bool timed_out = 5;
+  google.protobuf.Duration wall = 6;
+  ResourceUsage usage = 7;
+  // Set when the process was killed by a signal.
+  int32 signal = 8;
+}
+
+message ProcessStart {
+  string cell_id = 1;
+  repeated string argv = 2;
+  string shell = 3;
+  string cwd = 4;
+  map<string, string> env = 5;
+  google.protobuf.Duration timeout = 6;
+  string user = 7;
+  // Allocate a terminal of this size. No terminal when unset.
+  PtySize pty = 8;
+}
+
+message PtySize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message ProcessInput {
+  oneof input {
+    ProcessStart start = 1;
+    bytes stdin = 2;
+    // Close stdin.
+    bool eof = 3;
+    PtySize resize = 4;
+    int32 signal = 5;
+  }
+}
+
+message ProcessOutput {
+  oneof output {
+    // The process id inside the cell, sent once when the process starts.
+    uint32 pid = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    RunResult exit = 4;
+  }
+}
+
+message SignalRequest {
+  string cell_id = 1;
+  uint32 pid = 2;
+  int32 signal = 3;
+}
+
+message SessionCreateRequest {
+  string cell_id = 1;
+  string shell = 2;
+  string cwd = 3;
+  map<string, string> env = 4;
+  string user = 5;
+}
+
+message Session {
+  string cell_id = 1;
+  string id = 2;
+}
+
+message SessionRef {
+  string cell_id = 1;
+  string id = 2;
+}
+
+message SessionRunRequest {
+  SessionRef session = 1;
+  string command = 2;
+  google.protobuf.Duration timeout = 3;
+  uint64 max_output_bytes = 4;
+}
+
+message SessionRunResult {
+  int32 exit_code = 1;
+  // Stdout and stderr interleaved as the terminal saw them.
+  bytes output = 2;
+  bool truncated = 3;
+  bool timed_out = 4;
+  google.protobuf.Duration wall = 5;
+}
+
+message SessionInput {
+  oneof input {
+    SessionRef open = 1;
+    bytes data = 2;
+    PtySize resize = 3;
+  }
+}
+
+message SessionOutput {
+  bytes data = 1;
+}
