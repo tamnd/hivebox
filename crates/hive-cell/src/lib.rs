@@ -1,14 +1,21 @@
 //! The contract between the node agent and an isolation backend.
 //!
 //! A cell is one sandbox. It might be a WebAssembly instance, a container, a Firecracker microVM
-//! or a QEMU guest, and the node agent does not care which. This crate holds the isolation tiers
-//! and, once M0 lands, the driver trait and the conformance suite a new driver has to pass before
-//! it ships. The design is in `spec/07_backends_snapshots.md`.
+//! or a QEMU guest, and the node agent does not care which. This crate holds the isolation tiers,
+//! the [`CellDriver`] trait every backend implements, and the [`DriverRegistry`] the node agent
+//! keeps them in. The design is in `spec/07_backends_snapshots.md`.
 
 #![forbid(unsafe_code)]
 
+pub mod cgroup;
+mod driver;
+
 use std::fmt;
 
+pub use driver::{
+    CellDriver, CellHandle, CellMetrics, DriverCaps, DriverRegistry, ExitInfo, GuestChannel,
+    Liveness, NodeFit, PauseMode, Result, RootfsPlan, Slot, SnapshotCaps,
+};
 pub use hive_types::{CellId, CellState};
 
 /// How strongly a cell is isolated from the host and from its neighbours. A higher tier is a
