@@ -57,6 +57,7 @@ hivectl = { version = "=0.0.0", path = "crates/hivectl" }
 blake3 = "1.8"
 bytes = "1.12"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+getrandom = "0.4"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.53", default-features = false }
