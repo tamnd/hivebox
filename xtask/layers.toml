@@ -1,0 +1,38 @@
+# The rank of every crate in the workspace. A crate may depend only on crates of strictly lower
+# rank, and `cargo xtask layers` fails the build otherwise. The ranks follow the component diagram
+# in spec/03_architecture.md: the shared vocabulary at the bottom, then the runtime seams, then the
+# node side, then the services, then the things built on the services.
+#
+# A new crate needs a line here before it can build in CI. Raising a crate's rank to make a new
+# dependency legal is allowed, but it is a design change and the pull request should say so.
+
+[ranks]
+hive-types = 0
+hive-proto = 1
+hive-rt = 1
+hive-telemetry = 1
+hive-auth = 2
+hive-cell = 2
+hive-nectar = 2
+hive-drone = 2
+hive-cell-wasm = 3
+hive-cell-proc = 3
+hive-cell-oci = 3
+hive-cell-fc = 3
+hive-cell-ch = 3
+hive-cell-qemu = 3
+hive-cell-plugin = 3
+hive-uffd = 3
+hive-snap = 3
+hive-blockd = 3
+hive-guard = 3
+hive-imaged = 4
+hive-comb = 4
+hive-waggle = 4
+hive-scout = 4
+hive-keeper = 4
+hive-gate = 5
+hive-sdk = 5
+hive-pollen = 6
+hive-sim = 6
+hivectl = 6

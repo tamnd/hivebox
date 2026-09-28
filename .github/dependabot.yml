@@ -1,0 +1,39 @@
+# Weekly is often enough. Grouping keeps the patch and minor bumps to one pull request each without
+# hiding a major bump, and the cooldown means a release has had a week in the wild before it is
+# proposed here, which is when a compromised or broken release usually gets noticed and yanked.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: "deps"
+    groups:
+      patch:
+        update-types: ["patch"]
+      minor:
+        update-types: ["minor"]
+
+  # Actions are pinned to commit SHAs, so something has to move them. This moves the SHA and the
+  # version comment beside it together.
+  - package-ecosystem: github-actions
+    directories: ["/", "/.github/actions/*"]
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

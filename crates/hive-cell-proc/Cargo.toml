@@ -1,0 +1,17 @@
+[package]
+name = "hive-cell-proc"
+description = "The tier 0 hivebox driver, running process cells forked from a warm zygote pool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

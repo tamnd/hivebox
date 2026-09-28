@@ -1,0 +1,160 @@
+# Tagged releases: check the tag, build the binaries on every host we ship for, attach an SBOM and a
+# provenance attestation, and publish a GitHub release whose notes are the changelog section.
+#
+# Nothing goes to crates.io yet. Every crate is `publish = false` until the API is worth depending
+# on. When that changes, publishing will use crates.io trusted publishing through OIDC, so that no
+# long lived registry token ever sits in this repository's secrets.
+#
+# The binaries are built with cargo-auditable, which embeds the exact dependency list in the
+# executable. A scanner can then say which advisories affect a binary running on a node without
+# anyone having to find the lockfile it came from.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        # Every job checks this tag out, so a dispatch builds the tag and not the default branch.
+        # That makes it useful for finishing a release whose binaries did not publish the first
+        # time, as well as for a dry run.
+        description: the tag to build
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # A tag that does not pass the gate does not become a release. Cheaper to find out here than
+  # after the artifacts are uploaded.
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      # No cache anywhere in this workflow. A cache written by a pull request run could otherwise
+      # end up inside a release binary, and a release is worth the extra ten minutes of building.
+      - name: the version in the tag matches the workspace
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          have=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$want" != "$have" ]; then
+            echo "tag $TAG says $want but Cargo.toml says $have"
+            exit 1
+          fi
+          echo "releasing $have"
+      - name: the changelog has an entry
+        run: |
+          set -euo pipefail
+          grep -q "^## ${TAG#v}$" CHANGELOG.md || {
+            echo "CHANGELOG.md has no section for ${TAG#v}"
+            exit 1
+          }
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      - run: cargo xtask ci
+
+  build:
+    name: build for ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The daemons and the guest agent are Linux only. The CLI goes everywhere an operator sits.
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            bins: hivectl hive-gate hive-keeper hive-comb hive-imaged hive-drone
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            bins: hivectl hive-gate hive-keeper hive-comb hive-imaged hive-drone
+          - target: aarch64-apple-darwin
+            os: macos-26
+            bins: hivectl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      # GitHub accepts `$/` for an action in this repository since July 2026 and zizmor prefers it,
+      # but actionlint does not understand it yet. The workspace form is safe here because nothing
+      # before this step clones anything into the workspace.
+      - uses: ./.github/actions/build-archive # zizmor: ignore[self-repository]
+        with:
+          target: ${{ matrix.target }}
+          tag: ${{ env.TAG }}
+          bins: ${{ matrix.bins }}
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      # Provenance attestation, so that someone deploying a binary to a node can check which
+      # workflow run and which commit produced it with `gh attestation verify`.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      # One CycloneDX document for everything in the release. Syft reads the dependency list that
+      # cargo-auditable embedded, so the SBOM describes the binaries rather than the lockfile.
+      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: dist
+          format: cyclonedx-json
+          output-file: dist/hivebox-${{ env.TAG }}.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: list what is being published
+        run: ls -l dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+      # The release notes are the changelog section, written by hand, rather than a list of commit
+      # subjects. GitHub's generated list of merged pull requests follows it for anyone who wants
+      # the detail.
+      - name: take the release notes from the changelog
+        run: |
+          set -euo pipefail
+          awk -v want="## ${TAG#v}" '
+            $0 == want { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $TAG"; exit 1; }
+          cat notes.md
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" \
+            --notes-file notes.md --generate-notes --repo "$GITHUB_REPOSITORY"

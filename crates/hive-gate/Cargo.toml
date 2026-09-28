@@ -1,0 +1,17 @@
+[package]
+name = "hive-gate"
+description = "The hivebox API gateway that authenticates, routes and admits every request, with E2B compatible endpoints."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

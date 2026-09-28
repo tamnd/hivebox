@@ -1,0 +1,45 @@
+# cargo-deny configuration. Runs in CI on every commit and again nightly for advisories published
+# after a commit landed.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# We ship under Apache-2.0 and only take dependencies whose terms that license can carry. The list
+# grows by pull request, with the crate that needs the new license named in it.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.93
+# The list is written ahead of the dependencies that need it, so an unused entry is not a mistake.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside the workspace are pinned through [workspace.dependencies] and are not
+# wildcards in any sense that matters.
+allow-wildcard-paths = true
+deny = [
+  # The node agent links a lot of I/O. One TLS stack is enough, and it is rustls.
+  { name = "openssl-sys" },
+  { name = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,102 @@
+# The slow tier. Everything here is too slow or too noisy to gate a merge, and all of it is the
+# kind of check that finds a problem days before a user would.
+#
+# At M0 the list is short, because most of what belongs here needs a node agent that starts cells.
+# It grows with the milestones, and what is missing is named in the last job rather than left
+# implicit, so that the gap is visible.
+
+name: nightly
+
+on:
+  schedule:
+    # 03:00 UTC. Late enough that a day's commits are in, early enough that the results are
+    # waiting in the morning.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  miri:
+    name: miri
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install nightly with miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: miri
+      # Library unit tests only. The daemons talk to the kernel and Miri cannot. The unsafe this job
+      # is for is in the WAL record codec, the guest protocol framing and the page server's
+      # bookkeeping, and those are libraries.
+      - run: cargo +nightly miri test --workspace --lib
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  sanitizers:
+    name: ${{ matrix.san }} sanitizer
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, thread]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install nightly
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: san-${{ matrix.san }}
+      # The thread sanitizer is here for the node agent's cell table and the page server, which are
+      # shared across threads by design and where a data race is a cell answering for another.
+      - name: cargo test under the sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.san }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.san }}
+        run: cargo +nightly test --workspace --all-features -Zbuild-std --target x86_64-unknown-linux-gnu
+
+  advisories:
+    name: advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny
+      # The per-commit job checks the advisory database as it stood when the commit landed. This
+      # one catches an advisory published afterwards, which is the case that matters for something
+      # already deployed.
+      - run: cargo deny --all-features check advisories bans
+
+  # Named so the gap is visible rather than implicit. Each line becomes a real job at the milestone
+  # that makes it possible, per spec/13_observability_testing_bench.md and spec/14_roadmap.md.
+  planned:
+    name: what belongs here and does not exist yet
+    runs-on: ubuntu-24.04
+    steps:
+      - name: the list
+        run: |
+          cat <<'LIST'
+          the driver conformance suite on a KVM capable self-hosted runner         M0
+          SWE-bench Verified gold patches through the container tier               M0
+          10K deterministic simulation seeds over the control plane                M1
+          E2B compatibility suite, slime SWE unmodified                            M1
+          fuzzing the guest protocol, the WAL codec and the image parsers          M1
+          the escape corpus against every tier and network profile                 M3
+          LIST

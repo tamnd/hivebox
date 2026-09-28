@@ -1,0 +1,51 @@
+name: Bug
+description: A crash, a hang, a cell stuck in a state, a wrong error, or anything else that is broken.
+title: "bug: "
+labels: ["kind/bug", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If this lets code in a cell reach something it should not, stop here and use a private security advisory instead.
+
+        If a cell was lost or leaked (still consuming resources after it was reported stopped), say so in the title. Those are p0 regardless of how rare the trigger is.
+  - type: textarea
+    id: repro
+    attributes:
+      label: The reproduction
+      description: The smallest sequence of SDK or CLI calls that shows it, with the cell spec.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: Paste errors in full. The cell id and the request id help if you have them.
+    validations:
+      required: true
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Which tier
+      options:
+        - T0 wasm or proc
+        - T1 container
+        - T2 microVM
+        - T3 full VM
+        - Not specific to a tier
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `hivectl --version` and the node agent version, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: The host
+      description: Kernel version, distribution, CPU and memory, and the storage backend.
+    validations:
+      required: true

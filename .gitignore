@@ -1,0 +1,21 @@
+/target
+
+# Benchmark and profiling output. Large, machine specific, and regenerable.
+/bench-results
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+flamegraph.svg
+
+# Snapshots, images and disks made while testing a driver by hand.
+*.snap
+*.erofs
+*.img
+*.qcow2
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

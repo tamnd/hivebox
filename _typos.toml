@@ -1,0 +1,6 @@
+# Words typos does not know and that are not mistakes. Each one is a real name in this domain.
+[default.extend-words]
+# Linux Data Access MONitor, the kernel's memory access sampler.
+DAMON = "DAMON"
+# Free page reporting, the virtio-balloon feature.
+FPR = "FPR"

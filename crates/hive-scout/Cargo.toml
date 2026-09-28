@@ -1,0 +1,17 @@
+[package]
+name = "hive-scout"
+description = "The hivebox cluster state aggregator that collects node reports and serves them to placement and routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

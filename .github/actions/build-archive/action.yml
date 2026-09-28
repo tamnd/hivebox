@@ -1,0 +1,69 @@
+# Build the release binaries for one target and package them with their checksums.
+#
+# A composite action rather than steps in the workflow, so that adding a host to the release matrix
+# is one line and the steps cannot drift between hosts. The caller checks the repository out,
+# because a local action is read from the workspace.
+
+name: build archive
+description: build the hivebox binaries for one target with cargo-auditable and package them
+
+inputs:
+  target:
+    description: the Rust target triple to build
+    required: true
+  tag:
+    description: the tag the archive is named after
+    required: true
+  bins:
+    description: space separated list of binaries to build and package
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: add the target
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: rustup target add "$TARGET"
+    - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      with:
+        tool: cargo-auditable
+    - name: build
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        BINS: ${{ inputs.bins }}
+      run: |
+        set -euo pipefail
+        args=()
+        for b in $BINS; do args+=(--bin "$b"); done
+        cargo auditable build --release --locked --target "$TARGET" "${args[@]}"
+    - name: package
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        TAG: ${{ inputs.tag }}
+        BINS: ${{ inputs.bins }}
+      run: |
+        set -euo pipefail
+        name="hivebox-$TAG-$TARGET"
+        mkdir -p "dist/$name"
+        for b in $BINS; do cp "target/$TARGET/release/$b" "dist/$name/"; done
+        cp README.md LICENSE-APACHE CHANGELOG.md "dist/$name/"
+        cd dist
+        tar --format=ustar -czf "$name.tar.gz" "$name"
+        if command -v sha256sum > /dev/null; then
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+        else
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+        fi
+        rm -rf "$name"
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: dist-${{ inputs.target }}
+        path: |
+          dist/*.tar.gz
+          dist/*.sha256
+        if-no-files-found: error
+        retention-days: 7

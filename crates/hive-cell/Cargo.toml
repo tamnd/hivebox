@@ -1,0 +1,20 @@
+[package]
+name = "hive-cell"
+description = "The CellDriver trait that every hivebox isolation backend implements, and its conformance tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+hive-types.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+name: Performance
+description: Something is slower, heavier or less dense than the spec says it should be.
+title: "perf: "
+labels: ["kind/performance", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A number without the command that produced it cannot be acted on. If you can reproduce it with a suite from tamnd/hivebox-bench, that is the best possible report.
+  - type: textarea
+    id: what
+    attributes:
+      label: What is slow
+      description: Create latency, exec round trip, fork, restore, density, creates per second, memory per cell.
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: The numbers
+      description: Median and spread over several runs, and the target from spec/02_requirements_slos.md you are comparing against.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The command that reproduces it
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: The machine
+      description: CPU, core count, memory, kernel, storage, and how many nodes.
+    validations:
+      required: true

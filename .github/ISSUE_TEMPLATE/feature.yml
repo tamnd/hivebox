@@ -1,0 +1,21 @@
+name: Feature
+description: Something hivebox should do that it does not.
+title: "feat: "
+labels: ["kind/feature", "status/needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what stops you. Start from the workload, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: If you have a design in mind, say which spec document it touches.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead

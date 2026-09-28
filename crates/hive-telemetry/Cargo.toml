@@ -1,0 +1,17 @@
+[package]
+name = "hive-telemetry"
+description = "Tracing, metrics and audit log setup for hivebox services, with a guard on label cardinality."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

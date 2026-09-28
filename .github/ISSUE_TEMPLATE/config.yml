@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/tamnd/hivebox/security/advisories/new
+    about: A way out of a cell, past an egress policy, or into another tenant's data. Please do not open a public issue.
+  - name: Question about the design
+    url: https://github.com/tamnd/hivebox/discussions
+    about: The documents under spec/ are the design. If something in them does not hold up, a discussion is a good place to say so.

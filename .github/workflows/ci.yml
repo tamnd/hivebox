@@ -1,0 +1,181 @@
+# The per-commit gate. Everything here is required to merge, through the single `ci` job at the
+# bottom, so branch protection lists one check rather than all of them.
+#
+# The node side of hivebox only runs on Linux and most of it needs root, KVM or a recent kernel.
+# None of that is available on a hosted runner in a way that means anything, so the tests that need
+# it are gated and skip loudly here. They run on real hardware through tamnd/hivebox-bench. What
+# this workflow proves is that the tree builds, the rules hold and the tests that can run do pass.
+#
+# Every action is pinned to a full commit SHA with the version beside it. A tag is a moving
+# reference that whoever controls the action can repoint, and this is a project whose whole job is
+# running untrusted code safely. Dependabot moves the pins.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# A force-push cancels the run it replaced. The default branch is exempt, because a main-branch run
+# is what the badge and the bisect history read from.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  # Cheapest checks first, so a formatting mistake costs seconds rather than a full matrix.
+  quick:
+    name: format, lints and house rules
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      # spec/03_architecture.md gives the crates an order and xtask/layers.toml writes it down. The
+      # guest agent linking the node agent is the kind of mistake that is free to prevent on day
+      # one and weeks of work to undo later.
+      - name: layer rule
+        run: cargo xtask layers
+      - name: prose style
+        run: cargo xtask style
+      - name: spelling
+        uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+  test:
+    name: test on ${{ matrix.name }}
+    needs: quick
+    runs-on: ${{ matrix.os }}
+    # Runner images are named explicitly rather than through `-latest`, so that an image rollout
+    # shows up as a commit rather than as yesterday's green run turning red.
+    #
+    # macOS is here for the client side: the SDK, the CLI and everything they link. Most people
+    # who drive a cluster do it from a laptop. Windows is not here until someone asks for it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86-64, debug
+            os: ubuntu-24.04
+            profile: dev
+          - name: linux x86-64, release
+            os: ubuntu-24.04
+            profile: release
+          - name: linux arm64
+            os: ubuntu-24.04-arm
+            profile: dev
+          - name: macos arm64
+            os: macos-26
+            profile: dev
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.profile }}
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      - name: cargo nextest
+        run: cargo nextest run --workspace --all-features --cargo-profile ${{ matrix.profile }}
+      # nextest does not run doctests, and an example in the docs that does not compile is a
+      # broken promise on the first page anybody reads.
+      - name: doctests
+        run: cargo test --workspace --all-features --doc --profile ${{ matrix.profile }}
+
+  docs:
+    name: documentation
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo doc
+        run: cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    name: minimum supported rust version
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: read the floor from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: install
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "$MSRV" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv
+      # The floor is raised deliberately, in a commit, and not by accident in a dependency bump.
+      - name: cargo check
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+$MSRV" check --workspace --all-features
+
+  audit:
+    name: supply chain
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny
+      # Licenses, advisories, banned crates and unknown sources, all in deny.toml.
+      - name: cargo deny
+        run: cargo deny --all-features check
+
+  # The workflows are code that runs with a token, so they get linted like code. zizmor finds
+  # template injection, overly broad permissions, unpinned actions and credentials left on disk.
+  workflows:
+    name: workflow security
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          # Print the findings in the log and fail on them, rather than uploading to code scanning,
+          # which needs a write permission this workflow does not otherwise want.
+          advanced-security: false
+
+  ci:
+    name: ci
+    if: always()
+    needs: [quick, test, docs, msrv, audit, workflows]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: fail if anything upstream failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: pass
+        run: echo "all required jobs succeeded"

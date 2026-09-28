@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Guest images and snapshot fixtures are compared byte for byte, so git must not rewrite them.
+*.erofs binary
+*.img binary
+*.snap binary
