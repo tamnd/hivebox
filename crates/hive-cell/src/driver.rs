@@ -71,8 +71,8 @@ pub struct Slot {
     /// The cell's cgroup directory, made and limited by the node agent. The driver puts every
     /// process of the cell in it and nothing else.
     pub cgroup: PathBuf,
-    /// The cell's network namespace, as a path under `/run/netns`, or `None` for no network at
-    /// all.
+    /// The cell's network namespace, a file under the node's namespace directory that
+    /// [`crate::netns`] made, or `None` for the host's network.
     pub netns: Option<PathBuf>,
     /// A directory only this cell's driver writes to, for sockets, logs and state. It is removed
     /// when the cell is gone.
@@ -118,6 +118,8 @@ pub struct CellHandle {
     pub channel: GuestChannel,
     /// The cgroup from its [`Slot`].
     pub cgroup: PathBuf,
+    /// The network namespace from its [`Slot`].
+    pub netns: Option<PathBuf>,
     /// Anything else the driver needs to find the cell again, such as an API socket.
     pub extra: BTreeMap<String, String>,
 }

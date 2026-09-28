@@ -51,6 +51,8 @@ pub(crate) struct Handle {
     pub(crate) cgroup: String,
     #[prost(btree_map = "string, string", tag = "6")]
     pub(crate) extra: BTreeMap<String, String>,
+    #[prost(string, tag = "7")]
+    pub(crate) netns: String,
 }
 
 /// The WAL key that holds the next free sequence number. Real cell ids never have every bit set,
@@ -108,6 +110,7 @@ impl Handle {
             vsock,
             vsock_port,
             cgroup: text(&h.cgroup),
+            netns: h.netns.as_deref().map(text).unwrap_or_default(),
             extra: h.extra.clone(),
         }
     }
@@ -124,6 +127,7 @@ impl Handle {
             pid: self.pid,
             channel,
             cgroup: PathBuf::from(&self.cgroup),
+            netns: (!self.netns.is_empty()).then(|| PathBuf::from(&self.netns)),
             extra: self.extra.clone(),
         }
     }
@@ -164,6 +168,7 @@ mod tests {
             pid: Some(4242),
             channel: GuestChannel::Unix("/run/hive/cells/x/drone.sock".into()),
             cgroup: "/sys/fs/cgroup/hive.slice/cell-7".into(),
+            netns: Some("/run/hivebox/netns/cell-7".into()),
             extra: BTreeMap::from([("bundle".into(), "/var/lib/x".into())]),
         };
         let mut r = Record {
@@ -187,6 +192,7 @@ mod tests {
         let vm = CellHandle {
             channel: GuestChannel::Vsock { uds: "/srv/jail/v.sock".into(), port: 52 },
             pid: None,
+            netns: None,
             ..back.handle(id, Backend::Microvm).unwrap()
         };
         let stored = Handle::from_cell(&vm);

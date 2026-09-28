@@ -5,10 +5,14 @@
 //! the [`CellDriver`] trait every backend implements, and the [`DriverRegistry`] the node agent
 //! keeps them in. The design is in `spec/07_backends_snapshots.md`.
 
-#![forbid(unsafe_code)]
+// Unsafe is denied everywhere but the one `unshare` call in `netns`, which is how a network
+// namespace is made.
+#![deny(unsafe_code)]
 
 pub mod cgroup;
 mod driver;
+#[cfg(target_os = "linux")]
+pub mod netns;
 
 use std::fmt;
 

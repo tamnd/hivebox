@@ -23,6 +23,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long a cell that is still there gets to answer on a new channel before it counts as lost.
 const RECONNECT_PATIENCE: Duration = Duration::from_secs(5);
+/// Longest one connection attempt with its handshake may take. A local one takes well under a
+/// millisecond.
+const ATTEMPT: Duration = Duration::from_secs(2);
 
 /// Where a cell is, as its actor last left it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +152,8 @@ pub(crate) struct Actor {
     handle: Option<CellHandle>,
     /// The cell's own cgroup, from the moment it is taken until the cell is over.
     cgroup: Option<PathBuf>,
+    /// The cell's own network namespace, the same way.
+    netns: Option<PathBuf>,
 }
 
 impl Actor {
@@ -160,7 +165,17 @@ impl Actor {
         reservation: Option<Reservation>,
         record: Record,
     ) -> Self {
-        Self { inner, cell, driver, rx, reservation, record, handle: None, cgroup: None }
+        Self {
+            inner,
+            cell,
+            driver,
+            rx,
+            reservation,
+            record,
+            handle: None,
+            cgroup: None,
+            netns: None,
+        }
     }
 
     pub(crate) async fn run(mut self, start: Start) {
@@ -300,7 +315,14 @@ impl Actor {
             cgroup = taken.map_err(|e| io_error("setting up the cell's cgroup", &e))?;
             self.cgroup = Some(cgroup.clone());
         }
-        Ok(Slot { cgroup, netns: None, dir, secret })
+        if let Some(pool) = self.inner.netns.clone() {
+            let taken = tokio::task::spawn_blocking(move || pool.take())
+                .await
+                .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+            self.netns =
+                Some(taken.map_err(|e| io_error("making the cell's network namespace", &e))?);
+        }
+        Ok(Slot { cgroup, netns: self.netns.clone(), dir, secret })
     }
 
     /// Undoes whatever a failed create got as far as, and records the failure.
@@ -320,6 +342,7 @@ impl Actor {
         self.handle = self.record.handle(self.cell.id, backend);
         self.cgroup =
             self.handle.as_ref().map(|h| h.cgroup.clone()).filter(|c| !c.as_os_str().is_empty());
+        self.netns = self.handle.as_ref().and_then(|h| h.netns.clone());
         let state = self.record.cell_state().unwrap_or(CellState::Failed);
         if state.is_terminal() {
             // Already over and cleaned up. It only stays for others to see how it ended.
@@ -597,6 +620,14 @@ impl Actor {
                 }
             });
         }
+        if let (Some(ns), Some(pool)) = (self.netns.take(), self.inner.netns.clone()) {
+            // The kernel frees the namespace itself once no mount and no process holds it.
+            tokio::spawn(async move {
+                if let Err(e) = pool.remove(ns).await {
+                    eprintln!("hive-comb: removing a cell's network namespace: {e}");
+                }
+            });
+        }
     }
 
     /// Keeps an ended cell visible for a while, then forgets it.
@@ -640,7 +671,10 @@ pub(crate) async fn connect(
     let started = Instant::now();
     let mut wait = Duration::from_millis(1);
     loop {
-        match try_connect(channel, secret).await {
+        // A guest agent that takes the connection and then never answers would otherwise hold
+        // this up for good.
+        let attempt = tokio::time::timeout(ATTEMPT, try_connect(channel, secret)).await;
+        match attempt.unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::TimedOut))) {
             Ok(c) => return Ok(c),
             Err(e) => {
                 if patience.is_some_and(|p| started.elapsed() >= p) {
