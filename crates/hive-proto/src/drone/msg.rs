@@ -72,12 +72,15 @@ pub struct Status {
     /// For a human.
     #[prost(string, tag = "2")]
     pub message: String,
+    /// The errno name for a `FILE_ERROR`, or empty.
+    #[prost(string, tag = "3")]
+    pub errno: String,
 }
 
 impl Status {
     /// A failure with `reason`.
     pub fn error(reason: hive_types::Reason, message: impl Into<String>) -> Self {
-        Self { reason: reason.as_str().to_string(), message: message.into() }
+        Self { reason: reason.as_str().to_string(), message: message.into(), errno: String::new() }
     }
 
     /// The failure this status describes, or `None` for success. An unknown reason from a newer
@@ -89,12 +92,20 @@ impl Status {
         }
         let reason =
             hive_types::Reason::from_name(&self.reason).unwrap_or(hive_types::Reason::Internal);
-        Some(hive_types::Error::new(reason, self.message.clone()))
+        let mut e = hive_types::Error::new(reason, self.message.clone());
+        if !self.errno.is_empty() {
+            e.errno = Some(self.errno.clone());
+        }
+        Some(e)
     }
 }
 
 impl From<hive_types::Error> for Status {
     fn from(e: hive_types::Error) -> Self {
-        Self::error(e.reason, e.message)
+        Self {
+            reason: e.reason.as_str().to_string(),
+            message: e.message,
+            errno: e.errno.unwrap_or_default(),
+        }
     }
 }

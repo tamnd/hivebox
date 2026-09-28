@@ -26,6 +26,23 @@ pub const SESSION_RUN: &str = "session.run";
 pub const SESSION_SEND: &str = "session.send";
 /// Ends a session and everything running in it. Request [`SessionRef`], empty answer.
 pub const SESSION_CLOSE: &str = "session.close";
+/// Reads a file. Request [`FsRead`], answer the bytes as plain data frames.
+pub const FS_READ: &str = "fs.read";
+/// Writes a file. Request [`FsWrite`], then optionally more of the file as plain data frames,
+/// then the end. Answer [`FileInfo`].
+pub const FS_WRITE: &str = "fs.write";
+/// Describes a path. Request [`FsPath`], answer [`FileInfo`].
+pub const FS_STAT: &str = "fs.stat";
+/// Lists a directory. Request [`FsList`], answer [`FsListResult`].
+pub const FS_LIST: &str = "fs.list";
+/// Makes a directory. Request [`FsMkdir`], answer [`FileInfo`].
+pub const FS_MKDIR: &str = "fs.mkdir";
+/// Removes a file or directory. Request [`FsPath`], empty answer.
+pub const FS_REMOVE: &str = "fs.remove";
+/// Moves a path. Request [`FsRename`], answer [`FileInfo`] for where it went.
+pub const FS_RENAME: &str = "fs.rename";
+/// Changes permission bits. Request [`FsChmod`], answer [`FileInfo`].
+pub const FS_CHMOD: &str = "fs.chmod";
 
 /// The most data one tagged frame carries, so that the tag and the data fit in one frame.
 pub const MAX_CHUNK: usize = MAX_PAYLOAD - 1;
@@ -288,6 +305,180 @@ pub struct SessionSendResult {
     /// True when the shell exited. The next call starts a new one.
     #[prost(bool, tag = "6")]
     pub restarted: bool,
+}
+
+/// A path, and how to treat it. For `fs.stat` and `fs.remove`.
+///
+/// Every path in the fs methods is absolute or relative to the drone's working directory, and it
+/// resolves inside one of the drone's allowed roots. Symlinks and `..` never lead out of that
+/// root: an absolute link target starts again at the root.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsPath {
+    /// The path.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// For `fs.stat`: describe what a final symlink points to instead of the link itself.
+    #[prost(bool, tag = "2")]
+    pub follow: bool,
+    /// For `fs.remove`: remove a directory and everything in it.
+    #[prost(bool, tag = "3")]
+    pub recursive: bool,
+}
+
+/// What kind of thing a path is. The numbers match `hivebox.v1.FileType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum FileKind {
+    /// Not known.
+    Unspecified = 0,
+    /// A regular file.
+    File = 1,
+    /// A directory.
+    Dir = 2,
+    /// A symbolic link.
+    Symlink = 3,
+    /// A device, a pipe or a socket.
+    Other = 4,
+}
+
+/// One file or directory.
+#[derive(Clone, PartialEq, Message)]
+pub struct FileInfo {
+    /// The path as asked for, or joined from the listed directory.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// What it is.
+    #[prost(enumeration = "FileKind", tag = "2")]
+    pub kind: i32,
+    /// Its size in bytes.
+    #[prost(uint64, tag = "3")]
+    pub size: u64,
+    /// Permission bits, including setuid, setgid and sticky.
+    #[prost(uint32, tag = "4")]
+    pub mode: u32,
+    /// The owner.
+    #[prost(uint32, tag = "5")]
+    pub uid: u32,
+    /// The group.
+    #[prost(uint32, tag = "6")]
+    pub gid: u32,
+    /// When its content last changed, in nanoseconds since the Unix epoch.
+    #[prost(int64, tag = "7")]
+    pub modified_unix_nanos: i64,
+    /// Where a symlink points, as written in the link.
+    #[prost(string, tag = "8")]
+    pub symlink_target: String,
+}
+
+/// Reads part or all of a file.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsRead {
+    /// The file.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// Where to start.
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    /// The most bytes to read. To the end when zero.
+    #[prost(uint64, tag = "3")]
+    pub length: u64,
+}
+
+/// Writes a file. The drone writes to a new file next to it and renames that into place at the
+/// end, so readers never see half a file and a write that fails leaves the old file alone. An
+/// existing file keeps its permissions and owner unless the request sets them. Writing through
+/// a symlink, or with `append`, changes the file in place.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsWrite {
+    /// The file.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// The start of the content. The rest, if any, follows as data.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: Bytes,
+    /// Permission bits. 0644 for a new file when zero, and unchanged for an existing one.
+    #[prost(uint32, tag = "3")]
+    pub mode: u32,
+    /// Make missing parent directories.
+    #[prost(bool, tag = "4")]
+    pub make_parents: bool,
+    /// Add to the end of the file instead of replacing it.
+    #[prost(bool, tag = "5")]
+    pub append: bool,
+    /// The owner of a new file. The drone's configured user when unset.
+    #[prost(uint32, optional, tag = "6")]
+    pub uid: Option<u32>,
+    /// The group of a new file. The drone's configured group when unset.
+    #[prost(uint32, optional, tag = "7")]
+    pub gid: Option<u32>,
+}
+
+/// Lists a directory.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsList {
+    /// The directory.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// How deep to go. One lists just the directory's own entries, and zero is treated as one.
+    /// Symlinks to directories are listed but not entered.
+    #[prost(uint32, tag = "2")]
+    pub depth: u32,
+}
+
+/// A directory's entries, sorted by path.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsListResult {
+    /// The entries.
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<FileInfo>,
+    /// True when the listing stopped at the drone's limit.
+    #[prost(bool, tag = "2")]
+    pub truncated: bool,
+}
+
+/// Makes a directory.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsMkdir {
+    /// The directory.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// Permission bits. 0755 when zero.
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
+    /// Make missing parents too, and succeed if the directory is already there, like `mkdir -p`.
+    #[prost(bool, tag = "3")]
+    pub parents: bool,
+    /// The owner of directories it makes. The drone's configured user when unset.
+    #[prost(uint32, optional, tag = "4")]
+    pub uid: Option<u32>,
+    /// The group of directories it makes. The drone's configured group when unset.
+    #[prost(uint32, optional, tag = "5")]
+    pub gid: Option<u32>,
+}
+
+/// Moves a path.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsRename {
+    /// Where it is.
+    #[prost(string, tag = "1")]
+    pub from: String,
+    /// Where it goes. Both must be under the same root.
+    #[prost(string, tag = "2")]
+    pub to: String,
+    /// Replace what is at `to`. Without it, an existing `to` is an `EEXIST` error.
+    #[prost(bool, tag = "3")]
+    pub overwrite: bool,
+}
+
+/// Changes permission bits. A final symlink is followed, since links have no bits of their own.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsChmod {
+    /// The path.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// The new bits, including setuid, setgid and sticky.
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
 }
 
 impl RunResult {

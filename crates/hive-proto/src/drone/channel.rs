@@ -228,7 +228,7 @@ impl Drop for Ends {
         forget(&self.shared, self.id);
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         if !state.reset && !(state.sent_end && state.got_end) {
-            let status = Status { reason: String::new(), message: "dropped".into() };
+            let status = Status { message: "dropped".into(), ..Status::default() };
             let _ =
                 self.shared.out.try_send(Frame::new(self.id, Kind::Reset, status.encode_to_vec()));
         }

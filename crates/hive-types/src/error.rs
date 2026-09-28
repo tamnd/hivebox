@@ -34,6 +34,9 @@ pub enum Reason {
     ImageUnavailable,
     /// The guest agent did not answer.
     DroneUnreachable,
+    /// A file operation in the cell failed, like reading a path that does not exist. The error's
+    /// `errno` names the cause.
+    FileError,
     /// A bug or an unexpected failure inside hivebox.
     Internal,
 }
@@ -64,7 +67,7 @@ pub enum Code {
 
 impl Reason {
     /// Every reason.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::QuotaExceeded,
         Self::CapacityUnavailable,
         Self::CellNotFound,
@@ -76,6 +79,7 @@ impl Reason {
         Self::InvalidArgument,
         Self::ImageUnavailable,
         Self::DroneUnreachable,
+        Self::FileError,
         Self::Internal,
     ];
 
@@ -94,6 +98,7 @@ impl Reason {
             Self::InvalidArgument => "INVALID_ARGUMENT",
             Self::ImageUnavailable => "IMAGE_UNAVAILABLE",
             Self::DroneUnreachable => "DRONE_UNREACHABLE",
+            Self::FileError => "FILE_ERROR",
             Self::Internal => "INTERNAL",
         }
     }
@@ -113,7 +118,7 @@ impl Reason {
                 Code::Unavailable
             }
             Self::CellNotFound | Self::CellLost => Code::NotFound,
-            Self::CellNotRunning => Code::FailedPrecondition,
+            Self::CellNotRunning | Self::FileError => Code::FailedPrecondition,
             Self::ExecTimeout => Code::DeadlineExceeded,
             Self::OutputLimit => Code::Ok,
             Self::PolicyDenied => Code::PermissionDenied,
@@ -163,12 +168,20 @@ pub struct Error {
     pub reason: Reason,
     /// What happened, for the log and the caller.
     pub message: String,
+    /// For [`Reason::FileError`], the name of the Linux errno behind it, like `ENOENT`. SDKs use
+    /// it to raise the error their language has for that case.
+    pub errno: Option<String>,
 }
 
 impl Error {
     /// A failure for `reason`.
     pub fn new(reason: Reason, message: impl Into<String>) -> Self {
-        Self { reason, message: message.into() }
+        Self { reason, message: message.into(), errno: None }
+    }
+
+    /// A [`Reason::FileError`] caused by the errno named `errno`.
+    pub fn file(errno: impl Into<String>, message: impl Into<String>) -> Self {
+        Self { reason: Reason::FileError, message: message.into(), errno: Some(errno.into()) }
     }
 }
 

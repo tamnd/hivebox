@@ -139,6 +139,8 @@ message Error {
   // True when the failure is the platform's fault rather than the workload's, so a trainer can mask the sample.
   bool is_infra_error = 3;
   bool retryable = 4;
+  // For FILE_ERROR, the Linux errno behind it, like ENOENT.
+  string errno = 5;
 }
 
 // Picks cells either by id or by label selector within the caller's project.

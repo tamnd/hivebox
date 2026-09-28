@@ -223,6 +223,7 @@ pub fn error_to_v1(e: &Error) -> v1::Error {
         message: e.message.clone(),
         is_infra_error: e.reason.is_infra(),
         retryable: e.reason.is_retryable(),
+        errno: e.errno.clone().unwrap_or_default(),
     }
 }
 
@@ -241,11 +242,14 @@ fn code_to_tonic(c: Code) -> tonic::Code {
 }
 
 /// An error as a gRPC status: the reason's code, with an `ErrorInfo` detail carrying the reason,
-/// the domain and `is_infra_error`.
+/// the domain, `is_infra_error` and `errno` when there is one.
 #[must_use]
 pub fn error_to_status(e: &Error) -> tonic::Status {
-    let metadata: std::collections::HashMap<String, String> =
+    let mut metadata: std::collections::HashMap<String, String> =
         [("is_infra_error".to_string(), e.reason.is_infra().to_string())].into_iter().collect();
+    if let Some(errno) = &e.errno {
+        metadata.insert("errno".to_string(), errno.clone());
+    }
     let details = ErrorDetails::with_error_info(e.reason.as_str(), ERROR_DOMAIN, metadata);
     tonic::Status::with_error_details(code_to_tonic(e.reason.code()), e.message.clone(), details)
 }
@@ -254,13 +258,12 @@ pub fn error_to_status(e: &Error) -> tonic::Status {
 /// build does not know, reads as `INTERNAL` with the status message kept.
 #[must_use]
 pub fn error_from_status(s: &tonic::Status) -> Error {
-    let reason = s
-        .get_error_details()
-        .error_info()
-        .filter(|i| i.domain == ERROR_DOMAIN)
-        .and_then(|i| Reason::from_name(&i.reason))
-        .unwrap_or(Reason::Internal);
-    Error::new(reason, s.message().to_string())
+    let details = s.get_error_details();
+    let info = details.error_info().filter(|i| i.domain == ERROR_DOMAIN);
+    let reason = info.and_then(|i| Reason::from_name(&i.reason)).unwrap_or(Reason::Internal);
+    let mut e = Error::new(reason, s.message().to_string());
+    e.errno = info.and_then(|i| i.metadata.get("errno").cloned());
+    e
 }
 
 #[cfg(test)]
@@ -323,6 +326,9 @@ mod tests {
             assert_eq!(back, e);
         }
         assert_eq!(error_from_status(&tonic::Status::unavailable("x")).reason, Reason::Internal);
+        let e = Error::file("ENOENT", "no such file");
+        assert_eq!(error_from_status(&error_to_status(&e)), e);
+        assert_eq!(error_to_v1(&e).errno, "ENOENT");
     }
 
     #[test]

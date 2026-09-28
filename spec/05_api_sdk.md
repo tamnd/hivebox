@@ -107,10 +107,11 @@ Errors use the gRPC status plus `google.rpc.ErrorInfo{reason, domain:"hivebox.de
 | `OUTPUT_LIMIT` | OK with `truncated` | n/a | no |
 | `POLICY_DENIED` | PERMISSION_DENIED | no | no |
 | `IMAGE_UNAVAILABLE` | UNAVAILABLE | yes | yes |
+| `FILE_ERROR` | FAILED_PRECONDITION | no | no |
 | `DRONE_UNREACHABLE` | UNAVAILABLE | yes (≤3) | yes |
 | `INTERNAL` | INTERNAL | yes | yes |
 
-Every error carries `is_infra_error` in its metadata so trainers can mask samples uniformly (11 section 7).
+Every error carries `is_infra_error` in its metadata so trainers can mask samples uniformly (11 section 7). A `FILE_ERROR` also carries `errno`, the Linux name of the cause such as `ENOENT` or `EISDIR`, so SDKs can raise the error their language uses for it.
 
 ## 3. Cell state machine
 
