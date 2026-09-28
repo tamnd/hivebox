@@ -221,6 +221,20 @@ pub enum Cause {
 }
 
 impl Cause {
+    /// Every cause, in declaration order.
+    pub const ALL: [Self; 10] = [
+        Self::Requested,
+        Self::Idle,
+        Self::HardTtl,
+        Self::Exited,
+        Self::Oom,
+        Self::Policy,
+        Self::StartFailed,
+        Self::DroneLost,
+        Self::NodeLost,
+        Self::Recovery,
+    ];
+
     /// Whether the platform is to blame. The same split as [`Reason::is_infra`].
     #[must_use]
     pub const fn is_infra(self) -> bool {

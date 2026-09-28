@@ -15,3 +15,16 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hive-cell.workspace = true
+hive-drone.workspace = true
+hive-proto.workspace = true
+hive-rt.workspace = true
+hive-types.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util.workspace = true

@@ -73,6 +73,8 @@ impl CellState {
                     | (Starting, Running)
                     | (Running, Pausing)
                     | (Pausing, Paused)
+                    // The pause did not take, and the cell is still running.
+                    | (Pausing, Running)
                     | (Paused, Running)
                     | (Stopping, Stopped)
                     | (Stopping, Expired)
@@ -142,6 +144,11 @@ mod tests {
         assert!(!Running.can_become(Stopped));
         assert!(!Running.can_become(Expired));
         assert!(!Running.can_become(Running));
+    }
+
+    #[test]
+    fn a_pause_that_did_not_take_goes_back_to_running() {
+        assert!(Pausing.can_become(Running));
     }
 
     #[test]

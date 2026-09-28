@@ -73,6 +73,11 @@ impl Client {
         self.channel.is_closed()
     }
 
+    /// Waits until the connection has gone.
+    pub async fn closed(&self) {
+        self.channel.closed().await;
+    }
+
     /// Runs a command to completion.
     pub async fn run(&self, req: &RunRequest) -> Result<RunResult, Error> {
         if req.stdin.len() <= INLINE_STDIN {
