@@ -103,6 +103,12 @@ pub fn cause_to_v1(c: Cause) -> v1::Cause {
     }
 }
 
+/// A cause from the wire. `None` for `CAUSE_UNSPECIFIED`.
+#[must_use]
+pub fn cause_from_v1(c: v1::Cause) -> Option<Cause> {
+    Cause::ALL.into_iter().find(|&k| cause_to_v1(k) == c)
+}
+
 fn duration_from_v1(
     d: Option<prost_types::Duration>,
     field: &str,
@@ -269,6 +275,14 @@ pub fn error_from_status(s: &tonic::Status) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn causes_round_trip() {
+        for c in Cause::ALL {
+            assert_eq!(cause_from_v1(cause_to_v1(c)), Some(c));
+        }
+        assert_eq!(cause_from_v1(v1::Cause::Unspecified), None);
+    }
 
     #[test]
     fn a_bare_request_gets_the_defaults() {

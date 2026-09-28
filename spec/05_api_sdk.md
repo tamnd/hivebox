@@ -134,6 +134,8 @@ Every error carries `is_infra_error` in its metadata so trainers can mask sample
    └─ (fork/restore creates new cells; they enter at STARTING)
 ```
 
+A pause that does not take goes from PAUSING back to RUNNING, since the cell never stopped.
+
 The comb owns all transitions. Each one is a WAL record `{cell, from, to, cause, ts, seq}`.
 
 Terminal states are retained for 24 h (queryable), then compacted to the audit store.

@@ -319,6 +319,19 @@ version = "0.0.2"
 [[package]]
 name = "hive-comb"
 version = "0.0.2"
+dependencies = [
+ "blake3",
+ "bytes",
+ "futures",
+ "hive-cell",
+ "hive-drone",
+ "hive-proto",
+ "hive-rt",
+ "hive-types",
+ "prost",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "hive-drone"

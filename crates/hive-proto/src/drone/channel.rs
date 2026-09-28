@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 /// The credit each side starts with on a new stream.
@@ -62,6 +62,8 @@ struct Shared {
     streams: Mutex<HashMap<u32, Slot>>,
     next_id: AtomicU32,
     closed: AtomicBool,
+    // Flips to true once, when the connection goes, for anyone waiting in `closed`.
+    gone: watch::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -101,6 +103,7 @@ impl Channel {
             streams: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(if side == Side::Node { 1 } else { 2 }),
             closed: AtomicBool::new(false),
+            gone: watch::Sender::new(false),
         });
         tokio::spawn(write_loop(FramedWrite::new(write, FrameCodec), out_rx));
         tokio::spawn(read_loop(FramedRead::new(read, FrameCodec), shared.clone(), in_tx));
@@ -111,6 +114,13 @@ impl Channel {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// Waits until the connection underneath has gone.
+    pub async fn closed(&self) {
+        let mut rx = self.shared.gone.subscribe();
+        // The sender lives in `shared`, which `self` holds, so this only ends when the flag flips.
+        let _ = rx.wait_for(|&gone| gone).await;
     }
 
     /// Opens a stream calling `method` with `request`. The request must fit in one frame with
@@ -437,6 +447,7 @@ async fn read_loop<R>(
         }
     };
     shared.closed.store(true, Ordering::Release);
+    shared.gone.send_replace(true);
     let slots: Vec<Slot> = shared.table().drain().map(|(_, s)| s).collect();
     for slot in slots {
         let _ = slot.events.send(Event::Reset(Error::new(Reason::DroneUnreachable, why.clone())));
@@ -668,6 +679,23 @@ mod tests {
         let err = s.recv().await.unwrap_err();
         assert_eq!(err.reason, Reason::DroneUnreachable);
         assert!(node.is_closed());
+        // Waiting after the fact returns at once, and so does a clone's wait.
+        node.closed().await;
+        node.clone().closed().await;
+    }
+
+    #[tokio::test]
+    async fn closed_wakes_when_the_peer_goes() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (node, _in) = Channel::start(a, Side::Node);
+        let waiter = tokio::spawn({
+            let node = node.clone();
+            async move { node.closed().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(b);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await.unwrap().unwrap();
     }
 
     #[tokio::test]

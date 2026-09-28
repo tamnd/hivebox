@@ -1,0 +1,470 @@
+//! The comb: the table of cells, the way into each cell's actor, and recovery after a restart.
+
+use crate::admit::{self, Admission};
+use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
+use crate::config::Config;
+use crate::record::{Record, SEQ_KEY, Seq, time};
+use crate::wal::Wal;
+use hive_cell::{DriverRegistry, RootfsPlan, Slot};
+use hive_drone::Client;
+use hive_proto::convert;
+use hive_rt::{OsRng, Rng};
+use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Source, is_name};
+use prost::Message;
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, SystemTime};
+use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
+
+const SHARDS: usize = 64;
+/// Sequence numbers are reserved in the WAL this many at a time, so most creates don't write
+/// the counter.
+const SEQ_BLOCK: u64 = 4096;
+
+/// A request for a new cell.
+#[derive(Clone, Debug)]
+pub struct CreateRequest {
+    /// What to make.
+    pub spec: CellSpec,
+    /// Who owns it.
+    pub project: String,
+    /// A retry with the same key in the same project gets the same cell back instead of a new one.
+    pub idem_key: Option<String>,
+}
+
+/// What the WAL has done since the comb opened. Writes over syncs is how many transitions each disk flush carried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalStats {
+    /// Records written.
+    pub writes: u64,
+    /// Flushes to disk.
+    pub syncs: u64,
+    /// Times the log was rewritten down to its live records.
+    pub compactions: u64,
+}
+
+/// A change to a cell, as sent to watchers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellEvent {
+    /// The cell.
+    pub id: CellId,
+    /// Where it is now.
+    pub status: Status,
+}
+
+/// The node agent. Cloning it is cheap, and every clone is the same comb.
+#[derive(Clone, Debug)]
+pub struct Comb {
+    inner: Arc<Inner>,
+}
+
+pub(crate) struct Inner {
+    pub(crate) cfg: Config,
+    pub(crate) wal: Wal,
+    pub(crate) drivers: DriverRegistry,
+    pub(crate) admission: Arc<Admission>,
+    pub(crate) shutdown: CancellationToken,
+    shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
+    idem: Mutex<HashMap<(String, String), CellId>>,
+    seq: tokio::sync::Mutex<SeqBlock>,
+    events: broadcast::Sender<CellEvent>,
+}
+
+#[derive(Debug)]
+struct SeqBlock {
+    next: u64,
+    reserved: u64,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Comb")
+            .field("node", &self.cfg.node)
+            .field("drivers", &self.drivers)
+            .finish()
+    }
+}
+
+impl Comb {
+    /// Opens the WAL in `cfg.data_dir`, finds every cell it knows about and takes them back:
+    /// running cells get their guest agent reconnected, half made ones are cleaned up, and ended
+    /// ones stay visible until their time is up. Returns once every cell has been looked at.
+    pub async fn open(cfg: Config, drivers: DriverRegistry) -> io::Result<Self> {
+        let (wal, replay) = Wal::open(&cfg.data_dir.join("wal"))?;
+        if replay.cut > 0 {
+            eprintln!("hive-comb: cut {} damaged bytes off the end of the WAL", replay.cut);
+        }
+        let mem = cfg
+            .mem_mib
+            .map(|m| m << 20)
+            .or_else(|| admit::mem_total().map(|t| t.saturating_sub(cfg.reserved_mem_mib << 20)))
+            .unwrap_or(0);
+        let admission = Arc::new(Admission::new(mem, cfg.max_cells, &cfg.create_limit));
+        let mut records = replay.records;
+        let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
+        let inner = Arc::new(Inner {
+            cfg,
+            wal,
+            drivers,
+            admission,
+            shutdown: CancellationToken::new(),
+            shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
+            idem: Mutex::default(),
+            // Whatever was reserved before the restart may have been handed out, so the new block
+            // starts past all of it.
+            seq: tokio::sync::Mutex::new(SeqBlock { next, reserved: next }),
+            events: broadcast::channel(4096).0,
+        });
+        std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
+        let comb = Self { inner };
+        comb.recover(records).await;
+        Ok(comb)
+    }
+
+    async fn recover(&self, records: HashMap<u128, bytes::Bytes>) {
+        let inner = &self.inner;
+        let mut waits = Vec::new();
+        let mut known = std::collections::HashSet::new();
+        for (key, bytes) in records {
+            let id = CellId::from_bits(key);
+            known.insert(inner.cell_dir(id));
+            let Ok(record) = Record::decode(bytes) else {
+                eprintln!("hive-comb: dropping an unreadable WAL record for {id}");
+                let _ = inner.wal.delete(key).await;
+                continue;
+            };
+            let Ok(spec) = record.spec() else {
+                eprintln!("hive-comb: dropping a WAL record with a bad spec for {id}");
+                let _ = inner.wal.delete(key).await;
+                continue;
+            };
+            let state = record.cell_state().unwrap_or(CellState::Failed);
+            let status = Status {
+                state,
+                cause: record.cell_cause(),
+                message: record.message.clone(),
+                changed: time(record.changed_ms),
+            };
+            let (cell, rx) = Cell::new(
+                id,
+                record.project.clone(),
+                record.idem_key.clone(),
+                spec,
+                time(record.created_ms),
+                status,
+            );
+            inner.insert(&cell);
+            let Some(driver) = inner.drivers.get(cell.spec.backend).cloned() else {
+                eprintln!(
+                    "hive-comb: no {} driver for {id}, which stays as it is",
+                    cell.spec.backend
+                );
+                continue;
+            };
+            let reservation = (!state.is_terminal()).then(|| inner.admission.adopt(&cell.spec));
+            let actor =
+                Actor::new(inner.clone(), cell.clone(), driver, rx, reservation, record.clone());
+            let (done, recovered) = oneshot::channel();
+            tokio::spawn(actor.run(Start::Recover { record: Box::new(record), done }));
+            waits.push(recovered);
+        }
+        let _ =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(waits)).await;
+        // A directory with no record is left from a cell whose record was dropped.
+        if let Ok(dirs) = std::fs::read_dir(inner.cfg.data_dir.join("cells")) {
+            for d in dirs.flatten() {
+                if !known.contains(&d.path()) {
+                    let _ = std::fs::remove_dir_all(d.path());
+                }
+            }
+        }
+    }
+
+    /// Makes a cell and returns once it is running, or once it has failed.
+    pub async fn create(&self, req: CreateRequest) -> Result<CellInfo, Error> {
+        let inner = &self.inner;
+        req.spec.validate().map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+        if req.spec.backend == Backend::Auto {
+            return Err(Error::new(
+                Reason::InvalidArgument,
+                "pick a backend, auto is not supported yet",
+            ));
+        }
+        image_name(&req.spec)?;
+        let driver = inner.drivers.get(req.spec.backend).cloned().ok_or_else(|| {
+            Error::new(
+                Reason::CapacityUnavailable,
+                format!("this node has no {} backend", req.spec.backend),
+            )
+        })?;
+        let idem = req.idem_key.filter(|k| !k.is_empty());
+        if let Some(key) = &idem {
+            let existing = inner.lock_idem().get(&(req.project.clone(), key.clone())).copied();
+            if let Some(id) = existing
+                && let Some(cell) = inner.cell(id)
+            {
+                return wait_started(&cell).await;
+            }
+        }
+        let reservation = inner.admission.reserve(&req.spec)?;
+        let id = inner.next_id().await?;
+        let secret = random();
+        let now = SystemTime::now();
+        let status =
+            Status { state: CellState::Pending, cause: None, message: String::new(), changed: now };
+        let idem_key = idem.clone().unwrap_or_default();
+        let (cell, rx) =
+            Cell::new(id, req.project.clone(), idem_key.clone(), req.spec.clone(), now, status);
+        let record = Record {
+            spec: Some(convert::spec_to_v1(&req.spec)),
+            created_ms: crate::record::ms(now),
+            project: req.project.clone(),
+            idem_key,
+            ..Record::default()
+        };
+        if let Some(key) = idem {
+            // Two creates with one key at once: the first to get here wins, the other waits on it.
+            let winner = {
+                let mut map = inner.lock_idem();
+                let other =
+                    map.get(&(req.project.clone(), key.clone())).and_then(|&o| inner.cell(o));
+                if other.is_none() {
+                    map.insert((req.project, key), id);
+                }
+                other
+            };
+            if let Some(cell) = winner {
+                return wait_started(&cell).await;
+            }
+        }
+        inner.insert(&cell);
+        let actor = Actor::new(inner.clone(), cell.clone(), driver, rx, Some(reservation), record);
+        let (done, started) = oneshot::channel();
+        tokio::spawn(actor.run(Start::Create { secret, done }));
+        match started.await {
+            Ok(Ok(())) => Ok(cell.info()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::new(Reason::Internal, "the node is shutting down")),
+        }
+    }
+
+    /// The cell with `id`.
+    pub fn get(&self, id: CellId) -> Result<CellInfo, Error> {
+        self.inner.cell(id).map(|c| c.info()).ok_or_else(|| not_found(id))
+    }
+
+    /// Every cell this node knows about, live or recently ended.
+    #[must_use]
+    pub fn list(&self) -> Vec<CellInfo> {
+        let mut all = Vec::new();
+        for shard in &self.inner.shards {
+            let shard = shard.read().unwrap_or_else(PoisonError::into_inner);
+            all.extend(shard.values().map(|c| c.info()));
+        }
+        all.sort_by_key(|c| c.id);
+        all
+    }
+
+    /// Stops a cell and returns once it has ended. `grace` defaults to the configured one.
+    pub async fn stop(&self, id: CellId, grace: Option<Duration>) -> Result<CellInfo, Error> {
+        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        if cell.state().is_terminal() {
+            return Ok(cell.info());
+        }
+        let grace = grace.unwrap_or(self.inner.cfg.stop_grace);
+        let (done, wait) = oneshot::channel();
+        // A cell still starting gets the stop once its create is over, since the actor only reads
+        // its queue once the cell is up.
+        if cell.send(Cmd::Stop { cause: Cause::Requested, grace, done }).await {
+            let _ = wait.await;
+        }
+        Ok(cell.info())
+    }
+
+    /// Pauses a running cell.
+    pub async fn pause(&self, id: CellId) -> Result<CellInfo, Error> {
+        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::Pause { done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        wait.await.map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        Ok(cell.info())
+    }
+
+    /// Resumes a paused cell.
+    pub async fn resume(&self, id: CellId) -> Result<CellInfo, Error> {
+        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::Resume { done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        wait.await.map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        Ok(cell.info())
+    }
+
+    /// The guest agent client for a running cell, for exec and file calls. A paused cell is
+    /// resumed first, since a request is what wakes it.
+    pub async fn drone(&self, id: CellId) -> Result<Client, Error> {
+        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        if cell.state() == CellState::Paused {
+            self.resume(id).await?;
+        }
+        match (cell.state(), cell.drone()) {
+            (CellState::Running, Some(c)) if !c.is_closed() => Ok(c),
+            (CellState::Running, _) => Err(Error::new(
+                Reason::DroneUnreachable,
+                "the channel to the guest agent dropped and is being made again",
+            )),
+            (s, _) => Err(Error::new(Reason::CellNotRunning, format!("the cell is {s}"))),
+        }
+    }
+
+    /// Every change to every cell from now on. A watcher that falls more than 4096 changes
+    /// behind misses some and gets told how many.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<CellEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// Cells and bytes of memory committed right now.
+    #[must_use]
+    pub fn committed(&self) -> (usize, u64) {
+        self.inner.admission.committed()
+    }
+
+    /// What the WAL has done since the comb opened.
+    #[must_use]
+    pub fn wal_stats(&self) -> WalStats {
+        let stats = self.inner.wal.stats();
+        WalStats {
+            writes: stats.writes.load(Ordering::Relaxed),
+            syncs: stats.syncs.load(Ordering::Relaxed),
+            compactions: stats.compactions.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stops every actor and leaves every cell exactly as it is, for the next comb to take over.
+    /// Returns once the WAL is closed, so a new comb can open it straight away.
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        self.inner.wal.close().await;
+    }
+}
+
+impl Inner {
+    fn shard(&self, id: CellId) -> &RwLock<HashMap<CellId, Arc<Cell>>> {
+        // The low bits are the tag, which is random, so cells spread evenly.
+        &self.shards[(id.to_bits() as usize) % SHARDS]
+    }
+
+    fn cell(&self, id: CellId) -> Option<Arc<Cell>> {
+        self.shard(id).read().unwrap_or_else(PoisonError::into_inner).get(&id).cloned()
+    }
+
+    fn insert(&self, cell: &Arc<Cell>) {
+        self.shard(cell.id)
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(cell.id, cell.clone());
+        if !cell.idem_key.is_empty() {
+            self.lock_idem().insert((cell.project.clone(), cell.idem_key.clone()), cell.id);
+        }
+    }
+
+    pub(crate) fn forget(&self, cell: &Cell) {
+        self.shard(cell.id).write().unwrap_or_else(PoisonError::into_inner).remove(&cell.id);
+        if !cell.idem_key.is_empty() {
+            let mut map = self.lock_idem();
+            let key = (cell.project.clone(), cell.idem_key.clone());
+            if map.get(&key) == Some(&cell.id) {
+                map.remove(&key);
+            }
+        }
+    }
+
+    fn lock_idem(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), CellId>> {
+        self.idem.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn changed(&self, cell: &Cell) {
+        let status = cell.status.borrow().clone();
+        let _ = self.events.send(CellEvent { id: cell.id, status });
+    }
+
+    pub(crate) fn cell_dir(&self, id: CellId) -> PathBuf {
+        self.cfg.data_dir.join("cells").join(id.to_string())
+    }
+
+    /// Where a cell's root filesystem comes from. Until the image store lands, an image or
+    /// template name is a directory under `data_dir/images` holding an unpacked root filesystem.
+    pub(crate) fn rootfs(&self, spec: &CellSpec, slot: &Slot) -> Result<RootfsPlan, Error> {
+        let name = image_name(spec)?;
+        let dir = self.cfg.data_dir.join("images").join(name);
+        if !dir.is_dir() {
+            return Err(Error::new(Reason::ImageUnavailable, format!("no image named {name}")));
+        }
+        Ok(RootfsPlan { lowers: vec![dir], upper: slot.dir.join("upper") })
+    }
+
+    async fn next_id(&self) -> Result<CellId, Error> {
+        let mut seq = self.seq.lock().await;
+        if seq.next >= seq.reserved {
+            let reserved = seq.next + SEQ_BLOCK;
+            let bytes = Seq { next: reserved }.encode_to_vec().into();
+            self.wal.put(SEQ_KEY, bytes).await.map_err(|e| crate::cell::wal_error(&e))?;
+            seq.reserved = reserved;
+        }
+        let n = seq.next;
+        seq.next += 1;
+        drop(seq);
+        // The tag will be a MAC under the unit's key once the gate checks it. For now it is
+        // random, which still makes ids hard to guess.
+        let tag = u64::from_le_bytes(random()[..8].try_into().expect("eight bytes")) >> 16;
+        let c = &self.cfg;
+        CellId::new(c.unit, c.node, c.epoch, n, tag)
+            .ok_or_else(|| Error::new(Reason::Internal, "ran out of cell sequence numbers"))
+    }
+}
+
+/// Waits for a cell someone else is creating to be running, or to fail.
+async fn wait_started(cell: &Cell) -> Result<CellInfo, Error> {
+    let mut rx = cell.status.subscribe();
+    let status = rx
+        .wait_for(|s| {
+            !matches!(s.state, CellState::Pending | CellState::Preparing | CellState::Starting)
+        })
+        .await
+        .map_err(|_| Error::new(Reason::Internal, "the node is shutting down"))?
+        .clone();
+    if status.state == CellState::Failed && status.cause == Some(Cause::StartFailed) {
+        return Err(Error::new(Reason::Internal, status.message));
+    }
+    Ok(cell.info())
+}
+
+/// The image a cell starts from, if its name is one the comb can look up.
+fn image_name(spec: &CellSpec) -> Result<&str, Error> {
+    let name = match &spec.source {
+        Source::Image(n) | Source::Template(n) => n,
+        Source::Snapshot(_) => {
+            return Err(Error::new(Reason::InvalidArgument, "snapshots are not supported yet"));
+        }
+    };
+    if !is_name(name) || name.split('/').any(|p| p.is_empty() || p == "." || p == "..") {
+        return Err(Error::new(Reason::InvalidArgument, format!("{name:?} is not an image name")));
+    }
+    Ok(name)
+}
+
+fn not_found(id: CellId) -> Error {
+    Error::new(Reason::CellNotFound, format!("no cell {id} on this node"))
+}
+
+pub(crate) fn random() -> [u8; 32] {
+    OsRng.secret()
+}
