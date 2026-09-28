@@ -134,13 +134,16 @@ pub struct Resources {
 }
 
 impl Default for Resources {
-    /// One core, 2 GiB, 10 GiB of disk. Enough for a typical SWE task's test suite.
+    /// [`Resources::DEFAULT`].
     fn default() -> Self {
-        Self { vcpu_milli: 1000, mem_mib: 2048, disk_gib: 10, pids: 1024, open_files: 4096 }
+        Self::DEFAULT
     }
 }
 
 impl Resources {
+    /// One core, 2 GiB, 10 GiB of disk. Enough for a typical SWE task's test suite.
+    pub const DEFAULT: Self =
+        Self { vcpu_milli: 1000, mem_mib: 2048, disk_gib: 10, pids: 1024, open_files: 4096 };
     /// The smallest cell the node will make. Below this the guest agent alone does not fit.
     pub const MIN: Self =
         Self { vcpu_milli: 50, mem_mib: 64, disk_gib: 1, pids: 16, open_files: 64 };

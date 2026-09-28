@@ -8,6 +8,7 @@
 
 mod admit;
 mod cell;
+mod cgroups;
 mod comb;
 mod config;
 mod record;

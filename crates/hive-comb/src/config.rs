@@ -30,6 +30,11 @@ pub struct Config {
     pub stop_grace: Duration,
     /// How long a stopped or failed cell stays visible before its record is dropped.
     pub keep_ended: Duration,
+    /// The cgroup the comb puts its cells under, which it makes if it has to. `None` runs cells
+    /// with no cgroup of their own, with no limits and no kill on stop, which only suits tests.
+    pub cgroup_root: Option<PathBuf>,
+    /// Empty cgroups kept ready per QoS class, so a create does not wait on `mkdir`.
+    pub cgroup_depth: usize,
 }
 
 impl Default for Config {
@@ -51,6 +56,8 @@ impl Default for Config {
             create_deadline: Duration::from_secs(30),
             stop_grace: Duration::from_secs(10),
             keep_ended: Duration::from_secs(600),
+            cgroup_root: Some(PathBuf::from("/sys/fs/cgroup/hive.slice")),
+            cgroup_depth: 256,
         }
     }
 }
