@@ -284,6 +284,7 @@ version = "0.0.2"
 name = "hive-cell"
 version = "0.0.2"
 dependencies = [
+ "futures",
  "hive-types",
 ]
 
