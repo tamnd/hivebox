@@ -95,6 +95,8 @@ enum FsEventKind {
   FS_EVENT_KIND_REMOVE = 3;
   FS_EVENT_KIND_RENAME = 4;
   FS_EVENT_KIND_CHMOD = 5;
+  // The cell dropped events, so anything may have changed.
+  FS_EVENT_KIND_OVERFLOW = 6;
 }
 
 message FsEvent {

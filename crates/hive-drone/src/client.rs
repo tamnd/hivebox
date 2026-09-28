@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use hive_proto::drone::api::{
-    self, Command, FileInfo, FsChmod, FsList, FsListResult, FsMkdir, FsPath, FsRead, FsRename,
-    FsWrite, Health, MAX_CHUNK, RunRequest, RunResult, SessionCreate, SessionInfo, SessionRef,
-    SessionRun, SessionRunResult, SessionSend, SessionSendResult, tag, tagged,
+    self, Command, FileInfo, FsChmod, FsEvents, FsList, FsListResult, FsMkdir, FsPath, FsRead,
+    FsRename, FsUpload, FsUploadResult, FsWrite, Health, MAX_CHUNK, RunRequest, RunResult,
+    SessionCreate, SessionInfo, SessionRef, SessionRun, SessionRunResult, SessionSend,
+    SessionSendResult, tag, tagged,
 };
 use hive_proto::drone::handshake::{self, Established, Secret};
 use hive_proto::drone::{Channel, FrameCodec, RecvHalf, SendHalf, Side, Stream};
@@ -195,6 +196,46 @@ impl Client {
         self.unary(api::FS_CHMOD, req, INFO_LIMIT).await
     }
 
+    /// Unpacks the tar archive `tar` into the directory `req.path`.
+    pub async fn fs_upload(&self, req: &FsUpload, tar: Bytes) -> Result<FsUploadResult, Error> {
+        let mut w = self.fs_upload_start(req).await?;
+        w.write(tar).await?;
+        w.finish().await
+    }
+
+    /// Starts unpacking a tar archive that is sent through the [`ArchiveWriter`] a piece at a
+    /// time.
+    pub async fn fs_upload_start(&self, req: &FsUpload) -> Result<ArchiveWriter, Error> {
+        let stream = self.channel.open(api::FS_UPLOAD, req.encode_to_vec().into()).await?;
+        Ok(ArchiveWriter { stream })
+    }
+
+    /// Packs a file or directory into a tar archive in memory. Fails with `OUTPUT_LIMIT` past
+    /// `limit` bytes. Use [`Client::fs_download_start`] for trees too big to hold.
+    pub async fn fs_download(&self, req: &FsPath, limit: usize) -> Result<Bytes, Error> {
+        self.channel.call(api::FS_DOWNLOAD, req.encode_to_vec().into(), limit).await
+    }
+
+    /// Starts packing a file or directory into a tar archive that arrives through the
+    /// [`ArchiveReader`].
+    pub async fn fs_download_start(&self, req: &FsPath) -> Result<ArchiveReader, Error> {
+        let mut stream = self.channel.open(api::FS_DOWNLOAD, req.encode_to_vec().into()).await?;
+        stream.finish().await?;
+        Ok(ArchiveReader { stream })
+    }
+
+    /// Watches a directory, and with `req.recursive` everything under it. Returns once the
+    /// watch is in place, so any change made after this returns is reported.
+    pub async fn fs_watch(&self, req: &FsPath) -> Result<Watcher, Error> {
+        let mut stream = self.channel.open(api::FS_WATCH, req.encode_to_vec().into()).await?;
+        let first = stream
+            .recv()
+            .await?
+            .ok_or_else(|| Error::new(Reason::Internal, "the watch ended before it started"))?;
+        let info = FileInfo::decode(first).map_err(bad_answer)?;
+        Ok(Watcher { stream, info })
+    }
+
     /// Starts a command with its input and output streamed.
     pub async fn start(&self, cmd: &Command) -> Result<Process, Error> {
         let stream = self.channel.open(api::PROCESS_START, cmd.encode_to_vec().into()).await?;
@@ -231,14 +272,83 @@ impl FileWriter {
     /// Ends the file and waits for the drone to put it in place.
     pub async fn finish(mut self) -> Result<FileInfo, Error> {
         self.stream.finish().await?;
-        let mut answer = Vec::new();
-        while let Some(chunk) = self.stream.recv().await? {
-            if answer.len() + chunk.len() > INFO_LIMIT {
-                return Err(Error::new(Reason::OutputLimit, "the answer is over the limit"));
-            }
-            answer.extend_from_slice(&chunk);
-        }
+        let answer = collect(&mut self.stream, INFO_LIMIT).await?;
         FileInfo::decode(&answer[..]).map_err(bad_answer)
+    }
+}
+
+// Reads the rest of a stream, up to `limit` bytes.
+async fn collect(stream: &mut Stream, limit: usize) -> Result<Vec<u8>, Error> {
+    let mut answer = Vec::new();
+    while let Some(chunk) = stream.recv().await? {
+        if answer.len() + chunk.len() > limit {
+            return Err(Error::new(Reason::OutputLimit, "the answer is over the limit"));
+        }
+        answer.extend_from_slice(&chunk);
+    }
+    Ok(answer)
+}
+
+/// A tar archive being unpacked, from [`Client::fs_upload_start`].
+#[derive(Debug)]
+pub struct ArchiveWriter {
+    stream: Stream,
+}
+
+impl ArchiveWriter {
+    /// Sends the next part of the archive.
+    pub async fn write(&mut self, data: Bytes) -> Result<(), Error> {
+        self.stream.send(data).await
+    }
+
+    /// Ends the archive and waits for the drone to finish unpacking it.
+    pub async fn finish(mut self) -> Result<FsUploadResult, Error> {
+        self.stream.finish().await?;
+        let answer = collect(&mut self.stream, INFO_LIMIT).await?;
+        FsUploadResult::decode(&answer[..]).map_err(bad_answer)
+    }
+}
+
+/// A tar archive being packed, from [`Client::fs_download_start`].
+#[derive(Debug)]
+pub struct ArchiveReader {
+    stream: Stream,
+}
+
+impl ArchiveReader {
+    /// The next part of the archive, or `None` at the end.
+    pub async fn next(&mut self) -> Result<Option<Bytes>, Error> {
+        self.stream.recv().await
+    }
+}
+
+/// A directory being watched, from [`Client::fs_watch`]. Dropping it ends the watch.
+#[derive(Debug)]
+pub struct Watcher {
+    stream: Stream,
+    info: FileInfo,
+}
+
+impl Watcher {
+    /// The watched directory, as it was when the watch started.
+    #[must_use]
+    pub fn info(&self) -> &FileInfo {
+        &self.info
+    }
+
+    /// The next batch of changes, or `None` once the directory has gone and the watch is over.
+    pub async fn next(&mut self) -> Result<Option<FsEvents>, Error> {
+        match self.stream.recv().await? {
+            Some(frame) => FsEvents::decode(frame).map(Some).map_err(bad_answer),
+            None => Ok(None),
+        }
+    }
+
+    /// Ends the watch and waits for the drone to stop it.
+    pub async fn close(mut self) -> Result<(), Error> {
+        self.stream.finish().await?;
+        while self.stream.recv().await?.is_some() {}
+        Ok(())
     }
 }
 

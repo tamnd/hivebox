@@ -43,6 +43,16 @@ pub const FS_REMOVE: &str = "fs.remove";
 pub const FS_RENAME: &str = "fs.rename";
 /// Changes permission bits. Request [`FsChmod`], answer [`FileInfo`].
 pub const FS_CHMOD: &str = "fs.chmod";
+/// Unpacks a tar archive into a directory. Request [`FsUpload`], then the archive as plain data
+/// frames, then the end. Answer [`FsUploadResult`].
+pub const FS_UPLOAD: &str = "fs.upload";
+/// Packs a file or directory into a tar archive. Request [`FsPath`], answer the archive as plain
+/// data frames.
+pub const FS_DOWNLOAD: &str = "fs.download";
+/// Watches a directory for changes. Request [`FsPath`] with `recursive` to watch the whole tree,
+/// answer one [`FsEvents`] per data frame until the node ends its side. The first batch is empty
+/// and says the watch is in place.
+pub const FS_WATCH: &str = "fs.watch";
 
 /// The most data one tagged frame carries, so that the tag and the data fit in one frame.
 pub const MAX_CHUNK: usize = MAX_PAYLOAD - 1;
@@ -307,7 +317,7 @@ pub struct SessionSendResult {
     pub restarted: bool,
 }
 
-/// A path, and how to treat it. For `fs.stat` and `fs.remove`.
+/// A path, and how to treat it. For `fs.stat`, `fs.remove`, `fs.download` and `fs.watch`.
 ///
 /// Every path in the fs methods is absolute or relative to the drone's working directory, and it
 /// resolves inside one of the drone's allowed roots. Symlinks and `..` never lead out of that
@@ -320,7 +330,8 @@ pub struct FsPath {
     /// For `fs.stat`: describe what a final symlink points to instead of the link itself.
     #[prost(bool, tag = "2")]
     pub follow: bool,
-    /// For `fs.remove`: remove a directory and everything in it.
+    /// For `fs.remove`: remove a directory and everything in it. For `fs.watch`: watch every
+    /// directory under the path, including ones made later.
     #[prost(bool, tag = "3")]
     pub recursive: bool,
 }
@@ -479,6 +490,83 @@ pub struct FsChmod {
     /// The new bits, including setuid, setgid and sticky.
     #[prost(uint32, tag = "2")]
     pub mode: u32,
+}
+
+/// Unpacks a tar archive. Entry names are taken relative to `path`, and they resolve the way
+/// every other path does, as if `path` were the root: an absolute name, a `..`, or a symlink
+/// that an earlier entry made can't put anything outside it. Entries with `..` in the name are
+/// skipped, as are devices and pipes. Owners in the archive are ignored.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsUpload {
+    /// The directory to unpack into.
+    #[prost(string, tag = "1")]
+    pub path: String,
+    /// Make the directory and its missing parents.
+    #[prost(bool, tag = "2")]
+    pub make_parents: bool,
+    /// The owner of what it makes. The drone's configured user when unset.
+    #[prost(uint32, optional, tag = "3")]
+    pub uid: Option<u32>,
+    /// The group of what it makes. The drone's configured group when unset.
+    #[prost(uint32, optional, tag = "4")]
+    pub gid: Option<u32>,
+}
+
+/// What an upload did.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsUploadResult {
+    /// Files, directories and links made.
+    #[prost(uint64, tag = "1")]
+    pub entries: u64,
+    /// Bytes of file content written.
+    #[prost(uint64, tag = "2")]
+    pub bytes: u64,
+    /// Entries left out: devices, pipes and names with `..`.
+    #[prost(uint64, tag = "3")]
+    pub skipped: u64,
+}
+
+/// What happened to a path. The numbers match `hivebox.v1.FsEventKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum FsEventKind {
+    /// Not known.
+    Unspecified = 0,
+    /// Made, or moved in.
+    Create = 1,
+    /// Written to.
+    Write = 2,
+    /// Removed.
+    Remove = 3,
+    /// Moved away. Where it went, if it stayed in the watch, comes as a create.
+    Rename = 4,
+    /// Permissions, owner or times changed.
+    Chmod = 5,
+    /// The kernel dropped events. Anything may have changed, so a client should look again.
+    Overflow = 6,
+}
+
+/// One change.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsEvent {
+    /// What happened.
+    #[prost(enumeration = "FsEventKind", tag = "1")]
+    pub kind: i32,
+    /// The path, joined onto the watched path as it was asked for. Empty for an overflow.
+    #[prost(string, tag = "2")]
+    pub path: String,
+    /// Whether the path is a directory.
+    #[prost(bool, tag = "3")]
+    pub is_dir: bool,
+}
+
+/// Changes that happened together, in order. A run of the same change to the same path is sent
+/// once.
+#[derive(Clone, PartialEq, Message)]
+pub struct FsEvents {
+    /// The changes.
+    #[prost(message, repeated, tag = "1")]
+    pub events: Vec<FsEvent>,
 }
 
 impl RunResult {

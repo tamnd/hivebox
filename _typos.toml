@@ -4,3 +4,5 @@
 DAMON = "DAMON"
 # Free page reporting, the virtio-balloon feature.
 FPR = "FPR"
+# The open(2) flag for write only.
+WRONLY = "WRONLY"

@@ -11,17 +11,23 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
 use hive_drone::{Config, Drone};
+#[cfg(target_os = "linux")]
 use std::io::Read;
+#[cfg(target_os = "linux")]
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
 const USAGE: &str = "usage: hive-drone --listen unix:PATH --secret-stdin [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
 
+#[cfg(target_os = "linux")]
 struct Args {
     listen: String,
     cfg: Config,
 }
 
+#[cfg(target_os = "linux")]
 fn parse() -> Result<Args, String> {
     let mut listen = None;
     let mut secret_stdin = false;
@@ -58,6 +64,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args { listen, cfg })
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
         println!("hive-drone {}", env!("CARGO_PKG_VERSION"));
@@ -91,6 +98,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn serve(args: Args, secret: [u8; 32]) -> std::io::Result<()> {
     let Some(path) = args.listen.strip_prefix("unix:") else {
         return Err(std::io::Error::other(format!(
@@ -111,4 +119,10 @@ async fn serve(args: Args, secret: [u8; 32]) -> std::io::Result<()> {
             }
         });
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> std::process::ExitCode {
+    eprintln!("hive-drone runs only on Linux");
+    std::process::ExitCode::FAILURE
 }

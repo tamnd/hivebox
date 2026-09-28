@@ -1,5 +1,7 @@
 //! The drone and its client, end to end over an in-memory pipe.
 
+#![cfg(target_os = "linux")]
+
 use bytes::Bytes;
 use hive_drone::{Client, Config, Drone, Output};
 use hive_proto::drone::api::{Command, RunRequest};
