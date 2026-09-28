@@ -1,5 +1,7 @@
 //! Sessions, end to end over an in-memory pipe.
 
+#![cfg(target_os = "linux")]
+
 use bytes::Bytes;
 use hive_drone::{Client, Config, Drone};
 use hive_proto::drone::api::{SessionCreate, SessionRun, SessionRunResult, SessionSend};

@@ -29,8 +29,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-/// How much `fs.read` reads at a time.
-const READ_CHUNK: usize = 256 * 1024;
+/// How much the fs methods read or write at a time.
+pub(crate) const CHUNK: usize = 256 * 1024;
 /// The most entries one `fs.list` answer holds.
 pub(crate) const MAX_ENTRIES: usize = 100_000;
 
@@ -46,7 +46,7 @@ pub(crate) async fn read(cfg: &Config, req: FsRead, stream: &mut Stream) -> Resu
     let mut at = offset;
     tokio::task::spawn_blocking(move || {
         while at < end {
-            let want = usize::try_from(end - at).unwrap_or(usize::MAX).min(READ_CHUNK);
+            let want = usize::try_from(end - at).unwrap_or(usize::MAX).min(CHUNK);
             let mut buf = BytesMut::zeroed(want);
             let got = match file.read_at(&mut buf, at) {
                 Ok(0) => return,
@@ -83,7 +83,9 @@ fn open_for_read(cfg: &Config, path: &str) -> Result<std::fs::File, Error> {
     }
 }
 
-enum Part {
+/// What a blocking task that consumes a stream gets: data, then the end. A channel that closes
+/// without the end means the call failed, and the task should throw its work away.
+pub(crate) enum Part {
     Data(Bytes),
     End,
 }
@@ -95,16 +97,22 @@ pub(crate) async fn write(
     stream: &mut Stream,
 ) -> Result<FileInfo, Error> {
     let first = std::mem::take(&mut req.data);
-    let (tx, mut rx) = mpsc::channel::<Part>(8);
     let cfg = cfg.clone();
-    let writer = tokio::task::spawn_blocking(move || {
-        write_blocking(&cfg, &req, first, || rx.blocking_recv())
-    });
+    pipe_in(stream, move |mut rx| write_blocking(&cfg, &req, first, || rx.blocking_recv())).await
+}
+
+/// Runs `work` on the blocking pool and feeds it what arrives on `stream` until the end.
+pub(crate) async fn pipe_in<T: Send + 'static>(
+    stream: &mut Stream,
+    work: impl FnOnce(mpsc::Receiver<Part>) -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
+    let (tx, rx) = mpsc::channel::<Part>(8);
+    let worker = tokio::task::spawn_blocking(move || work(rx));
     let fed = loop {
         match stream.recv().await {
             Ok(Some(chunk)) => {
                 if tx.send(Part::Data(chunk)).await.is_err() {
-                    // The writer failed and says why below.
+                    // The worker failed and says why below.
                     break Ok(());
                 }
             }
@@ -112,14 +120,14 @@ pub(crate) async fn write(
                 let _ = tx.send(Part::End).await;
                 break Ok(());
             }
-            // Dropping the sender without an end makes the writer throw its work away.
+            // Dropping the sender without an end makes the worker throw its work away.
             Err(e) => break Err(e),
         }
     };
     drop(tx);
-    let written = writer.await.map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+    let done = worker.await.map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
     fed?;
-    written
+    done
 }
 
 fn write_blocking(
@@ -309,7 +317,7 @@ fn walk(dir: OwnedFd, base: &str, depth: u32, out: &mut Vec<FileInfo>) -> Result
     Ok(false)
 }
 
-fn join(base: &str, name: &CStr) -> String {
+pub(crate) fn join(base: &str, name: &CStr) -> String {
     let name = name.to_string_lossy();
     if base.ends_with('/') { format!("{base}{name}") } else { format!("{base}/{name}") }
 }
@@ -337,7 +345,12 @@ pub(crate) async fn mkdir(cfg: &Config, req: FsMkdir) -> Result<FileInfo, Error>
 }
 
 // Makes one directory with exactly `mode`, whatever the umask, and returns it opened.
-fn make_dir(dir: &OwnedFd, name: &OsStr, mode: u32, owner: Owner) -> Result<OwnedFd, Errno> {
+pub(crate) fn make_dir(
+    dir: &OwnedFd,
+    name: &OsStr,
+    mode: u32,
+    owner: Owner,
+) -> Result<OwnedFd, Errno> {
     rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(mode))?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = rustix::fs::openat(dir, name, flags, Mode::empty())?;
@@ -456,14 +469,14 @@ pub(crate) async fn chmod(cfg: &Config, req: FsChmod) -> Result<FileInfo, Error>
 }
 
 /// A path split into the root it falls under and the rest.
-struct Resolved {
-    root: OwnedFd,
-    // Relative to the root, and empty for the root itself.
-    rel: PathBuf,
+pub(crate) struct Resolved {
+    pub(crate) root: OwnedFd,
+    /// Relative to the root, and empty for the root itself.
+    pub(crate) rel: PathBuf,
 }
 
 impl Resolved {
-    fn new(cfg: &Config, path: &str) -> Result<Self, Error> {
+    pub(crate) fn new(cfg: &Config, path: &str) -> Result<Self, Error> {
         if path.is_empty() {
             return Err(Error::new(Reason::InvalidArgument, "an empty path"));
         }
@@ -484,62 +497,90 @@ impl Resolved {
         Ok(Self { root, rel })
     }
 
-    // The parent directory and the final name, or None for the root itself.
-    fn split(&self) -> Option<(&Path, &OsStr)> {
+    /// The parent directory and the final name, or None for the root itself.
+    pub(crate) fn split(&self) -> Option<(&Path, &OsStr)> {
         Some((self.rel.parent()?, self.rel.file_name()?))
     }
 
-    fn open(&self, rel: &Path, flags: OFlags, mode: Mode) -> Result<OwnedFd, Errno> {
-        let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel };
-        let how = ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS;
-        let mut tries = 0;
-        loop {
-            match rustix::fs::openat2(&self.root, rel, flags | OFlags::CLOEXEC, mode, how) {
-                // The kernel gives up when a rename races the walk. Trying again is what it asks.
-                Err(Errno::AGAIN) if tries < 16 => tries += 1,
-                other => return other,
-            }
-        }
+    pub(crate) fn open(&self, rel: &Path, flags: OFlags, mode: Mode) -> Result<OwnedFd, Errno> {
+        open_beneath(self.root.as_fd(), rel, flags, mode)
     }
 
     // Opens `rel` as a directory, making it and any missing parents first.
-    fn make_dirs(&self, rel: &Path, mode: u32, owner: Owner) -> Result<OwnedFd, Errno> {
-        let dirs = OFlags::PATH | OFlags::DIRECTORY;
-        match self.open(rel, dirs, Mode::empty()) {
-            Err(Errno::NOENT) => {}
+    pub(crate) fn make_dirs(&self, rel: &Path, mode: u32, owner: Owner) -> Result<OwnedFd, Errno> {
+        make_dirs_beneath(self.root.as_fd(), rel, mode, owner)
+    }
+}
+
+/// Opens `rel` as if `root` were `/`, so no symlink or `..` in it leads out of `root`.
+pub(crate) fn open_beneath(
+    root: BorrowedFd<'_>,
+    rel: &Path,
+    flags: OFlags,
+    mode: Mode,
+) -> Result<OwnedFd, Errno> {
+    let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel };
+    let how = ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS;
+    let mut tries = 0;
+    loop {
+        match rustix::fs::openat2(root, rel, flags | OFlags::CLOEXEC, mode, how) {
+            // The kernel gives up when a rename races the walk. Trying again is what it asks.
+            Err(Errno::AGAIN) if tries < 16 => tries += 1,
             other => return other,
         }
-        let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
-            return Err(Errno::NOENT);
-        };
-        let up = self.make_dirs(parent, mode, owner)?;
-        match make_dir(&up, name, mode, owner) {
-            Ok(_) | Err(Errno::EXIST) => self.open(rel, dirs, Mode::empty()),
-            Err(e) => Err(e),
-        }
+    }
+}
+
+/// Opens `rel` under `root` as a directory, making it and any missing parents first.
+pub(crate) fn make_dirs_beneath(
+    root: BorrowedFd<'_>,
+    rel: &Path,
+    mode: u32,
+    owner: Owner,
+) -> Result<OwnedFd, Errno> {
+    let dirs = OFlags::PATH | OFlags::DIRECTORY;
+    match open_beneath(root, rel, dirs, Mode::empty()) {
+        Err(Errno::NOENT) => {}
+        other => return other,
+    }
+    let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
+        return Err(Errno::NOENT);
+    };
+    let up = make_dirs_beneath(root, parent, mode, owner)?;
+    match make_dir(&up, name, mode, owner) {
+        Ok(_) | Err(Errno::EXIST) => open_beneath(root, rel, dirs, Mode::empty()),
+        Err(e) => Err(e),
     }
 }
 
 /// Who new files and directories belong to. Only the ids that differ from the drone's own are
 /// set, so a drone that isn't root can still create files.
 #[derive(Clone, Copy)]
-struct Owner {
+pub(crate) struct Owner {
     uid: Option<Uid>,
     gid: Option<Gid>,
 }
 
 impl Owner {
-    fn new(uid: Option<u32>, gid: Option<u32>) -> Self {
+    pub(crate) fn new(uid: Option<u32>, gid: Option<u32>) -> Self {
         let uid = uid.map(Uid::from_raw).filter(|&u| u != rustix::process::geteuid());
         let gid = gid.map(Gid::from_raw).filter(|&g| g != rustix::process::getegid());
         Self { uid, gid }
     }
 
-    fn apply(self, fd: impl AsFd) -> Result<(), Errno> {
+    pub(crate) fn apply(self, fd: impl AsFd) -> Result<(), Errno> {
         if self.uid.is_none() && self.gid.is_none() {
             return Ok(());
         }
         rustix::fs::fchown(fd, self.uid, self.gid)
+    }
+
+    /// Sets the owner of the symlink `name` in `dir`, not of what it points to.
+    pub(crate) fn apply_to_link(self, dir: impl AsFd, name: &OsStr) -> Result<(), Errno> {
+        if self.uid.is_none() && self.gid.is_none() {
+            return Ok(());
+        }
+        rustix::fs::chownat(dir, name, self.uid, self.gid, AtFlags::SYMLINK_NOFOLLOW)
     }
 }
 
@@ -555,16 +596,20 @@ fn describe(dir: impl AsFd, name: impl AsRef<OsStr>, path: String) -> Result<Fil
     Ok(info(path, &st, target))
 }
 
-fn statat(dir: impl AsFd, name: impl AsRef<OsStr>, follow: bool) -> Result<Statx, Errno> {
+pub(crate) fn statat(
+    dir: impl AsFd,
+    name: impl AsRef<OsStr>,
+    follow: bool,
+) -> Result<Statx, Errno> {
     let flags = if follow { AtFlags::empty() } else { AtFlags::SYMLINK_NOFOLLOW };
     rustix::fs::statx(dir, name.as_ref(), flags, StatxFlags::BASIC_STATS)
 }
 
-fn fstat(fd: impl AsFd) -> Result<Statx, Errno> {
+pub(crate) fn fstat(fd: impl AsFd) -> Result<Statx, Errno> {
     rustix::fs::statx(fd, c"", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)
 }
 
-fn kind(st: &Statx) -> FileKind {
+pub(crate) fn kind(st: &Statx) -> FileKind {
     match FileType::from_raw_mode(st.stx_mode.into()) {
         FileType::RegularFile => FileKind::File,
         FileType::Directory => FileKind::Dir,
@@ -573,7 +618,7 @@ fn kind(st: &Statx) -> FileKind {
     }
 }
 
-fn info(path: String, st: &Statx, symlink_target: String) -> FileInfo {
+pub(crate) fn info(path: String, st: &Statx, symlink_target: String) -> FileInfo {
     let t = st.stx_mtime;
     FileInfo {
         path,
@@ -590,18 +635,18 @@ fn info(path: String, st: &Statx, symlink_target: String) -> FileInfo {
     }
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, Error> + Send + 'static,
 ) -> Result<T, Error> {
     tokio::task::spawn_blocking(f).await.map_err(|e| Error::new(Reason::Internal, e.to_string()))?
 }
 
-fn io_err(e: &std::io::Error, path: &str) -> Error {
+pub(crate) fn io_err(e: &std::io::Error, path: &str) -> Error {
     os(Errno::from_io_error(e).unwrap_or(Errno::IO), path)
 }
 
 /// A failed call as a `FILE_ERROR` with the errno's name.
-fn os(e: Errno, path: &str) -> Error {
+pub(crate) fn os(e: Errno, path: &str) -> Error {
     if e == Errno::NOSYS {
         return Error::new(Reason::Internal, "the kernel has no openat2, which needs Linux 5.6");
     }

@@ -1,8 +1,8 @@
 use crate::session::Sessions;
-use crate::{Config, fs, health, process};
+use crate::{Config, archive, fs, health, process, watch};
 use hive_proto::drone::api::{
-    self, Command, FsChmod, FsList, FsMkdir, FsPath, FsRead, FsRename, FsWrite, RunRequest,
-    SessionCreate, SessionRef, SessionRun, SessionSend,
+    self, Command, FsChmod, FsList, FsMkdir, FsPath, FsRead, FsRename, FsUpload, FsWrite,
+    RunRequest, SessionCreate, SessionRef, SessionRun, SessionSend,
 };
 use hive_proto::drone::handshake::{self, Secret, VERSION};
 use hive_proto::drone::msg::{Hello, Status};
@@ -20,7 +20,7 @@ use tokio_util::codec::Framed;
 /// The most stdin `process.run` buffers. Bigger input should be streamed.
 const MAX_STDIN: usize = 64 << 20;
 /// How long a finished call waits for the node to end its side before the stream is dropped.
-const LINGER: Duration = Duration::from_secs(5);
+pub(crate) const LINGER: Duration = Duration::from_secs(5);
 
 /// The guest agent. One per cell, serving any number of connections from the node agent.
 #[derive(Debug)]
@@ -177,6 +177,31 @@ impl Drone {
             },
             api::FS_CHMOD => match FsChmod::decode(open.request) {
                 Ok(req) => fs::chmod(&self.cfg, req).await.map(|i| i.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_UPLOAD => match FsUpload::decode(open.request) {
+                Ok(req) => {
+                    archive::upload(&self.cfg, req, &mut stream).await.map(|r| r.encode_to_vec())
+                }
+                Err(e) => Err(bad_request(e)),
+            },
+            api::FS_DOWNLOAD => {
+                let done = match FsPath::decode(open.request) {
+                    Ok(req) => archive::download(&self.cfg, req, &mut stream).await,
+                    Err(e) => Err(bad_request(e)),
+                };
+                match done {
+                    Ok(()) => {
+                        if stream.finish().await.is_ok() {
+                            linger(stream).await;
+                        }
+                        return;
+                    }
+                    Err(e) => return stream.reset(Status::from(e)).await,
+                }
+            }
+            api::FS_WATCH => match FsPath::decode(open.request) {
+                Ok(req) => return watch::run(&self.cfg, req, stream).await,
                 Err(e) => Err(bad_request(e)),
             },
             other => Err(Error::new(Reason::InvalidArgument, format!("no method {other:?}"))),
