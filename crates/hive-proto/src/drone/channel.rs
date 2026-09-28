@@ -161,33 +161,121 @@ fn register(shared: &Arc<Shared>, streams: &mut HashMap<u32, Slot>, id: u32) -> 
     let (tx, rx) = mpsc::unbounded_channel();
     let credit = Arc::new(Semaphore::new(WINDOW as usize));
     streams.insert(id, Slot { events: tx, credit: credit.clone(), peer_allowance: WINDOW });
+    let ends =
+        Arc::new(Ends { id, shared: shared.clone(), state: Mutex::new(EndState::default()) });
     Stream {
-        id,
-        shared: shared.clone(),
-        events: rx,
-        credit,
-        unacked: 0,
-        sent_end: false,
-        got_end: false,
-        reset: false,
+        tx: SendHalf { id, shared: shared.clone(), credit, sent_end: false, ends: ends.clone() },
+        rx: RecvHalf { id, shared: shared.clone(), events: rx, unacked: 0, got_end: false, ends },
     }
 }
 
 /// One call on a channel. Dropping a stream that has not ended both ways resets it.
+///
+/// [`Stream::split`] gives a sending half and a receiving half that can be used from two tasks,
+/// for calls where both sides send at once and neither may wait for the other.
 #[derive(Debug)]
 pub struct Stream {
+    tx: SendHalf,
+    rx: RecvHalf,
+}
+
+/// The sending half of a [`Stream`].
+#[derive(Debug)]
+pub struct SendHalf {
+    id: u32,
+    shared: Arc<Shared>,
+    credit: Arc<Semaphore>,
+    sent_end: bool,
+    ends: Arc<Ends>,
+}
+
+/// The receiving half of a [`Stream`].
+#[derive(Debug)]
+pub struct RecvHalf {
     id: u32,
     shared: Arc<Shared>,
     events: mpsc::UnboundedReceiver<Event>,
-    credit: Arc<Semaphore>,
     // Bytes read by the application that have not been handed back to the peer as credit.
     unacked: u32,
+    got_end: bool,
+    ends: Arc<Ends>,
+}
+
+// Shared by both halves. When the last half goes, the stream is forgotten, and reset unless it
+// ended cleanly both ways.
+#[derive(Debug)]
+struct Ends {
+    id: u32,
+    shared: Arc<Shared>,
+    state: Mutex<EndState>,
+}
+
+#[derive(Debug, Default)]
+struct EndState {
     sent_end: bool,
     got_end: bool,
     reset: bool,
 }
 
+impl Ends {
+    fn update(&self, f: impl FnOnce(&mut EndState)) {
+        f(&mut self.state.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+}
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        forget(&self.shared, self.id);
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if !state.reset && !(state.sent_end && state.got_end) {
+            let status = Status { reason: String::new(), message: "dropped".into() };
+            let _ =
+                self.shared.out.try_send(Frame::new(self.id, Kind::Reset, status.encode_to_vec()));
+        }
+    }
+}
+
 impl Stream {
+    /// The stream id.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.tx.id
+    }
+
+    /// Splits the stream into halves that can be used from different tasks. The stream is reset
+    /// when both are dropped, unless it ended cleanly both ways.
+    #[must_use]
+    pub fn split(self) -> (SendHalf, RecvHalf) {
+        (self.tx, self.rx)
+    }
+
+    /// Sends `data`, waiting for credit as needed.
+    pub async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+        self.tx.send(data).await
+    }
+
+    /// Sends the end of this side of the stream. The peer can still send.
+    pub async fn finish(&mut self) -> Result<(), Error> {
+        self.tx.finish().await
+    }
+
+    /// Sends `data` and the end in one frame where it fits.
+    pub async fn send_last(&mut self, data: Bytes) -> Result<(), Error> {
+        self.tx.send_last(data).await
+    }
+
+    /// The next piece of data, `None` once the peer has finished, or the error it reset with.
+    pub async fn recv(&mut self) -> Result<Option<Bytes>, Error> {
+        self.rx.recv().await
+    }
+
+    /// Ends the stream both ways with `status`.
+    pub async fn reset(self, status: Status) {
+        self.tx.reset(status).await;
+    }
+}
+
+impl SendHalf {
     /// The stream id.
     #[must_use]
     pub fn id(&self) -> u32 {
@@ -213,7 +301,7 @@ impl Stream {
         if self.sent_end {
             return Ok(());
         }
-        self.sent_end = true;
+        self.mark_end();
         let frame =
             Frame { stream: self.id, kind: Kind::Data, flags: FLAG_END, payload: Bytes::new() };
         send(&self.shared, frame).await
@@ -225,14 +313,37 @@ impl Stream {
             self.send(data).await?;
             return self.finish().await;
         }
+        if self.sent_end {
+            return Err(Error::new(Reason::Internal, "send after finish"));
+        }
         let permits = self.credit.acquire_many(data.len() as u32).await.map_err(|_| closed())?;
         permits.forget();
-        self.sent_end = true;
+        self.mark_end();
         send(
             &self.shared,
             Frame { stream: self.id, kind: Kind::Data, flags: FLAG_END, payload: data },
         )
         .await
+    }
+
+    /// Ends the stream both ways with `status`.
+    pub async fn reset(self, status: Status) {
+        self.ends.update(|s| s.reset = true);
+        forget(&self.shared, self.id);
+        let _ = send(&self.shared, Frame::new(self.id, Kind::Reset, status.encode_to_vec())).await;
+    }
+
+    fn mark_end(&mut self) {
+        self.sent_end = true;
+        self.ends.update(|s| s.sent_end = true);
+    }
+}
+
+impl RecvHalf {
+    /// The stream id.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
     /// The next piece of data, `None` once the peer has finished, or the error it reset with.
@@ -251,24 +362,18 @@ impl Stream {
             }
             Some(Event::End) => {
                 self.got_end = true;
+                self.ends.update(|s| s.got_end = true);
                 Ok(None)
             }
             Some(Event::Reset(e)) => {
-                self.reset = true;
+                self.ends.update(|s| s.reset = true);
                 Err(e)
             }
             None => {
-                self.reset = true;
+                self.ends.update(|s| s.reset = true);
                 Err(closed())
             }
         }
-    }
-
-    /// Ends the stream both ways with `status`.
-    pub async fn reset(mut self, status: Status) {
-        self.reset = true;
-        forget(&self.shared, self.id);
-        let _ = send(&self.shared, Frame::new(self.id, Kind::Reset, status.encode_to_vec())).await;
     }
 
     async fn grant(&self, n: u32) -> Result<(), Error> {
@@ -279,17 +384,6 @@ impl Stream {
             }
         }
         send(&self.shared, Frame::new(self.id, Kind::Credit, n.to_be_bytes().to_vec())).await
-    }
-}
-
-impl Drop for Stream {
-    fn drop(&mut self) {
-        forget(&self.shared, self.id);
-        if !self.reset && !(self.sent_end && self.got_end) {
-            let status = Status { reason: String::new(), message: "dropped".into() };
-            let _ =
-                self.shared.out.try_send(Frame::new(self.id, Kind::Reset, status.encode_to_vec()));
-        }
     }
 }
 
@@ -512,6 +606,41 @@ mod tests {
         let want = (16 * WINDOW as usize / block.len()) * block.len();
         assert_eq!(got, Bytes::from(want.to_string()));
         assert_eq!(s.recv().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn split_halves_send_and_receive_at_once() {
+        let ((node, _), (_, incoming)) = pair();
+        echo_server(incoming);
+        let (mut tx, mut rx) = node.open("echo", Bytes::new()).await.unwrap().split();
+        // The echo goes back as it arrives, so a sender that stopped to read would stall at a
+        // window each way. With the halves on two tasks it flows.
+        let total = 32 * WINDOW as usize;
+        let writer = tokio::spawn(async move {
+            let block = Bytes::from(vec![0x5a; 50_000]);
+            let mut sent = 0;
+            while sent < total {
+                tx.send(block.clone()).await.unwrap();
+                sent += block.len();
+            }
+            tx.finish().await.unwrap();
+            sent
+        });
+        let mut got = 0;
+        while let Some(b) = rx.recv().await.unwrap() {
+            got += b.len();
+        }
+        assert_eq!(got, writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_both_halves_resets_the_stream() {
+        let ((node, _), (_, mut incoming)) = pair();
+        let (tx, rx) = node.open("x", Bytes::new()).await.unwrap().split();
+        let mut served = incoming.recv().await.unwrap().stream;
+        drop(tx);
+        drop(rx);
+        assert!(served.recv().await.is_err());
     }
 
     #[tokio::test]

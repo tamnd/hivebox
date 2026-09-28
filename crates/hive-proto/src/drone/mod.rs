@@ -10,5 +10,5 @@ pub mod frame;
 pub mod handshake;
 pub mod msg;
 
-pub use channel::{Channel, Incoming, Side, Stream};
+pub use channel::{Channel, Incoming, RecvHalf, SendHalf, Side, Stream};
 pub use frame::{Frame, FrameCodec, Kind};

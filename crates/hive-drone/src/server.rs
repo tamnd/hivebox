@@ -1,5 +1,8 @@
+use crate::session::Sessions;
 use crate::{Config, health, process};
-use hive_proto::drone::api::{self, Command, RunRequest};
+use hive_proto::drone::api::{
+    self, Command, RunRequest, SessionCreate, SessionRef, SessionRun, SessionSend,
+};
 use hive_proto::drone::handshake::{self, Secret, VERSION};
 use hive_proto::drone::msg::{Hello, Status};
 use hive_proto::drone::{Channel, FrameCodec, Incoming, Side, Stream};
@@ -26,6 +29,7 @@ pub struct Drone {
     secrets: Mutex<[Secret; 2]>,
     started: Instant,
     processes: AtomicU32,
+    sessions: Sessions,
 }
 
 impl Drone {
@@ -37,6 +41,7 @@ impl Drone {
             secrets: Mutex::new([secret, secret]),
             started: Instant::now(),
             processes: AtomicU32::new(0),
+            sessions: Sessions::default(),
         })
     }
 
@@ -110,8 +115,26 @@ impl Drone {
             }
             api::HEALTH => {
                 let processes = self.processes.load(Ordering::Relaxed);
-                Ok(health::read(&self.cfg.build, self.started.elapsed(), processes).encode_to_vec())
+                let sessions = self.sessions.len() as u32;
+                let uptime = self.started.elapsed();
+                Ok(health::read(&self.cfg.build, uptime, processes, sessions).encode_to_vec())
             }
+            api::SESSION_CREATE => match SessionCreate::decode(open.request) {
+                Ok(spec) => self.sessions.create(&self.cfg, spec).map(|s| s.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::SESSION_RUN => match SessionRun::decode(open.request) {
+                Ok(req) => self.sessions.run(&self.cfg, req).await.map(|r| r.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::SESSION_SEND => match SessionSend::decode(open.request) {
+                Ok(req) => self.sessions.send(&self.cfg, req).await.map(|r| r.encode_to_vec()),
+                Err(e) => Err(bad_request(e)),
+            },
+            api::SESSION_CLOSE => match SessionRef::decode(open.request) {
+                Ok(r) => self.sessions.close(&r.id).map(|()| Vec::new()),
+                Err(e) => Err(bad_request(e)),
+            },
             other => Err(Error::new(Reason::InvalidArgument, format!("no method {other:?}"))),
         };
         match result {

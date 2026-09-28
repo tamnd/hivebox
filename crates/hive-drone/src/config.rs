@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How the drone runs commands. The defaults suit a cell image with a shell at `/bin/sh`.
@@ -6,6 +6,8 @@ use std::time::Duration;
 pub struct Config {
     /// Runs commands given as a string, with `-c`.
     pub shell: PathBuf,
+    /// The shell for sessions that do not name one. Bash is started with `--noprofile --norc`.
+    pub session_shell: PathBuf,
     /// Where commands run when they do not say.
     pub workdir: PathBuf,
     /// The environment every command starts with. Nothing is inherited from the drone.
@@ -28,6 +30,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shell: "/bin/sh".into(),
+            session_shell: if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" }
+                .into(),
             workdir: "/".into(),
             base_env: vec![
                 (

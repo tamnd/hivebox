@@ -11,6 +11,7 @@ use hive_proto::drone::Stream;
 use hive_proto::drone::api::{Command, MAX_CHUNK, RunRequest, RunResult, tag, tagged};
 use hive_types::{Error, Reason};
 use rustix::process::{Pid, Signal};
+use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -22,8 +23,8 @@ use tokio::sync::mpsc;
 
 /// How long to keep reading output after a command exits. A background job that inherited the
 /// pipes can hold them open for as long as it runs, and the answer should not wait for it.
-const DRAIN: Duration = Duration::from_millis(100);
-const READ_BUF: usize = 32 * 1024;
+pub(crate) const DRAIN: Duration = Duration::from_millis(100);
+pub(crate) const READ_BUF: usize = 32 * 1024;
 
 /// Runs a command to completion.
 pub(crate) async fn run(cfg: &Config, req: RunRequest) -> Result<RunResult, Error> {
@@ -205,19 +206,31 @@ fn build(cfg: &Config, c: &Command) -> Result<tokio::process::Command, Error> {
     } else {
         return Err(invalid("the command has neither argv nor shell"));
     };
+    setup(&mut cmd, cfg, &c.env, &c.cwd, c.uid, c.gid);
+    Ok(cmd)
+}
+
+/// Gives `cmd` a clean environment, a working directory, its own process group and its user.
+pub(crate) fn setup(
+    cmd: &mut tokio::process::Command,
+    cfg: &Config,
+    env: &BTreeMap<String, String>,
+    cwd: &str,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) {
     cmd.env_clear();
     cmd.envs(cfg.base_env.iter().map(|(k, v)| (k, v)));
-    cmd.envs(&c.env);
-    cmd.current_dir(if c.cwd.is_empty() { cfg.workdir.as_path() } else { Path::new(&c.cwd) });
+    cmd.envs(env);
+    cmd.current_dir(if cwd.is_empty() { cfg.workdir.as_path() } else { Path::new(cwd) });
     cmd.process_group(0);
     cmd.kill_on_drop(true);
-    if let Some(gid) = c.gid.or(cfg.gid) {
+    if let Some(gid) = gid.or(cfg.gid) {
         cmd.gid(gid);
     }
-    if let Some(uid) = c.uid.or(cfg.uid) {
+    if let Some(uid) = uid.or(cfg.uid) {
         cmd.uid(uid);
     }
-    Ok(cmd)
 }
 
 // What a shell reports for a command it cannot find, with the reason on stderr.
@@ -276,31 +289,31 @@ fn lock(ring: &Mutex<Ring>) -> MutexGuard<'_, Ring> {
 /// A command's process group, killed when dropped unless the command has exited. A caller that
 /// goes away, or a connection that drops, takes the command and its children with it.
 #[derive(Debug)]
-struct Group {
+pub(crate) struct Group {
     pid: Option<Pid>,
     running: bool,
 }
 
 impl Group {
-    fn new(child: &Child) -> Self {
+    pub(crate) fn new(child: &Child) -> Self {
         let pid = child.id().and_then(|id| Pid::from_raw(id as i32));
         Self { pid, running: true }
     }
 
-    fn signal(&self, sig: Signal) {
+    pub(crate) fn signal(&self, sig: Signal) {
         if let Some(pid) = self.pid.filter(|_| self.running) {
             // The group may already be gone, which is fine.
             let _ = rustix::process::kill_process_group(pid, sig);
         }
     }
 
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         self.signal(Signal::KILL);
     }
 
     // After the leader exits its pid can be reused, so the group is left alone from then on.
     // Children it left running in the background keep running, as they would under a shell.
-    fn exited(&mut self) {
+    pub(crate) fn exited(&mut self) {
         self.running = false;
     }
 }
@@ -313,6 +326,6 @@ impl Drop for Group {
     }
 }
 
-fn invalid(message: impl Into<String>) -> Error {
+pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::new(Reason::InvalidArgument, message)
 }

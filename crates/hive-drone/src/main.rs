@@ -1,8 +1,8 @@
 //! The `hive-drone` binary.
 //!
 //! ```text
-//! hive-drone --listen unix:/run/hive/drone.sock --secret-stdin [--shell /bin/sh] [--workdir /]
-//!            [--uid N] [--gid N]
+//! hive-drone --listen unix:/run/hive/drone.sock --secret-stdin [--shell /bin/sh]
+//!            [--session-shell /bin/bash] [--workdir /] [--uid N] [--gid N]
 //! ```
 //!
 //! The first secret is read from stdin as 32 raw bytes, so it never shows up in the process list
@@ -14,7 +14,7 @@ use hive_drone::{Config, Drone};
 use std::io::Read;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: hive-drone --listen unix:PATH --secret-stdin [--shell PATH] [--workdir PATH] [--uid N] [--gid N]";
+const USAGE: &str = "usage: hive-drone --listen unix:PATH --secret-stdin [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N]";
 
 struct Args {
     listen: String,
@@ -32,6 +32,7 @@ fn parse() -> Result<Args, String> {
             "--listen" => listen = Some(value("--listen")?),
             "--secret-stdin" => secret_stdin = true,
             "--shell" => cfg.shell = value("--shell")?.into(),
+            "--session-shell" => cfg.session_shell = value("--session-shell")?.into(),
             "--workdir" => cfg.workdir = value("--workdir")?.into(),
             "--uid" => cfg.uid = Some(value("--uid")?.parse().map_err(|e| format!("--uid: {e}"))?),
             "--gid" => cfg.gid = Some(value("--gid")?.parse().map_err(|e| format!("--gid: {e}"))?),

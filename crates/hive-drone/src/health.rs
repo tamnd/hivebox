@@ -3,7 +3,7 @@
 use hive_proto::drone::api::Health;
 use std::time::Duration;
 
-pub(crate) fn read(build: &str, uptime: Duration, processes: u32) -> Health {
+pub(crate) fn read(build: &str, uptime: Duration, processes: u32, sessions: u32) -> Health {
     let (mem_total_bytes, mem_available_bytes) = meminfo();
     Health {
         build: build.to_string(),
@@ -12,6 +12,7 @@ pub(crate) fn read(build: &str, uptime: Duration, processes: u32) -> Health {
         mem_total_bytes,
         mem_available_bytes,
         processes,
+        sessions,
     }
 }
 
