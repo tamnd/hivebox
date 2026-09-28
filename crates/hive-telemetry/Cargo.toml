@@ -15,3 +15,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json", "std"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
