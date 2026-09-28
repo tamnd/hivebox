@@ -4,6 +4,14 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.3
+
+The start of hive-comb, the node agent, in standalone mode.
+
+- `hive-cell` has the `CellDriver` trait every backend implements, with plain data handles the node can store and give back after a restart, and a `DriverRegistry` (#22).
+- `hive-comb` has its WAL, admission and the lifecycle actors. The WAL groups concurrent writes into one fsync, so 256 writers get about 32,600 writes/s on a VPS disk where one fsync takes 2.4 ms. A restarted comb takes back every cell it knew, reconnects running cells to their guest agent and cleans up half made ones. Create then stop runs about 1,650 cells/s with 256 callers on the same box, with a fake driver (#23).
+- Every cell gets its own cgroup under `hive.slice/<class>.slice`, taken from a pool of spares that already have the default limits, which costs under 1 us. Stopping a cell kills everything in its cgroup, and a restarted comb sweeps any cgroup no cell claims (#24).
+
 ## 0.0.2
 
 hive-drone v1, the guest agent that runs inside every cell.
