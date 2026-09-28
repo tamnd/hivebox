@@ -17,6 +17,15 @@ pub const PROCESS_RUN: &str = "process.run";
 pub const PROCESS_START: &str = "process.start";
 /// The drone's view of the cell. Empty request, answer [`Health`].
 pub const HEALTH: &str = "health";
+/// Starts a persistent shell. Request [`SessionCreate`], answer [`SessionInfo`].
+pub const SESSION_CREATE: &str = "session.create";
+/// Runs one command in a session's shell. Request [`SessionRun`], answer [`SessionRunResult`].
+pub const SESSION_RUN: &str = "session.run";
+/// Writes raw input to a session's shell and collects what comes back. Request [`SessionSend`],
+/// answer [`SessionSendResult`].
+pub const SESSION_SEND: &str = "session.send";
+/// Ends a session and everything running in it. Request [`SessionRef`], empty answer.
+pub const SESSION_CLOSE: &str = "session.close";
 
 /// The most data one tagged frame carries, so that the tag and the data fit in one frame.
 pub const MAX_CHUNK: usize = MAX_PAYLOAD - 1;
@@ -145,6 +154,140 @@ pub struct Health {
     /// Processes the drone is running for callers right now.
     #[prost(uint32, tag = "6")]
     pub processes: u32,
+    /// Sessions open right now.
+    #[prost(uint32, tag = "7")]
+    pub sessions: u32,
+}
+
+/// A persistent shell to start.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionCreate {
+    /// The shell to run. The drone's session shell when empty.
+    #[prost(string, tag = "1")]
+    pub shell: String,
+    /// Where it starts. The drone's default when empty.
+    #[prost(string, tag = "2")]
+    pub cwd: String,
+    /// Added on top of the drone's base environment.
+    #[prost(btree_map = "string, string", tag = "3")]
+    pub env: BTreeMap<String, String>,
+    /// The user it runs as. The drone's default when unset.
+    #[prost(uint32, optional, tag = "4")]
+    pub uid: Option<u32>,
+    /// The group it runs as. The drone's default when unset.
+    #[prost(uint32, optional, tag = "5")]
+    pub gid: Option<u32>,
+}
+
+/// A session that was started.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionInfo {
+    /// Names the session in later calls.
+    #[prost(string, tag = "1")]
+    pub id: String,
+}
+
+/// Names a session.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionRef {
+    /// From [`SessionInfo`].
+    #[prost(string, tag = "1")]
+    pub id: String,
+}
+
+/// One command to run in a session.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionRun {
+    /// The session.
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// Shell source, run in the session's shell so that `cd`, variables and functions carry
+    /// over to the next command. Its stdin is `/dev/null`.
+    #[prost(string, tag = "2")]
+    pub command: String,
+    /// The shell is killed and started again after this many milliseconds. The drone's default
+    /// when zero.
+    #[prost(uint64, tag = "3")]
+    pub timeout_ms: u64,
+    /// Output kept. The drone's default when zero, and never more than its cap.
+    #[prost(uint64, tag = "4")]
+    pub max_output_bytes: u64,
+}
+
+/// How a session command ended.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionRunResult {
+    /// The command's exit code. When the shell itself exited, its exit code, or 128 plus the
+    /// signal that ended it.
+    #[prost(sint32, tag = "1")]
+    pub exit_code: i32,
+    /// Stdout and stderr, interleaved as the command wrote them.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub output: Bytes,
+    /// True when output was dropped from the middle. See [`RunResult::truncated`].
+    #[prost(bool, tag = "3")]
+    pub truncated: bool,
+    /// True when the command ran past its timeout and the shell was killed.
+    #[prost(bool, tag = "4")]
+    pub timed_out: bool,
+    /// From writing the command to seeing it finish, in nanoseconds.
+    #[prost(uint64, tag = "5")]
+    pub wall_nanos: u64,
+    /// Bytes of output, including any that were dropped.
+    #[prost(uint64, tag = "6")]
+    pub output_bytes: u64,
+    /// True when the shell is gone, killed at the timeout or exited on its own. The next call
+    /// starts a new one with the session's first directory and environment.
+    #[prost(bool, tag = "7")]
+    pub restarted: bool,
+}
+
+/// Raw input for a session's shell, for driving interactive programs like `python` or `gdb`.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionSend {
+    /// The session.
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// Written to the shell's stdin as is.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub input: Bytes,
+    /// Stop reading once the output since the input was written contains this.
+    #[prost(string, tag = "3")]
+    pub expect: String,
+    /// Stop reading once no output has come for this many milliseconds. With `expect` empty, 200
+    /// when zero. With `expect` set, zero means wait for the match.
+    #[prost(uint64, tag = "4")]
+    pub quiet_ms: u64,
+    /// Stop reading after this many milliseconds, whatever happens. The drone's default when
+    /// zero. The shell is left running.
+    #[prost(uint64, tag = "5")]
+    pub timeout_ms: u64,
+    /// Output kept. The drone's default when zero, and never more than its cap.
+    #[prost(uint64, tag = "6")]
+    pub max_output_bytes: u64,
+}
+
+/// What came back after a [`SessionSend`].
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionSendResult {
+    /// Stdout and stderr, interleaved.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub output: Bytes,
+    /// True when output was dropped from the middle.
+    #[prost(bool, tag = "2")]
+    pub truncated: bool,
+    /// True when `expect` was seen.
+    #[prost(bool, tag = "3")]
+    pub matched: bool,
+    /// True when reading stopped at the timeout.
+    #[prost(bool, tag = "4")]
+    pub timed_out: bool,
+    /// Bytes of output, including any that were dropped.
+    #[prost(uint64, tag = "5")]
+    pub output_bytes: u64,
+    /// True when the shell exited. The next call starts a new one.
+    #[prost(bool, tag = "6")]
+    pub restarted: bool,
 }
 
 impl RunResult {

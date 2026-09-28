@@ -128,13 +128,19 @@ async fn streamed_commands_echo_their_input() {
     assert!(matches!(p.next().await.unwrap(), Some(Output::Started(pid)) if pid > 0));
     p.write(b"one\n").await.unwrap();
     assert_eq!(p.next().await.unwrap(), Some(Output::Stdout(Bytes::from_static(b"one\n"))));
-    let big = vec![b'y'; 1 << 20];
-    p.write(&big).await.unwrap();
-    p.close_stdin().await.unwrap();
-    let r = p.wait().await.unwrap();
+    // Far more than the pipes and the channel windows hold, so input and output have to flow
+    // at the same time.
+    let (mut input, output) = p.split();
+    let writer = tokio::spawn(async move {
+        input.write(&vec![b'y'; 16 << 20]).await.unwrap();
+        input.close_stdin().await.unwrap();
+        input
+    });
+    let r = output.wait().await.unwrap();
+    writer.await.unwrap().finish().await.unwrap();
     assert_eq!(r.exit_code, 0);
-    assert_eq!(r.stdout.len(), 1 << 20);
-    assert_eq!(r.stdout_bytes, 4 + (1 << 20));
+    assert_eq!(r.stdout.len(), 16 << 20);
+    assert_eq!(r.stdout_bytes, 4 + (16 << 20));
 }
 
 #[tokio::test]

@@ -23,7 +23,7 @@ hive-proto.workspace = true
 hive-rt.workspace = true
 hive-types.workspace = true
 prost.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["pipe", "process"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 

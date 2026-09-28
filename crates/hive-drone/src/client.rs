@@ -1,9 +1,10 @@
 use bytes::Bytes;
 use hive_proto::drone::api::{
-    self, Command, Health, MAX_CHUNK, RunRequest, RunResult, tag, tagged,
+    self, Command, Health, MAX_CHUNK, RunRequest, RunResult, SessionCreate, SessionInfo,
+    SessionRef, SessionRun, SessionRunResult, SessionSend, SessionSendResult, tag, tagged,
 };
 use hive_proto::drone::handshake::{self, Established, Secret};
-use hive_proto::drone::{Channel, FrameCodec, Side, Stream};
+use hive_proto::drone::{Channel, FrameCodec, RecvHalf, SendHalf, Side};
 use hive_types::{Error, Reason};
 use prost::Message;
 use std::io;
@@ -93,17 +94,66 @@ impl Client {
         Health::decode(answer).map_err(bad_answer)
     }
 
+    /// Starts a persistent shell.
+    pub async fn session_create(&self, spec: &SessionCreate) -> Result<SessionInfo, Error> {
+        self.unary(api::SESSION_CREATE, spec, 4096).await
+    }
+
+    /// Runs one command in a session's shell and waits for it to finish.
+    pub async fn session_run(&self, req: &SessionRun) -> Result<SessionRunResult, Error> {
+        self.unary(api::SESSION_RUN, req, RESULT_LIMIT).await
+    }
+
+    /// Writes raw input to a session's shell and collects what comes back.
+    pub async fn session_send(&self, req: &SessionSend) -> Result<SessionSendResult, Error> {
+        self.unary(api::SESSION_SEND, req, RESULT_LIMIT).await
+    }
+
+    /// Ends a session and kills everything running in it.
+    pub async fn session_close(&self, id: &str) -> Result<(), Error> {
+        let req = SessionRef { id: id.to_string() };
+        self.channel.call(api::SESSION_CLOSE, req.encode_to_vec().into(), 0).await.map(|_| ())
+    }
+
+    async fn unary<A: Message + Default>(
+        &self,
+        method: &str,
+        req: &impl Message,
+        limit: usize,
+    ) -> Result<A, Error> {
+        let answer = self.channel.call(method, req.encode_to_vec().into(), limit).await?;
+        A::decode(answer).map_err(bad_answer)
+    }
+
     /// Starts a command with its input and output streamed.
     pub async fn start(&self, cmd: &Command) -> Result<Process, Error> {
         let stream = self.channel.open(api::PROCESS_START, cmd.encode_to_vec().into()).await?;
-        Ok(Process { stream, done: false })
+        let (tx, rx) = stream.split();
+        Ok(Process { input: ProcessInput { tx }, output: ProcessOutput { rx, done: false } })
     }
 }
 
 /// A command started with [`Client::start`]. Dropping it kills the command.
+///
+/// Feeding a command a lot of input while not reading its output stalls the way a pipe does, once
+/// the command's output fills up. [`Process::split`] gives an input half and an output half that
+/// can run on two tasks.
 #[derive(Debug)]
 pub struct Process {
-    stream: Stream,
+    input: ProcessInput,
+    output: ProcessOutput,
+}
+
+/// The input half of a [`Process`].
+#[derive(Debug)]
+pub struct ProcessInput {
+    tx: SendHalf,
+}
+
+/// The output half of a [`Process`].
+#[derive(Debug)]
+pub struct ProcessOutput {
+    rx: RecvHalf,
     done: bool,
 }
 
@@ -122,31 +172,80 @@ pub enum Output {
 }
 
 impl Process {
+    /// Splits into an input half and an output half. The command is killed once both are
+    /// dropped, unless it has exited and the input half was closed with
+    /// [`ProcessInput::finish`].
+    #[must_use]
+    pub fn split(self) -> (ProcessInput, ProcessOutput) {
+        (self.input, self.output)
+    }
+
+    /// Writes to the command's stdin.
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.input.write(data).await
+    }
+
+    /// Closes the command's stdin.
+    pub async fn close_stdin(&mut self) -> Result<(), Error> {
+        self.input.close_stdin().await
+    }
+
+    /// Sends `signal` to the command's process group.
+    pub async fn signal(&mut self, signal: i32) -> Result<(), Error> {
+        self.input.signal(signal).await
+    }
+
+    /// The next thing the command did, or `None` after [`Output::Exit`].
+    pub async fn next(&mut self) -> Result<Option<Output>, Error> {
+        let out = self.output.next().await?;
+        if let Some(Output::Exit(_)) = out {
+            self.input.finish().await?;
+        }
+        Ok(out)
+    }
+
+    /// Reads everything to the end and returns the result with the output filled in.
+    pub async fn wait(self) -> Result<RunResult, Error> {
+        let (mut input, output) = self.split();
+        let result = output.wait().await?;
+        input.finish().await?;
+        Ok(result)
+    }
+}
+
+impl ProcessInput {
     /// Writes to the command's stdin.
     pub async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         for chunk in data.chunks(MAX_CHUNK) {
-            self.stream.send(tagged(tag::STDIN, chunk)).await?;
+            self.tx.send(tagged(tag::STDIN, chunk)).await?;
         }
         Ok(())
     }
 
     /// Closes the command's stdin.
     pub async fn close_stdin(&mut self) -> Result<(), Error> {
-        self.stream.send(tagged(tag::EOF, &[])).await
+        self.tx.send(tagged(tag::EOF, &[])).await
     }
 
     /// Sends `signal` to the command's process group.
     pub async fn signal(&mut self, signal: i32) -> Result<(), Error> {
-        self.stream.send(tagged(tag::SIGNAL, &signal.to_be_bytes())).await
+        self.tx.send(tagged(tag::SIGNAL, &signal.to_be_bytes())).await
     }
 
+    /// Ends the node's side of the call. Nothing more can be sent, and stdin is closed.
+    pub async fn finish(&mut self) -> Result<(), Error> {
+        self.tx.finish().await
+    }
+}
+
+impl ProcessOutput {
     /// The next thing the command did, or `None` after [`Output::Exit`].
     pub async fn next(&mut self) -> Result<Option<Output>, Error> {
         loop {
             if self.done {
                 return Ok(None);
             }
-            let Some(msg) = self.stream.recv().await? else {
+            let Some(msg) = self.rx.recv().await? else {
                 return Err(Error::new(
                     Reason::DroneUnreachable,
                     "the drone ended the stream early",
@@ -164,9 +263,9 @@ impl Process {
                 tag::EXIT => {
                     self.done = true;
                     let result = RunResult::decode(msg.slice(1..)).map_err(bad_answer)?;
-                    self.stream.finish().await?;
-                    // Read the end so the stream closes cleanly.
-                    while self.stream.recv().await?.is_some() {}
+                    // The exit is the drone's last frame. Reading its end lets the stream close
+                    // cleanly.
+                    while self.rx.recv().await?.is_some() {}
                     Output::Exit(result)
                 }
                 other => return Err(bad_answer(format!("unknown frame tag {other}"))),
