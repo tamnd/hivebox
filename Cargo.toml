@@ -54,7 +54,13 @@ hivectl = { version = "=0.0.0", path = "crates/hivectl" }
 
 # Third party crates. Versions are bumped by dependabot in groups, and a new one here needs a line
 # in the pull request saying why the standard library or an existing one is not enough.
+blake3 = "1.8"
+bytes = "1.12"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+prost = "0.14"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.53", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

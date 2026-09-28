@@ -1,5 +1,7 @@
-//! Generated code for the `hivebox.v1` public API and the internal gate, comb, scout and keeper services, plus the conversions to and from `hive-types`. Nothing in here makes a decision.
+//! Wire types for hivebox: the drone channel between the node agent and the guest agent today, and the generated code for the `hivebox.v1` public API and the internal services as they land. Nothing in here makes a decision.
 //!
-//! The design is in `spec/05_api_sdk.md`. Nothing here is implemented yet, and the milestone issues say when it will be.
+//! The drone channel is in `spec/09_guest_agent.md` and the public API in `spec/05_api_sdk.md`.
 
 #![forbid(unsafe_code)]
+
+pub mod drone;
