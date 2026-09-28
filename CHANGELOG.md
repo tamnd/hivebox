@@ -4,6 +4,15 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.2
+
+hive-drone v1, the guest agent that runs inside every cell.
+
+- `process.run`, `process.start` and `health`, with a typed client for the node side. Running `/bin/true` through the drone costs about the same as spawning it straight from tokio, around 0.7 to 0.9 ms p50 on the test box (#17).
+- Persistent shell sessions that keep `cd` and variables across calls, with end of command detection by a sentinel. A shell builtin in a session takes about 150 us p50. Channel streams split into halves so a caller can write and read at once (#18).
+- `fs.read`, `fs.write`, `fs.stat`, `fs.list`, `fs.mkdir`, `fs.remove`, `fs.rename` and `fs.chmod`. Every path resolves with `openat2` inside the drone's configured roots, and writes are all or nothing. `hive-types` gains the `FILE_ERROR` reason and an `errno` field on errors (#19).
+- `fs.upload` and `fs.download` move whole trees as tar archives, and hostile archives stay inside the destination. `fs.watch` streams changes under a directory through inotify, recursively if asked. The drone crate now builds only on Linux (#20).
+
 ## 0.0.1
 
 The first pieces of M0.
