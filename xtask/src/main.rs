@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod bump;
 mod layers;
 mod style;
 
@@ -19,6 +20,10 @@ fn main() -> ExitCode {
         Some("style") => style::check(&root()),
         Some("msrv") => msrv(),
         Some("ci") => ci(),
+        Some("bump") => match std::env::args().nth(2) {
+            Some(version) => bump::run(&root(), &version),
+            None => Err("bump needs a version, like `cargo xtask bump 0.0.1`".into()),
+        },
         Some("help" | "--help" | "-h") | None => {
             usage();
             return ExitCode::SUCCESS;
@@ -41,6 +46,7 @@ fn usage() {
     println!("  style    the prose rules for markdown in this repository");
     println!("  msrv     the workspace still builds on the oldest Rust the manifest claims");
     println!("  ci       everything the per-commit workflow runs, in the same order");
+    println!("  bump V   move the workspace, the internal pins and the changelog to version V");
 }
 
 fn root() -> PathBuf {

@@ -62,7 +62,7 @@ Pull requests describe the problem, then the change, then how it was verified. R
 
 ## Versions
 
-The minor version is the number of milestones finished. Work inside M0 is 0.0.x, the release where M0's exit criterion passes is 0.1.0, and so on. Tagging is the whole release process: push a tag that matches the version in `Cargo.toml` and has a section in `CHANGELOG.md`, and the release workflow does the rest or refuses.
+The minor version is the number of milestones finished. Work inside M0 is 0.0.x, the release where M0's exit criterion passes is 0.1.0, and so on. A patch release goes out when enough has landed since the last one to be worth a tag. To cut one, run `cargo xtask bump 0.0.1` and `cargo update --workspace`, commit, and push a `v0.0.1` tag. The release workflow checks that the tag, the workspace version and the changelog agree, and does the rest or refuses.
 
 ## Security
 
