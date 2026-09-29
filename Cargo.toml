@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 # The floor is raised deliberately, in a commit, and the msrv job in CI holds us to it. 1.88 is the
 # first release with let chains on edition 2024, and that is the only reason it is not 1.85.
@@ -22,35 +22,35 @@ publish = false
 # One version for the whole workspace, bumped together. Internal crates are pinned exactly so that
 # a partial publish can never produce a mixed version build.
 [workspace.dependencies]
-hive-types = { version = "=0.0.7", path = "crates/hive-types" }
-hive-proto = { version = "=0.0.7", path = "crates/hive-proto" }
-hive-rt = { version = "=0.0.7", path = "crates/hive-rt" }
-hive-telemetry = { version = "=0.0.7", path = "crates/hive-telemetry" }
-hive-auth = { version = "=0.0.7", path = "crates/hive-auth" }
-hive-cell = { version = "=0.0.7", path = "crates/hive-cell" }
-hive-nectar = { version = "=0.0.7", path = "crates/hive-nectar" }
-hive-drone = { version = "=0.0.7", path = "crates/hive-drone" }
-hive-cell-wasm = { version = "=0.0.7", path = "crates/hive-cell-wasm" }
-hive-cell-proc = { version = "=0.0.7", path = "crates/hive-cell-proc" }
-hive-cell-oci = { version = "=0.0.7", path = "crates/hive-cell-oci" }
-hive-cell-fc = { version = "=0.0.7", path = "crates/hive-cell-fc" }
-hive-cell-ch = { version = "=0.0.7", path = "crates/hive-cell-ch" }
-hive-cell-qemu = { version = "=0.0.7", path = "crates/hive-cell-qemu" }
-hive-cell-plugin = { version = "=0.0.7", path = "crates/hive-cell-plugin" }
-hive-uffd = { version = "=0.0.7", path = "crates/hive-uffd" }
-hive-snap = { version = "=0.0.7", path = "crates/hive-snap" }
-hive-blockd = { version = "=0.0.7", path = "crates/hive-blockd" }
-hive-guard = { version = "=0.0.7", path = "crates/hive-guard" }
-hive-imaged = { version = "=0.0.7", path = "crates/hive-imaged" }
-hive-comb = { version = "=0.0.7", path = "crates/hive-comb" }
-hive-waggle = { version = "=0.0.7", path = "crates/hive-waggle" }
-hive-scout = { version = "=0.0.7", path = "crates/hive-scout" }
-hive-keeper = { version = "=0.0.7", path = "crates/hive-keeper" }
-hive-gate = { version = "=0.0.7", path = "crates/hive-gate" }
-hive-sdk = { version = "=0.0.7", path = "crates/hive-sdk" }
-hive-pollen = { version = "=0.0.7", path = "crates/hive-pollen" }
-hive-sim = { version = "=0.0.7", path = "crates/hive-sim" }
-hivectl = { version = "=0.0.7", path = "crates/hivectl" }
+hive-types = { version = "=0.0.8", path = "crates/hive-types" }
+hive-proto = { version = "=0.0.8", path = "crates/hive-proto" }
+hive-rt = { version = "=0.0.8", path = "crates/hive-rt" }
+hive-telemetry = { version = "=0.0.8", path = "crates/hive-telemetry" }
+hive-auth = { version = "=0.0.8", path = "crates/hive-auth" }
+hive-cell = { version = "=0.0.8", path = "crates/hive-cell" }
+hive-nectar = { version = "=0.0.8", path = "crates/hive-nectar" }
+hive-drone = { version = "=0.0.8", path = "crates/hive-drone" }
+hive-cell-wasm = { version = "=0.0.8", path = "crates/hive-cell-wasm" }
+hive-cell-proc = { version = "=0.0.8", path = "crates/hive-cell-proc" }
+hive-cell-oci = { version = "=0.0.8", path = "crates/hive-cell-oci" }
+hive-cell-fc = { version = "=0.0.8", path = "crates/hive-cell-fc" }
+hive-cell-ch = { version = "=0.0.8", path = "crates/hive-cell-ch" }
+hive-cell-qemu = { version = "=0.0.8", path = "crates/hive-cell-qemu" }
+hive-cell-plugin = { version = "=0.0.8", path = "crates/hive-cell-plugin" }
+hive-uffd = { version = "=0.0.8", path = "crates/hive-uffd" }
+hive-snap = { version = "=0.0.8", path = "crates/hive-snap" }
+hive-blockd = { version = "=0.0.8", path = "crates/hive-blockd" }
+hive-guard = { version = "=0.0.8", path = "crates/hive-guard" }
+hive-imaged = { version = "=0.0.8", path = "crates/hive-imaged" }
+hive-comb = { version = "=0.0.8", path = "crates/hive-comb" }
+hive-waggle = { version = "=0.0.8", path = "crates/hive-waggle" }
+hive-scout = { version = "=0.0.8", path = "crates/hive-scout" }
+hive-keeper = { version = "=0.0.8", path = "crates/hive-keeper" }
+hive-gate = { version = "=0.0.8", path = "crates/hive-gate" }
+hive-sdk = { version = "=0.0.8", path = "crates/hive-sdk" }
+hive-pollen = { version = "=0.0.8", path = "crates/hive-pollen" }
+hive-sim = { version = "=0.0.8", path = "crates/hive-sim" }
+hivectl = { version = "=0.0.8", path = "crates/hivectl" }
 
 # Third party crates. Versions are bumped by dependabot in groups, and a new one here needs a line
 # in the pull request saying why the standard library or an existing one is not enough.
