@@ -15,3 +15,22 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+futures.workspace = true
+hive-cell.workspace = true
+hive-types.workspace = true
+rustix = { workspace = true, features = ["event", "fs", "mount", "process", "thread"] }
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libcontainer = { workspace = true, features = ["v2"] }
+nix = { workspace = true, features = ["process", "signal"] }
+
+[dev-dependencies]
+hive-drone.workspace = true
+hive-proto.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

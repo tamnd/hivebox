@@ -7,6 +7,9 @@
 //! It reads its config from `PATH`, or from `/etc/hivebox/comb.toml` when there is one, opens the
 //! comb and serves the local API on the config's socket. On SIGTERM or SIGINT it stops taking
 //! calls and leaves every cell running, and the next comb to start takes them over.
+//!
+//! `hive-comb --oci-worker` is not for people: it is how the container backend starts its workers,
+//! which have to be single threaded processes of their own.
 
 #![forbid(unsafe_code)]
 
@@ -41,6 +44,10 @@ fn config() -> Result<hive_comb::Config, String> {
 
 #[cfg(target_os = "linux")]
 fn main() -> ExitCode {
+    // Before anything else, the runtime's threads above all, since a worker has to have none.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--oci-worker") {
+        return hive_cell_oci::worker::main();
+    }
     if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
         println!("hive-comb {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
@@ -76,10 +83,9 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     let socket = cfg.api_socket.clone();
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
-    // No backend is built into the binary yet. Each one is added here as it lands.
-    let drivers = hive_cell::DriverRegistry::new();
+    let drivers = drivers(&cfg).await;
     if drivers.iter().next().is_none() {
-        eprintln!("hive-comb: no backend is built in yet, so every create will be refused");
+        eprintln!("hive-comb: no backend can run here, so every create will be refused");
     }
     let comb = hive_comb::Comb::open(cfg, drivers).await?;
     let listener = hive_comb::api::bind(&socket)?;
@@ -108,6 +114,34 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&socket);
     comb.shutdown().await;
     result
+}
+
+/// Every backend this node can run. One that cannot is left out, and the log says why.
+#[cfg(target_os = "linux")]
+async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
+    use hive_cell::CellDriver;
+
+    let mut drivers = hive_cell::DriverRegistry::new();
+    let c = &cfg.container;
+    if c.enabled {
+        let oci = hive_cell_oci::Config {
+            drone: c.drone.clone(),
+            state_dir: c.state_dir.clone(),
+            workers: c.workers,
+            uid_base: c.uid_base,
+            uid_count: c.uid_count,
+            ..hive_cell_oci::Config::default()
+        };
+        match hive_cell_oci::OciDriver::new(oci) {
+            Ok(d) => match d.probe().await {
+                Ok(fit) if fit.ready => drivers.add(std::sync::Arc::new(d)),
+                Ok(fit) => eprintln!("hive-comb: no container cells: {}", fit.notes.join(", ")),
+                Err(e) => eprintln!("hive-comb: no container cells: {e}"),
+            },
+            Err(e) => eprintln!("hive-comb: no container cells: {e}"),
+        }
+    }
+    drivers
 }
 
 #[cfg(not(target_os = "linux"))]

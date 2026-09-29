@@ -43,6 +43,38 @@ pub struct Config {
     pub netns_depth: usize,
     /// Where the local API listens.
     pub api_socket: PathBuf,
+    /// The container backend.
+    pub container: ContainerBackend,
+}
+
+/// How the comb runs container cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerBackend {
+    /// Off leaves the backend out even where the node could run it.
+    pub enabled: bool,
+    /// The static drone binary put in every container.
+    pub drone: PathBuf,
+    /// Where each container cell gets its bundle, its state and its log.
+    pub state_dir: PathBuf,
+    /// Processes kept to make containers, which is how many creates go on at once.
+    pub workers: usize,
+    /// The first host id root in a cell maps to. Images have to be imported with the same base.
+    pub uid_base: u32,
+    /// How many ids each cell has.
+    pub uid_count: u32,
+}
+
+impl Default for ContainerBackend {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            drone: PathBuf::from("/usr/lib/hivebox/hive-drone"),
+            state_dir: PathBuf::from("/run/hivebox/oci"),
+            workers: 8,
+            uid_base: 1_000_000,
+            uid_count: 65536,
+        }
+    }
 }
 
 impl Default for Config {
@@ -69,6 +101,7 @@ impl Default for Config {
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
             netns_depth: 400,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
+            container: ContainerBackend::default(),
         }
     }
 }
@@ -95,6 +128,10 @@ impl Config {
     ///
     /// [backends.create_limit]
     /// container = 128
+    ///
+    /// [backends.container]
+    /// drone = "/usr/lib/hivebox/hive-drone"
+    /// workers = 8
     /// ```
     ///
     /// An empty `cgroup_root` or `netns_dir` turns that pool off.
@@ -143,6 +180,20 @@ impl Config {
                 .find(|b| b.as_str() == name && *b != Backend::Auto)
                 .ok_or_else(|| format!("backends.create_limit has no backend named {name:?}"))?;
             c.create_limit.insert(backend, limit);
+        }
+        let k = file.backends.container;
+        let b = &mut c.container;
+        set(&mut b.enabled, k.enabled);
+        set(&mut b.drone, k.drone);
+        set(&mut b.state_dir, k.state_dir);
+        set(&mut b.workers, k.workers);
+        set(&mut b.uid_base, k.uid_base);
+        set(&mut b.uid_count, k.uid_count);
+        if b.workers == 0 {
+            return Err("backends.container.workers must not be 0".into());
+        }
+        if b.uid_count == 0 || b.uid_base.checked_add(b.uid_count).is_none() {
+            return Err("backends.container ids run past the last uid".into());
         }
         if c.node == 0 {
             return Err("node.node must not be 0".into());
@@ -215,6 +266,18 @@ struct LifecycleFile {
 #[serde(default, deny_unknown_fields)]
 struct BackendsFile {
     create_limit: BTreeMap<String, usize>,
+    container: ContainerFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ContainerFile {
+    enabled: Option<bool>,
+    drone: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    workers: Option<usize>,
+    uid_base: Option<u32>,
+    uid_count: Option<u32>,
 }
 
 #[cfg(test)]
@@ -249,6 +312,10 @@ mod tests {
 
             [backends.create_limit]
             container = 8
+
+            [backends.container]
+            drone = "/opt/hive-drone"
+            workers = 2
             "#,
         )
         .unwrap();
@@ -264,6 +331,9 @@ mod tests {
         assert_eq!(c.keep_ended, Duration::from_secs(600));
         assert_eq!(c.create_limit[&Backend::Container], 8);
         assert_eq!(c.create_limit[&Backend::Microvm], 64);
+        assert_eq!(c.container.drone, PathBuf::from("/opt/hive-drone"));
+        assert_eq!(c.container.workers, 2);
+        assert_eq!(c.container.uid_base, 1_000_000);
     }
 
     #[test]
@@ -273,5 +343,7 @@ mod tests {
         assert!(Config::from_toml("[lifecycle]\nstop_grace = \"1d\"").is_err());
         assert!(Config::from_toml("[backends.create_limit]\nauto = 1").is_err());
         assert!(Config::from_toml("[node]\nnode = 0").is_err());
+        assert!(Config::from_toml("[backends.container]\nworkers = 0").is_err());
+        assert!(Config::from_toml("[backends.container]\nuid_base = 4294967295").is_err());
     }
 }

@@ -5,6 +5,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 ## Unreleased
 
 - `hive-drone` can run as a container's first process with `--init`, which reaps orphans and passes stop signals on, and can lock itself down with `--harden`: Landlock makes the `--protect` paths read only, a seccomp allowlist of 282 calls returns ENOSYS for the rest, and 41 calls such as mount, unshare, setns, bpf and io_uring return EPERM. The secret can come from a file the drone deletes after reading it, and `--env` sets the environment commands get. On server3 the filters add about 100 to 200 ns to each syscall and nothing measurable to running a command (#29).
+- `hive-cell-oci` runs container cells through youki's libcontainer, in process. Each cell has its own user, PID, mount, IPC, UTS and cgroup namespaces, root in the cell is uid 1000000 on the host, the root filesystem is an overlay over an image unpacked by `hive-oci import`, and the first process is a hardened `hive-drone --init` whose socket is bound on the host and passed in as descriptor 3. Containers are made by single threaded worker processes, which `hive-comb` starts as `hive-comb --oci-worker`, and the comb registers the backend when the node passes its probe (`[backends.container]` in the config). On server3 at load 22 to 45 on 8 cores, a create through the comb takes 112 ms at p50 with a python image, 64 at once are all running in 2.7 s, and an idle cell uses about 680 KiB (#30).
 
 ## 0.0.4
 
