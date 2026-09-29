@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-nectar` v0 stores images as EROFS layers. `PosixStore` keeps blobs by BLAKE3 name on a local or shared filesystem, `oci::Importer` turns an OCI image layout into one metadata blob and one data blob per layer by streaming each layer into `mkfs.erofs` through a pipe, and `Cache` is the node's L1 that fetches whole blobs in 256 KiB chunks, resumes after a crash, checks every blob it fetches and evicts the least recently used. Layers build the same bytes every time, so the same layer is stored once. On server3, python:3.12-slim imports in 19 to 41 s depending on how busy the disk is, with 0.7 MiB of metadata for 122.5 MiB of data, and an import of an image already there takes about 25 ms.
+
 ## 0.0.5
 
 The first real backend: container cells through youki's libcontainer, with a hardened drone inside.
