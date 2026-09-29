@@ -185,12 +185,20 @@ The SDK retries automatically only when `is_infra_error && idempotent`.
 ## 5. Rust SDK
 
 ```rust
-let hive = hive_sdk::Client::connect("https://hive.unit1.internal").with_token(tok).await?;
-let cells = hive.cells().create(Spec::template("swe-py311").qos(QoS::Standard), 16).collect().await?;
-let out = cells[0].run(["bash", "-lc", "pytest -q"]).timeout(secs(300)).await?;
-let mut s = cells[0].session().await?;
+let hive = hive_sdk::Client::connect("unix:/run/hivebox/comb.sock").await?.project("rl")?;
+let spec = CellSpec::new(Source::Image("python".into()), Backend::Container);
+let cells = hive.create_many(&spec, 16, Some("batch-7")).await?;
+let cell = cells.into_iter().next().unwrap()?;
+let out = cell.run(Command::new(["bash", "-lc", "pytest -q"]).timeout(Duration::from_secs(300))).await?;
+let s = cell.session().await?;
 s.run("git diff").await?;
+cell.write("/work/patch.diff", patch).await?;
+hive.stop(&Selector::Labels(labels)).await?;
 ```
+
+`Client::connect` takes `unix:PATH` for a comb's socket or an `http://` URL, and `token` sets the bearer token a gate wants. `create_many` returns one result per cell, so a batch where some cells failed still hands back the rest. `Cell::start` gives a `Process` that takes stdin and signals and yields stdout, stderr and the exit as they come.
+
+`hivectl` is built on it. It talks to `$HIVE_SOCKET` or `--endpoint`, and has commands to create, list, get, pause, resume, stop and watch cells, `run` and `sh` to run commands, and `cat`, `cp`, `files` and `rm` for files. `hivectl run` exits with the command's exit code, 128 plus the signal when a signal killed it, and 124 when it timed out.
 
 ## 6. E2B compatibility layer (in gate, feature `compat-e2b`)
 
