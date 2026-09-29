@@ -26,6 +26,7 @@ hive-guard.workspace = true
 hive-nectar.workspace = true
 hive-proto.workspace = true
 hive-rt.workspace = true
+hive-telemetry.workspace = true
 hive-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true

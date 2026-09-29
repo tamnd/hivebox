@@ -80,7 +80,7 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio_util::sync::CancellationToken;
 
-    let socket = cfg.api_socket.clone();
+    let (socket, metrics) = (cfg.api_socket.clone(), cfg.metrics);
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let drivers = drivers(&cfg).await;
@@ -89,6 +89,17 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     }
     let comb = hive_comb::Comb::open(cfg, drivers).await?;
     let listener = hive_comb::api::bind(&socket)?;
+    if let Some(addr) = metrics {
+        let scrape = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("serving metrics on {addr}: {e}"))
+        })?;
+        let registry = comb.metrics().registry().clone();
+        tokio::spawn(async move {
+            if let Err(e) = hive_telemetry::serve(scrape, registry).await {
+                eprintln!("hive-comb: the metrics endpoint stopped: {e}");
+            }
+        });
+    }
     eprintln!(
         "hive-comb {}: {} cells, serving on {}",
         env!("CARGO_PKG_VERSION"),

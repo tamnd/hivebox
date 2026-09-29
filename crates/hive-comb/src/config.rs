@@ -44,6 +44,8 @@ pub struct Config {
     pub netns_depth: usize,
     /// Where the local API listens.
     pub api_socket: PathBuf,
+    /// Where `/metrics` is served, if anywhere.
+    pub metrics: Option<SocketAddr>,
     /// The container backend.
     pub container: ContainerBackend,
     /// Where images come from.
@@ -162,6 +164,7 @@ impl Default for Config {
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
             netns_depth: 400,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
+            metrics: None,
             container: ContainerBackend::default(),
             images: Images::default(),
             network: Network::default(),
@@ -179,6 +182,7 @@ impl Config {
     /// unit = 1
     /// node = 7
     /// socket = "/run/hivebox/comb.sock"
+    /// metrics = "127.0.0.1:9464"
     /// reserved_mem_mib = 4096
     ///
     /// [pools]
@@ -223,6 +227,11 @@ impl Config {
         set(&mut c.node, n.node);
         set(&mut c.epoch, n.epoch);
         set(&mut c.api_socket, n.socket);
+        if let Some(text) = n.metrics {
+            c.metrics = Some(text.parse().map_err(|_| {
+                format!("node.metrics = {text:?} is not an address like 127.0.0.1:9464")
+            })?);
+        }
         if n.mem_mib.is_some() {
             c.mem_mib = n.mem_mib;
         }
@@ -378,6 +387,7 @@ struct NodeFile {
     node: Option<u16>,
     epoch: Option<u16>,
     socket: Option<PathBuf>,
+    metrics: Option<String>,
     mem_mib: Option<u64>,
     reserved_mem_mib: Option<u64>,
     max_cells: Option<usize>,
@@ -437,6 +447,7 @@ mod tests {
             data_dir = "/tmp/hb"
             node = 7
             socket = "/tmp/hb/comb.sock"
+            metrics = "127.0.0.1:9464"
             mem_mib = 8192
 
             [pools]
@@ -472,6 +483,7 @@ mod tests {
         assert_eq!(c.node, 7);
         assert_eq!(c.api_socket, PathBuf::from("/tmp/hb/comb.sock"));
         assert_eq!(c.mem_mib, Some(8192));
+        assert_eq!(c.metrics, Some("127.0.0.1:9464".parse().unwrap()));
         assert_eq!(c.cgroup_root, None);
         assert_eq!(c.netns_dir, Config::default().netns_dir);
         assert_eq!(c.netns_depth, 16);
@@ -502,6 +514,7 @@ mod tests {
         assert!(Config::from_toml("[lifecycle]\nstop_grace = \"1d\"").is_err());
         assert!(Config::from_toml("[backends.create_limit]\nauto = 1").is_err());
         assert!(Config::from_toml("[node]\nnode = 0").is_err());
+        assert!(Config::from_toml("[node]\nmetrics = \"localhost\"").is_err());
         assert!(Config::from_toml("[network]\ncells = \"100.64.0.0\"").is_err());
         assert!(Config::from_toml("[network]\ncells = \"100.64.0.0/31\"").is_err());
         assert!(Config::from_toml("[network]\nupstream = [\"dns.google\"]").is_err());

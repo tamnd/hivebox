@@ -23,7 +23,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -475,6 +475,7 @@ impl Exec for Api {
     type SessionInteractStream = BoxStream<'static, Result<v1::SessionOutput, Status>>;
 
     async fn run(&self, req: Request<v1::RunRequest>) -> Result<Response<v1::RunResult>, Status> {
+        let started = Instant::now();
         let project = project(&req)?;
         let r = req.into_inner();
         if !r.idempotency_key.is_empty() {
@@ -496,6 +497,7 @@ impl Exec for Api {
             .run(&drone::RunRequest { command: Some(command), stdin: r.stdin })
             .await
             .map_err(status)?;
+        self.comb.metrics().exec("run", started.elapsed());
         Ok(Response::new(result_to_v1(out)))
     }
 
