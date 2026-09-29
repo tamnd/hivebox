@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-guard` has the egress program every cell's traffic goes through, written in plain C, built by clang and loaded with aya on tc ingress of the host side of the cell's interface as a tcx link. An interface with no cell passes nothing, a cell may only send from its own address and MAC, ARP only for its own address, no IPv6, and IPv4 only to what a rule in its profile allows or what the DNS proxy resolved for it until the answer expires. Drops are counted by reason and reported in a ring. The maps and links are pinned in `/sys/fs/bpf/hive/guard-v1`, so the policy holds while the node restarts, and attaching again replaces a link with no gap. The built-in `none` profile reaches only the DNS proxy and `mirrors` adds the mirror proxy. On server3 a packet costs about 300 ns when a rule allows it and 550 ns when DNS does, against 80 ns for an empty program, and a cell is put on its interface with one map write of 2 to 17 us.
+
 ## 0.0.6
 
 Images as EROFS layers with hive-nectar, and container cells running on them.
