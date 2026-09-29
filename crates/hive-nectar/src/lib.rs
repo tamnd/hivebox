@@ -9,14 +9,20 @@
 //! - [`Cache`] is the node's L1: blobs fetched whole from a store onto local disk, resumable after
 //!   a crash, checked against their names, pinned while in use and evicted least recently used.
 //!
+//! - [`mount::Layers`] mounts an image's layers on a node, once each, with EROFS on loop devices
+//!   and an idmapped mount for the cells' id range.
+//!
 //! Lazy filling, chunk level dedup and the other stores come later.
 
-#![forbid(unsafe_code)]
+// Only the mount module has any, for loop device ioctls and `mount_setattr`.
+#![deny(unsafe_code)]
 
 mod blob;
 pub mod cache;
 pub mod erofs;
 pub mod image;
+#[cfg(target_os = "linux")]
+pub mod mount;
 pub mod oci;
 pub mod store;
 

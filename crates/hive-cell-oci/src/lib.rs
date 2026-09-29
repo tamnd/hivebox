@@ -5,8 +5,9 @@
 //! own user, PID, mount, IPC, UTS and cgroup namespaces, in the network namespace and the cgroup
 //! the comb made for it. The host's user namespace keeps owning the network namespace, so root in
 //! the cell cannot change its own routes or firewall. Root in the cell is `uid_base` on the host, and every cell shares
-//! that one range, so images are shifted to it once when they are imported (see [`import`]).
-//! The root filesystem is an overlay of the image's layers under a scratch upper.
+//! that one range. Images from `hive-nectar` keep the owners the image has and are shifted to it
+//! by an idmapped mount of each layer, and unpacked images are shifted once when they are imported
+//! (see [`import`]). The root filesystem is an overlay of the image's layers under a scratch upper.
 //!
 //! The container's first process is `hive-drone --init`, bind mounted read only from the host.
 //! The drone's socket is bound on the host by the worker that makes the container and passed in

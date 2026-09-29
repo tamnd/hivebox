@@ -287,7 +287,7 @@ impl Actor {
 
     async fn bring_up(&mut self, secret: [u8; 32]) -> Result<(), Error> {
         let slot = self.slot(secret).await?;
-        let rootfs = self.inner.rootfs(&self.cell.spec, &slot)?;
+        let rootfs = self.inner.rootfs(&self.cell.spec, &slot).await?;
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
         self.handle = Some(handle);
         self.commit(CellState::Starting, None, "").await?;
