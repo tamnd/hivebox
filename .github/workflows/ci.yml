@@ -153,6 +153,31 @@ jobs:
       - name: cargo deny
         run: cargo deny --all-features check
 
+  # The Python SDK's unit tests, and a check that its checked in stubs match the protos. The live
+  # tests need a comb and run on real hardware like the rest.
+  python:
+    name: python sdk
+    needs: quick
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q -e '.[test]' grpcio-tools==1.84.0
+      - name: stubs are current
+        run: |
+          PATH="$PWD/.venv/bin:$PATH" sh generate.sh
+          git status --porcelain -- hivebox/v1
+          test -z "$(git status --porcelain -- hivebox/v1)"
+      - name: pytest
+        run: .venv/bin/python -m pytest -q tests
+
   # The workflows are code that runs with a token, so they get linted like code. zizmor finds
   # template injection, overly broad permissions, unpinned actions and credentials left on disk.
   workflows:
@@ -171,7 +196,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, docs, msrv, audit, workflows]
+    needs: [quick, test, docs, msrv, python, audit, workflows]
     runs-on: ubuntu-24.04
     steps:
       - name: fail if anything upstream failed

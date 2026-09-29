@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hivebox"
+version = "0.0.7"
+description = "The Python client for hivebox, a sandbox fabric for agentic RL."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "grpcio>=1.84",
+    "protobuf>=7.35.1",
+    "googleapis-common-protos>=1.63",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["grpcio-tools>=1.84"]
+
+[project.urls]
+Repository = "https://github.com/tamnd/hivebox"
+
+[tool.setuptools.packages.find]
+include = ["hivebox*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

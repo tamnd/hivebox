@@ -298,7 +298,12 @@ async fn bulk(client: &Client, what: &str, args: &Args) -> Result<i32, String> {
             );
         }
         if matches!(sel, Selector::Labels(_)) {
-            println!("{} matched, {} {what}d", r.matched, r.succeeded);
+            let done = match what {
+                "pause" => "paused",
+                "resume" => "resumed",
+                _ => "stopped",
+            };
+            println!("{} matched, {} {done}", r.matched, r.succeeded);
         }
     }
     Ok(i32::from(failed > 0))
