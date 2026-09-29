@@ -19,4 +19,4 @@ mod wal;
 
 pub use cell::{CellInfo, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, WalStats};
-pub use config::{Config, ContainerBackend};
+pub use config::{Config, ContainerBackend, Images};

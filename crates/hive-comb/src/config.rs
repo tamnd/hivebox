@@ -45,6 +45,34 @@ pub struct Config {
     pub api_socket: PathBuf,
     /// The container backend.
     pub container: ContainerBackend,
+    /// Where images come from.
+    pub images: Images,
+}
+
+/// Where the comb gets images made by `hive-nectar`. An image name is looked up in
+/// `data_dir/images`: a directory there is an unpacked root filesystem as `hive-oci import` makes
+/// one, and a file holds the id of an image in the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Images {
+    /// The blob store images are in. `None` leaves only unpacked images.
+    pub store: Option<PathBuf>,
+    /// The node's cache of blobs from the store, `data_dir/cache` unless set.
+    pub cache_dir: PathBuf,
+    /// Most bytes the cache keeps.
+    pub cache_bytes: u64,
+    /// Where layers are mounted, once each for every cell that uses them.
+    pub layers_dir: PathBuf,
+}
+
+impl Default for Images {
+    fn default() -> Self {
+        Self {
+            store: None,
+            cache_dir: PathBuf::from("/var/lib/hivebox/cache"),
+            cache_bytes: 64 << 30,
+            layers_dir: PathBuf::from("/run/hivebox/layers"),
+        }
+    }
 }
 
 /// How the comb runs container cells.
@@ -102,6 +130,7 @@ impl Default for Config {
             netns_depth: 400,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             container: ContainerBackend::default(),
+            images: Images::default(),
         }
     }
 }
@@ -132,6 +161,11 @@ impl Config {
     /// [backends.container]
     /// drone = "/usr/lib/hivebox/hive-drone"
     /// workers = 8
+    ///
+    /// [images]
+    /// store = "/srv/hivebox/store"
+    /// cache_dir = "/var/lib/hivebox/cache"
+    /// cache_bytes = 68719476736
     /// ```
     ///
     /// An empty `cgroup_root` or `netns_dir` turns that pool off.
@@ -195,6 +229,13 @@ impl Config {
         if b.uid_count == 0 || b.uid_base.checked_add(b.uid_count).is_none() {
             return Err("backends.container ids run past the last uid".into());
         }
+        let i = file.images;
+        if let Some(store) = i.store {
+            c.images.store = (!store.as_os_str().is_empty()).then_some(store);
+        }
+        c.images.cache_dir = i.cache_dir.unwrap_or_else(|| c.data_dir.join("cache"));
+        set(&mut c.images.cache_bytes, i.cache_bytes);
+        set(&mut c.images.layers_dir, i.layers_dir);
         if c.node == 0 {
             return Err("node.node must not be 0".into());
         }
@@ -230,6 +271,16 @@ struct File {
     pools: PoolsFile,
     lifecycle: LifecycleFile,
     backends: BackendsFile,
+    images: ImagesFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ImagesFile {
+    store: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    cache_bytes: Option<u64>,
+    layers_dir: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]
@@ -316,6 +367,10 @@ mod tests {
             [backends.container]
             drone = "/opt/hive-drone"
             workers = 2
+
+            [images]
+            store = "/srv/store"
+            cache_bytes = 1048576
             "#,
         )
         .unwrap();
@@ -334,6 +389,9 @@ mod tests {
         assert_eq!(c.container.drone, PathBuf::from("/opt/hive-drone"));
         assert_eq!(c.container.workers, 2);
         assert_eq!(c.container.uid_base, 1_000_000);
+        assert_eq!(c.images.store, Some(PathBuf::from("/srv/store")));
+        assert_eq!(c.images.cache_bytes, 1 << 20);
+        assert_eq!(c.images.layers_dir, Images::default().layers_dir);
     }
 
     #[test]

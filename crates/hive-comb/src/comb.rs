@@ -9,6 +9,9 @@ use crate::record::{Record, SEQ_KEY, Seq, time};
 use crate::wal::Wal;
 use hive_cell::{DriverRegistry, RootfsPlan, Slot};
 use hive_drone::Client;
+use hive_nectar::mount::{IdMap, Layers};
+use hive_nectar::oci::load_manifest;
+use hive_nectar::{BlobId, Cache, PosixStore};
 use hive_proto::convert;
 use hive_rt::{OsRng, Rng};
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Source, is_name};
@@ -72,10 +75,40 @@ pub(crate) struct Inner {
     pub(crate) shutdown: CancellationToken,
     pub(crate) cgroups: Option<Arc<Cgroups>>,
     pub(crate) netns: Option<Arc<Namespaces>>,
+    images: Option<Nectar>,
     shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
     seq: tokio::sync::Mutex<SeqBlock>,
     events: broadcast::Sender<CellEvent>,
+}
+
+fn at(what: &str, path: &std::path::Path) -> impl FnOnce(io::Error) -> io::Error {
+    let what = format!("{what} {}", path.display());
+    move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
+}
+
+/// Images from a `hive-nectar` store, and the layers of them this node has mounted.
+#[derive(Debug)]
+struct Nectar {
+    store: PosixStore,
+    layers: Layers,
+}
+
+impl Nectar {
+    fn open(cfg: &Config) -> io::Result<Option<Self>> {
+        let Some(dir) = &cfg.images.store else { return Ok(None) };
+        let store = PosixStore::open(dir).map_err(at("opening the image store", dir))?;
+        let i = &cfg.images;
+        let cache = Cache::open(&i.cache_dir, i.cache_bytes)
+            .map_err(at("opening the image cache", &i.cache_dir))?;
+        // Every cell has the same ids, so one map serves every layer.
+        let c = &cfg.container;
+        let idmap = IdMap::new(c.uid_base, c.uid_count)
+            .map_err(|e| io::Error::new(e.kind(), format!("making the id map for layers: {e}")))?;
+        let layers = Layers::new(&i.layers_dir, cache, Some(idmap))
+            .map_err(at("clearing the layer mounts in", &i.layers_dir))?;
+        Ok(Some(Self { store, layers }))
+    }
 }
 
 #[derive(Debug)]
@@ -120,6 +153,7 @@ impl Comb {
             })?)),
             None => None,
         };
+        let images = Nectar::open(&cfg)?;
         let mut records = replay.records;
         let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
         let inner = Arc::new(Inner {
@@ -130,6 +164,7 @@ impl Comb {
             shutdown: CancellationToken::new(),
             cgroups,
             netns,
+            images,
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
             // Whatever was reserved before the restart may have been handed out, so the new block
@@ -469,15 +504,40 @@ impl Inner {
         self.cfg.data_dir.join("cells").join(id.to_string())
     }
 
-    /// Where a cell's root filesystem comes from. Until the image store lands, an image or
-    /// template name is a directory under `data_dir/images` holding an unpacked root filesystem.
-    pub(crate) fn rootfs(&self, spec: &CellSpec, slot: &Slot) -> Result<RootfsPlan, Error> {
+    /// Where a cell's root filesystem comes from. An image or template name is looked up in
+    /// `data_dir/images`, where a directory is an unpacked root filesystem and a file holds the id
+    /// of an image in the store, whose layers are fetched and mounted the first time a cell needs
+    /// them.
+    pub(crate) async fn rootfs(&self, spec: &CellSpec, slot: &Slot) -> Result<RootfsPlan, Error> {
         let name = image_name(spec)?;
-        let dir = self.cfg.data_dir.join("images").join(name);
-        if !dir.is_dir() {
-            return Err(Error::new(Reason::ImageUnavailable, format!("no image named {name}")));
+        let path = self.cfg.data_dir.join("images").join(name);
+        let upper = slot.dir.join("upper");
+        let missing = || Error::new(Reason::ImageUnavailable, format!("no image named {name}"));
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => return Ok(RootfsPlan { lowers: vec![path], upper }),
+            Ok(m) if m.is_file() => {}
+            _ => return Err(missing()),
         }
-        Ok(RootfsPlan { lowers: vec![dir], upper: slot.dir.join("upper") })
+        let Some(nectar) = &self.images else {
+            return Err(Error::new(
+                Reason::ImageUnavailable,
+                format!("{name} is in an image store, and this node has none set up"),
+            ));
+        };
+        let unavailable =
+            |e: String| Error::new(Reason::ImageUnavailable, format!("image {name}: {e}"));
+        let text =
+            tokio::fs::read_to_string(&path).await.map_err(|e| unavailable(e.to_string()))?;
+        let id: BlobId =
+            text.trim().parse().map_err(|e: hive_nectar::BadBlobId| unavailable(e.to_string()))?;
+        let manifest =
+            load_manifest(&nectar.store, id).await.map_err(|e| unavailable(e.to_string()))?;
+        let lowers = nectar
+            .layers
+            .mount(&nectar.store, &manifest)
+            .await
+            .map_err(|e| unavailable(e.to_string()))?;
+        Ok(RootfsPlan { lowers, upper })
     }
 
     async fn next_id(&self) -> Result<CellId, Error> {

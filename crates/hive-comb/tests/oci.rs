@@ -1,7 +1,8 @@
 //! Container cells through the whole comb: admission, the cgroup and network namespace pools, the
 //! WAL, the OCI driver with its workers started as `hive-comb --oci-worker`, and the drone inside.
-//! Needs root, cgroup v2, an image made by `hive-oci import` in `HIVE_OCI_IMAGE` and a static drone
-//! in `HIVE_OCI_DRONE`, and passes without doing anything when one is missing.
+//! Needs root, cgroup v2, a static drone in `HIVE_OCI_DRONE`, and an image: either one made by
+//! `hive-oci import` in `HIVE_OCI_IMAGE`, or a `hive-nectar` store in `HIVE_NECTAR_STORE` and the id
+//! of an image in it in `HIVE_NECTAR_IMAGE`. Passes without doing anything when one is missing.
 
 #![cfg(target_os = "linux")]
 
@@ -21,18 +22,38 @@ struct Node {
 
 impl Node {
     async fn new(depth: usize) -> Option<Self> {
-        let (Some(image), Some(drone)) =
-            (std::env::var_os("HIVE_OCI_IMAGE"), std::env::var_os("HIVE_OCI_DRONE"))
-        else {
-            eprintln!("skipped: set HIVE_OCI_IMAGE and HIVE_OCI_DRONE to run it");
+        let Some(drone) = std::env::var_os("HIVE_OCI_DRONE") else {
+            eprintln!("skipped: set HIVE_OCI_DRONE to run it");
             return None;
         };
+        let nectar =
+            std::env::var_os("HIVE_NECTAR_STORE").zip(std::env::var_os("HIVE_NECTAR_IMAGE"));
+        let image = std::env::var_os("HIVE_OCI_IMAGE");
+        if nectar.is_none() && image.is_none() {
+            eprintln!(
+                "skipped: set HIVE_OCI_IMAGE, or HIVE_NECTAR_STORE and HIVE_NECTAR_IMAGE, to run it"
+            );
+            return None;
+        }
         let tree = Tree::new()?;
         let scratch = Scratch::new();
         // Scratch makes an empty python image, and this one is the real thing.
         let python = scratch.0.join("images").join("python");
         std::fs::remove_dir_all(&python).unwrap();
-        std::os::unix::fs::symlink(image, &python).unwrap();
+        let mut images = Images::default();
+        match (nectar, image) {
+            (Some((store, id)), _) => {
+                std::fs::write(&python, id.as_encoded_bytes()).unwrap();
+                images = Images {
+                    store: Some(store.into()),
+                    cache_dir: scratch.0.join("cache"),
+                    layers_dir: scratch.0.join("layers"),
+                    ..images
+                };
+            }
+            (None, Some(image)) => std::os::unix::fs::symlink(image, &python).unwrap(),
+            (None, None) => unreachable!(),
+        }
         let cfg = Config {
             cgroup_root: Some(tree.0.clone()),
             cgroup_depth: depth,
@@ -42,6 +63,7 @@ impl Node {
             stop_grace: Duration::from_secs(2),
             // Admission counts memory the cells may use, and idle ones use under a MiB.
             mem_mib: Some(1 << 20),
+            images,
             ..config(&scratch.0)
         };
         let drone = PathBuf::from(drone);

@@ -1,13 +1,14 @@
 //! Unpacks a root filesystem for container cells, with every owner shifted into the cells' id
-//! range. Until `hive-nectar` makes images, this is how one gets onto a node:
+//! range. `hive-nectar` images are the usual way to get one onto a node now, and this stays for
+//! tests and for nodes with no image store:
 //!
 //! ```text
 //! docker export $(docker create python:3.12-slim) | hive-oci import /var/lib/hivebox/images/python
 //! ```
 //!
 //! Root in a cell is `uid_base` on the host, so a file root owns in the image has to be owned by
-//! `uid_base` on disk, or the cell sees it as owned by nobody. Shifting once here is cheaper than
-//! an idmapped mount per cell.
+//! `uid_base` on disk, or the cell sees it as owned by nobody. `hive-nectar` layers get the same
+//! result from an idmapped mount, made once per layer rather than once per cell.
 
 use std::io::Read;
 use std::path::Path;
