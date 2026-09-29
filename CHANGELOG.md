@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-drone` can run as a container's first process with `--init`, which reaps orphans and passes stop signals on, and can lock itself down with `--harden`: Landlock makes the `--protect` paths read only, a seccomp allowlist of 282 calls returns ENOSYS for the rest, and 41 calls such as mount, unshare, setns, bpf and io_uring return EPERM. The secret can come from a file the drone deletes after reading it, and `--env` sets the environment commands get. On server3 the filters add about 100 to 200 ns to each syscall and nothing measurable to running a command (#29).
+
 ## 0.0.4
 
 hive-comb gets a network namespace per cell and runs on its own with a local API.
