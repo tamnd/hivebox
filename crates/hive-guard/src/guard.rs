@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray, RingBuf};
 use aya::programs::links::FdLink;
 use aya::programs::{SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
@@ -283,6 +283,20 @@ impl Guard {
         self.dns.insert(DnsKey { cell, ip: net(ip) }, until, 0).map_err(|e| failed("dns_allow", e))
     }
 
+    /// A handle of its own on the map [`Guard::allow`] writes, for the DNS proxy, so answers do
+    /// not wait on whoever holds the `Guard` to wire an interface.
+    ///
+    /// # Errors
+    ///
+    /// The pinned map could not be opened.
+    pub fn dns_allow(&self) -> io::Result<DnsAllow> {
+        let data =
+            MapData::from_pin(self.dir.join("dns_allow")).map_err(|e| failed("dns_allow", e))?;
+        let map = HashMap::try_from(Map::from_map_data(data).map_err(|e| failed("dns_allow", e))?)
+            .map_err(|e| failed("dns_allow", e))?;
+        Ok(DnsAllow(map))
+    }
+
     /// Packets counted so far, summed over the CPUs.
     ///
     /// # Errors
@@ -304,6 +318,27 @@ impl Guard {
             out.extend(Deny::parse(&item));
         }
         out
+    }
+}
+
+/// The DNS proxy's handle on the guard's allow list, from [`Guard::dns_allow`].
+pub struct DnsAllow(HashMap<MapData, DnsKey, u64>);
+
+impl std::fmt::Debug for DnsAllow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsAllow").finish_non_exhaustive()
+    }
+}
+
+impl DnsAllow {
+    /// Does what [`Guard::allow`] does.
+    ///
+    /// # Errors
+    ///
+    /// The kernel refused the write.
+    pub fn allow(&mut self, cell: u32, ip: Ipv4Addr, ttl: Duration) -> io::Result<()> {
+        let until = boottime().saturating_add(u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX));
+        self.0.insert(DnsKey { cell, ip: net(ip) }, until, 0).map_err(|e| failed("dns_allow", e))
     }
 }
 

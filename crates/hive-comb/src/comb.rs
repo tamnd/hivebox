@@ -193,6 +193,15 @@ impl Comb {
                 eprintln!("hive-comb: removed {swept} network namespaces no cell claims");
             }
             tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+            if let Some(net) = pool.net() {
+                let (serve, stop) = (net.dns(), comb.inner.shutdown.clone());
+                tokio::spawn(async move {
+                    tokio::select! {
+                        () = serve => {}
+                        () = stop.cancelled() => {}
+                    }
+                });
+            }
         }
         if let Some(pool) = &comb.inner.cgroups {
             let swept = pool.sweep(&claimed).await?;
@@ -472,7 +481,7 @@ impl Inner {
     /// which serves `none` and nothing else.
     pub(crate) fn profile(&self, name: &str) -> Result<Option<Profile>, Error> {
         let net = self.netns.as_ref().and_then(|p| p.net());
-        match (net, Profile::builtin(name)) {
+        match (net, net.and_then(|n| n.profile(name))) {
             (Some(_), Some(p)) => Ok(Some(p)),
             (None, _) if name == "none" => Ok(None),
             _ => Err(Error::new(

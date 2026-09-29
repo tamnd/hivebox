@@ -94,6 +94,9 @@ impl Node {
                 guard: true,
                 cells: (std::net::Ipv4Addr::new(100, 64, 240, 0), 24),
                 pin_dir: g.pins.clone(),
+                upstream: vec![upstream().await],
+                profiles: [("lookup".into(), vec!["ok.test".into(), "*.example.test".into()])]
+                    .into(),
             },
             None => Network { guard: false, ..Network::default() },
         };
@@ -120,6 +123,78 @@ impl Node {
         self.comb.shutdown().await;
         self.comb = open_oci(&self.cfg, &self.drone).await;
     }
+}
+
+/// A resolver for the DNS proxy to ask. It knows `ok.test`, at an address the test puts on the
+/// host, and `a.example.test`, which also has a private address, and nothing else.
+async fn upstream() -> std::net::SocketAddr {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            let q = &buf[..n];
+            let (mut at, mut labels) = (12, Vec::new());
+            while at < n && q[at] != 0 {
+                let len = usize::from(q[at]);
+                labels.push(String::from_utf8_lossy(&q[(at + 1).min(n)..(at + 1 + len).min(n)]));
+                at += 1 + len;
+            }
+            if at + 5 > n {
+                continue;
+            }
+            let ips: &[[u8; 4]] = match labels.join(".").to_ascii_lowercase().as_str() {
+                "ok.test" => &[[198, 51, 100, 7]],
+                "a.example.test" => &[[10, 1, 2, 3], [198, 51, 100, 7]],
+                _ => &[],
+            };
+            let mut r = q[..2].to_vec();
+            r.extend([0x81, 0x80, 0, 1, 0, ips.len() as u8, 0, 0, 0, 0]);
+            r.extend(&q[12..at + 5]);
+            for ip in ips {
+                r.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                r.extend(ip);
+            }
+            let _ = sock.send_to(&r, from).await;
+        }
+    });
+    addr
+}
+
+/// A dummy interface with an address on it, for a cell to reach once it has looked it up.
+struct Dummy(String);
+
+impl Dummy {
+    fn new(ip: &str) -> Self {
+        let name = format!("hbt{}", std::process::id());
+        let ip_cmd = |args: &[&str]| std::process::Command::new("ip").args(args).status().unwrap();
+        assert!(ip_cmd(&["link", "add", &name, "type", "dummy"]).success());
+        assert!(ip_cmd(&["addr", "add", &format!("{ip}/32"), "dev", &name]).success());
+        assert!(ip_cmd(&["link", "set", &name, "up"]).success());
+        Self(name)
+    }
+}
+
+impl Drop for Dummy {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("ip").args(["link", "del", &self.0]).output();
+    }
+}
+
+/// What the cell's own resolver makes of each name: its addresses, or `-` when it has none.
+async fn lookup(comb: &Comb, id: CellId, names: &[&str]) -> String {
+    let script = format!(
+        "python3 -c 'import socket\nfor n in {names:?}:\n    try:\n        print(\",\".join(sorted(socket.gethostbyname_ex(n)[2])))\n    except OSError:\n        print(\"-\")'"
+    );
+    sh(comb, id, &script).await
+}
+
+/// The response code the proxy gives the cell for a query of type `kind`.
+async fn rcode(comb: &Comb, id: CellId, name: &str, kind: u16) -> u8 {
+    let script = format!(
+        "python3 -c 'import socket, struct\nq = b\"\\x12\\x34\\x01\\x00\\x00\\x01\" + bytes(6)\nfor l in \"{name}\".split(\".\"):\n    q += bytes([len(l)]) + l.encode()\nq += b\"\\x00\" + struct.pack(\">HH\", {kind}, 1)\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.settimeout(3)\ns.sendto(q, (\"169.254.77.53\", 53))\nprint(s.recv(512)[3] & 15)'"
+    );
+    sh(comb, id, &script).await.trim().parse().unwrap()
 }
 
 async fn open_oci(cfg: &Config, drone: &Path) -> Comb {
@@ -215,9 +290,34 @@ async fn a_guarded_cell_reaches_the_node_resolver_and_nothing_else() {
             == "ro\n"
     );
 
+    // With none, every name is unknown, and nothing is asked upstream.
+    let _host = Dummy::new("198.51.100.7");
+    assert_eq!(lookup(&comb, id, &["ok.test"]).await, "-\n");
+    assert!(!reaches(&comb, id, "198.51.100.7", 9).await);
+
     // After a restart the comb still knows the cell's interface, and frees it on stop.
     node.restart().await;
     assert!(reaches(&node.comb, id, "169.254.77.53", 53).await);
+    let mut lookup_spec = spec("python");
+    lookup_spec.network_profile = "lookup".into();
+    let finder = node.comb.create(request(lookup_spec)).await.unwrap().id;
+    assert!(!reaches(&node.comb, finder, "198.51.100.7", 9).await, "not before it is looked up");
+    let t = Instant::now();
+    let found = lookup(
+        &node.comb,
+        finder,
+        &["ok.test", "a.example.test", "example.test", "b.ok.test", "other.test"],
+    )
+    .await;
+    println!("five lookups from a cell, with python starting, took {:.2?}", t.elapsed());
+    assert_eq!(found, "198.51.100.7\n198.51.100.7\n-\n-\n-\n", "the private address is gone");
+    assert!(reaches(&node.comb, finder, "198.51.100.7", 9).await, "reachable once looked up");
+    assert!(!reaches(&node.comb, id, "198.51.100.7", 9).await, "but only by the cell that did");
+    assert!(!reaches(&node.comb, finder, "10.1.2.3", 9).await);
+    assert_eq!(rcode(&node.comb, finder, "ok.test", 16).await, 5, "TXT is refused");
+    assert_eq!(rcode(&node.comb, finder, "ok.test", 28).await, 0, "AAAA is empty");
+    assert_eq!(rcode(&node.comb, finder, "nope.test", 1).await, 3);
+    node.comb.stop(finder, None).await.unwrap();
     let mirrors = {
         let mut s = spec("python");
         s.network_profile = "mirrors".into();
@@ -232,11 +332,34 @@ async fn a_guarded_cell_reaches_the_node_resolver_and_nothing_else() {
     for id in [id, other] {
         node.comb.stop(id, None).await.unwrap();
     }
-    // Only the spares keep a program, once the pool is full again.
+    // Only the spares keep a program. The pool refills once it is under half full, so it may
+    // stay at 3.
     let dir = node.guard.as_ref().unwrap().pins.join("links");
     let until = Instant::now() + Duration::from_secs(20);
-    while std::fs::read_dir(&dir).unwrap().count() != 4 || node.comb.spare_netns() != Some(4) {
-        assert!(Instant::now() < until, "{} links", std::fs::read_dir(&dir).unwrap().count());
+    while Some(std::fs::read_dir(&dir).unwrap().count()) != node.comb.spare_netns() {
+        if Instant::now() > until {
+            let names = |d: &Path| {
+                let mut v: Vec<String> = std::fs::read_dir(d)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                v.sort();
+                v
+            };
+            let hv: Vec<String> = names(Path::new("/sys/class/net"))
+                .into_iter()
+                .filter(|n| n.starts_with("hv"))
+                .map(|n| {
+                    let i = std::fs::read_to_string(format!("/sys/class/net/{n}/ifindex")).unwrap();
+                    format!("{n}={}", i.trim())
+                })
+                .collect();
+            panic!(
+                "links {:?}, spares {:?}, interfaces {hv:?}",
+                names(&dir),
+                node.comb.spare_netns()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     node.comb.shutdown().await;
