@@ -80,6 +80,8 @@ message ListDirRequest {
 
 message ListDirResponse {
   repeated FileInfo entries = 1;
+  // True when the listing stopped at the cell's limit, so some entries are missing.
+  bool truncated = 2;
 }
 
 message WatchDirRequest {

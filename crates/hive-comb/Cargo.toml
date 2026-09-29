@@ -41,5 +41,6 @@ hive-cell-oci.workspace = true
 [dev-dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
 tonic = { workspace = true, features = ["channel"] }
+tar.workspace = true
 tonic-prost.workspace = true
 tower = { workspace = true, features = ["util"] }
