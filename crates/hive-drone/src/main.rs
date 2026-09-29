@@ -1,13 +1,16 @@
 //! The `hive-drone` binary.
 //!
 //! ```text
-//! hive-drone --listen unix:/run/hive/drone.sock --secret-stdin [--shell /bin/sh]
-//!            [--session-shell /bin/bash] [--workdir /] [--uid N] [--gid N]
-//!            [--root PATH]...
+//! hive-drone [--init] --listen unix:/run/hive/drone.sock (--secret-stdin | --secret-file PATH)
+//!            [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell /bin/sh]
+//!            [--session-shell /bin/bash] [--workdir /] [--uid N] [--gid N] [--root PATH]...
 //! ```
 //!
-//! The first secret is read from stdin as 32 raw bytes, so it never shows up in the process list
-//! or the environment of a command.
+//! The first secret is 32 raw bytes, read from stdin or from a file that is removed once read, so
+//! it never shows up in the process list or the environment of a command. `--init`, which has to
+//! come first, runs the drone under a small PID 1 that waits on orphans. `--harden` applies
+//! Landlock and seccomp before serving, and makes each `--protect` path read only. `--env` adds
+//! to the environment every command starts with.
 
 #![forbid(unsafe_code)]
 
@@ -19,11 +22,14 @@ use std::io::Read;
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: hive-drone --listen unix:PATH --secret-stdin [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
+const USAGE: &str = "usage: hive-drone [--init] --listen unix:PATH (--secret-stdin | --secret-file PATH) [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
 
 #[cfg(target_os = "linux")]
 struct Args {
     listen: String,
+    secret: Option<std::path::PathBuf>,
+    harden: bool,
+    protect: Vec<std::path::PathBuf>,
     cfg: Config,
 }
 
@@ -31,6 +37,9 @@ struct Args {
 fn parse() -> Result<Args, String> {
     let mut listen = None;
     let mut secret_stdin = false;
+    let mut secret = None;
+    let mut harden = false;
+    let mut protect = Vec::new();
     let mut cfg = Config::default();
     let mut roots = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -39,6 +48,24 @@ fn parse() -> Result<Args, String> {
         match arg.as_str() {
             "--listen" => listen = Some(value("--listen")?),
             "--secret-stdin" => secret_stdin = true,
+            "--secret-file" => secret = Some(value("--secret-file")?.into()),
+            "--harden" => harden = true,
+            "--protect" => {
+                let path: std::path::PathBuf = value("--protect")?.into();
+                if !path.is_absolute() {
+                    return Err(format!("--protect {} is not an absolute path", path.display()));
+                }
+                protect.push(path);
+            }
+            "--env" => {
+                let pair = value("--env")?;
+                let Some((key, val)) = pair.split_once('=').filter(|(k, _)| !k.is_empty()) else {
+                    return Err(format!("--env {pair} is not KEY=VALUE"));
+                };
+                // A later value for the same key wins, as in a shell.
+                cfg.base_env.retain(|(k, _)| k != key);
+                cfg.base_env.push((key.into(), val.into()));
+            }
             "--shell" => cfg.shell = value("--shell")?.into(),
             "--session-shell" => cfg.session_shell = value("--session-shell")?.into(),
             "--workdir" => cfg.workdir = value("--workdir")?.into(),
@@ -57,11 +84,14 @@ fn parse() -> Result<Args, String> {
     if !roots.is_empty() {
         cfg.roots = roots;
     }
-    if !secret_stdin {
-        return Err("--secret-stdin is required".into());
+    if secret_stdin == secret.is_some() {
+        return Err("give one of --secret-stdin and --secret-file".into());
+    }
+    if !protect.is_empty() && !harden {
+        return Err("--protect needs --harden".into());
     }
     let listen = listen.ok_or("--listen is required")?;
-    Ok(Args { listen, cfg })
+    Ok(Args { listen, secret, harden, protect, cfg })
 }
 
 #[cfg(target_os = "linux")]
@@ -70,6 +100,9 @@ fn main() -> ExitCode {
         println!("hive-drone {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--init") {
+        return hive_drone::init::run(std::env::args_os().skip(2).collect());
+    }
     let args = match parse() {
         Ok(args) => args,
         Err(e) => {
@@ -77,10 +110,33 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut secret = [0u8; 32];
-    if let Err(e) = std::io::stdin().read_exact(&mut secret) {
-        eprintln!("hive-drone: reading the secret from stdin: {e}");
-        return ExitCode::FAILURE;
+    let secret = match read_secret(args.secret.as_deref()) {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!("hive-drone: reading the secret: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let listener = match bind(&args.listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("hive-drone: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Before the runtime starts, since Landlock and seccomp bind only the calling thread and the
+    // runtime's threads have to start out bound too.
+    if args.harden {
+        match hive_drone::harden::apply(&args.protect) {
+            Ok(h) => eprintln!(
+                "hive-drone: hardened, landlock {}, {} syscalls allowed, {} refused",
+                h.landlock, h.allowed, h.denied
+            ),
+            Err(e) => {
+                eprintln!("hive-drone: hardening: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -89,7 +145,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match rt.block_on(serve(args, secret)) {
+    match rt.block_on(serve(listener, args.cfg, secret)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hive-drone: {e}");
@@ -99,17 +155,43 @@ fn main() -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-async fn serve(args: Args, secret: [u8; 32]) -> std::io::Result<()> {
-    let Some(path) = args.listen.strip_prefix("unix:") else {
+fn read_secret(file: Option<&std::path::Path>) -> std::io::Result<[u8; 32]> {
+    let mut secret = [0u8; 32];
+    match file {
+        None => std::io::stdin().read_exact(&mut secret)?,
+        Some(path) => {
+            let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut secret));
+            // Gone whether or not it was good, so a second reader never finds it.
+            let removed = std::fs::remove_file(path);
+            read?;
+            removed?;
+        }
+    }
+    Ok(secret)
+}
+
+#[cfg(target_os = "linux")]
+fn bind(listen: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    let Some(path) = listen.strip_prefix("unix:") else {
         return Err(std::io::Error::other(format!(
-            "cannot listen on {}, only unix:PATH is supported so far",
-            args.listen
+            "cannot listen on {listen}, only unix:PATH is supported so far"
         )));
     };
     // A socket left by an earlier run would make bind fail.
     let _ = std::fs::remove_file(path);
-    let listener = tokio::net::UnixListener::bind(path)?;
-    let drone = Drone::new(args.cfg, secret);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+async fn serve(
+    listener: std::os::unix::net::UnixListener,
+    cfg: Config,
+    secret: [u8; 32],
+) -> std::io::Result<()> {
+    let listener = tokio::net::UnixListener::from_std(listener)?;
+    let drone = Drone::new(cfg, secret);
     loop {
         let (conn, _) = listener.accept().await?;
         let drone = drone.clone();

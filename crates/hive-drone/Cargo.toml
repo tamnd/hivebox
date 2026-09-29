@@ -22,10 +22,13 @@ futures.workspace = true
 hive-proto.workspace = true
 hive-rt.workspace = true
 hive-types.workspace = true
+landlock.workspace = true
+libc.workspace = true
 prost.workspace = true
 rustix = { workspace = true, features = ["fs", "pipe", "process"] }
+seccompiler.workspace = true
 tar.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 
 [dev-dependencies]
