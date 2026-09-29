@@ -74,6 +74,9 @@ pub struct Slot {
     /// The cell's network namespace, a file under the node's namespace directory that
     /// [`crate::netns`] made, or `None` for the host's network.
     pub netns: Option<PathBuf>,
+    /// Where the cell sends DNS queries, when it has a network beyond loopback. The driver makes
+    /// this the cell's only resolver.
+    pub nameserver: Option<std::net::Ipv4Addr>,
     /// A directory only this cell's driver writes to, for sockets, logs and state. It is removed
     /// when the cell is gone.
     pub dir: PathBuf,

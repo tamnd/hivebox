@@ -70,7 +70,7 @@ impl Env {
         let ns = self.root.join("netns").join(id.to_string());
         netns::create(std::slice::from_ref(&ns)).pop().unwrap().unwrap();
         let secret: [u8; 32] = std::array::from_fn(|i| (n as u8).wrapping_mul(31) ^ (i as u8));
-        Slot { cgroup: cg, netns: Some(ns), dir, secret }
+        Slot { cgroup: cg, netns: Some(ns), nameserver: None, dir, secret }
     }
 
     /// Makes a cell and connects to its drone, and returns how long each step took.

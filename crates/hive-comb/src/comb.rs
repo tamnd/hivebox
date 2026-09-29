@@ -4,11 +4,13 @@ use crate::admit::{self, Admission};
 use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
+use crate::net::Net;
 use crate::netns::Namespaces;
 use crate::record::{Record, SEQ_KEY, Seq, time};
 use crate::wal::Wal;
 use hive_cell::{DriverRegistry, RootfsPlan, Slot};
 use hive_drone::Client;
+use hive_guard::Profile;
 use hive_nectar::mount::{IdMap, Layers};
 use hive_nectar::oci::load_manifest;
 use hive_nectar::{BlobId, Cache, PosixStore};
@@ -148,9 +150,19 @@ impl Comb {
             None => None,
         };
         let netns = match &cfg.netns_dir {
-            Some(dir) => Some(Arc::new(Namespaces::init(dir, cfg.netns_depth).map_err(|e| {
-                io::Error::new(e.kind(), format!("setting up {}: {e}", dir.display()))
-            })?)),
+            Some(dir) => {
+                let net = cfg.network.guard.then(|| Net::open(&cfg.network)).and_then(|n| {
+                    n.map_err(|e| {
+                        eprintln!(
+                            "hive-comb: cells get loopback only, the guard did not load: {e}"
+                        );
+                    })
+                    .ok()
+                });
+                Some(Arc::new(Namespaces::init(dir, cfg.netns_depth, net.map(Arc::new)).map_err(
+                    |e| io::Error::new(e.kind(), format!("setting up {}: {e}", dir.display())),
+                )?))
+            }
             None => None,
         };
         let images = Nectar::open(&cfg)?;
@@ -280,12 +292,7 @@ impl Comb {
             ));
         }
         image_name(&req.spec)?;
-        if req.spec.network_profile != "none" {
-            return Err(Error::new(
-                Reason::CapacityUnavailable,
-                format!("this node has no {:?} network profile", req.spec.network_profile),
-            ));
-        }
+        inner.profile(&req.spec.network_profile)?;
         let driver = inner.drivers.get(req.spec.backend).cloned().ok_or_else(|| {
             Error::new(
                 Reason::CapacityUnavailable,
@@ -461,6 +468,20 @@ impl Comb {
 }
 
 impl Inner {
+    /// The guard's profile for a spec's `network_profile`, or `None` when cells have loopback only,
+    /// which serves `none` and nothing else.
+    pub(crate) fn profile(&self, name: &str) -> Result<Option<Profile>, Error> {
+        let net = self.netns.as_ref().and_then(|p| p.net());
+        match (net, Profile::builtin(name)) {
+            (Some(_), Some(p)) => Ok(Some(p)),
+            (None, _) if name == "none" => Ok(None),
+            _ => Err(Error::new(
+                Reason::CapacityUnavailable,
+                format!("this node has no {name:?} network profile"),
+            )),
+        }
+    }
+
     fn shard(&self, id: CellId) -> &RwLock<HashMap<CellId, Arc<Cell>>> {
         // The low bits are the tag, which is random, so cells spread evenly.
         &self.shards[(id.to_bits() as usize) % SHARDS]
