@@ -95,9 +95,10 @@ message RunResult    { int32 exit_code = 1; bytes stdout = 2; bytes stderr = 3; 
 
 ### 1.2 Local API
 
-A comb in standalone mode serves Cells and Exec itself, on a Unix socket (`/run/hivebox/comb.sock` by default, mode 0600), so one node is usable with no gate in front of it. The calls and messages are the same as through a gate, with these differences:
+A comb in standalone mode serves Cells, Exec and Files itself, on a Unix socket (`/run/hivebox/comb.sock` by default, mode 0600), so one node is usable with no gate in front of it. The calls and messages are the same as through a gate, with these differences:
 
 - There is no auth. Whoever can open the socket is trusted, the same as with the Docker socket. The caller names its project in the `x-hive-project` header, `local` when it names none, and sees only that project's cells.
+- Files goes to the drone in the cell. `Diff` and `Apply` with a patch are not served yet, and `Apply` with a tar unpacks it under the path it names.
 - `Create` with a count makes the cells at once and streams each one as it is ready. A count over 1 with an idempotency key gives cell `i` the key `<key>/<i>`, so a retry of the whole batch gets the same cells back. At most 1,024 cells per call.
 - `Watch` by id ends once the cell has ended. A watcher that falls more than 4,096 changes behind gets the current state of every cell that moved since it last heard, instead of the changes it missed.
 - `Pause`, `Resume` and `Stop` by labels pick only the cells the call can act on (running, paused and not yet ended), so `matched` counts those.

@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The local API in `hive-comb` serves Files: read, write, stat, list, remove and watch go to the drone in the cell, and `Apply` unpacks a tar. Small writes go in one message and bigger ones are streamed, and `ListDirResponse` now says when a listing stopped at the cell's limit.
+
 ## 0.0.7
 
 Cells get a network: hive-guard on a veth per cell, and a DNS proxy that only answers the names a profile lists.

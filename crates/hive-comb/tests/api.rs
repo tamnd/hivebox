@@ -10,6 +10,7 @@ use hive_comb::api;
 use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
+use hive_proto::v1::files_client::FilesClient;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 
@@ -38,6 +39,10 @@ impl Served {
 
     fn exec(&self) -> ExecClient<Channel> {
         ExecClient::new(self.channel.clone())
+    }
+
+    fn files(&self) -> FilesClient<Channel> {
+        FilesClient::new(self.channel.clone())
     }
 }
 
@@ -303,6 +308,148 @@ async fn commands_run_stream_and_keep_sessions() {
     api.stop.cancel();
 }
 
+/// Writes `data` to `path` in `cell` in chunks of `chunk` bytes.
+async fn write(
+    files: &mut FilesClient<Channel>,
+    project: &str,
+    cell: &str,
+    path: &str,
+    data: &[u8],
+    chunk: usize,
+) -> Result<v1::FileInfo, tonic::Status> {
+    use v1::write_file_chunk::Part;
+    let header = v1::WriteFileHeader {
+        cell_id: cell.into(),
+        path: path.into(),
+        make_parents: true,
+        ..Default::default()
+    };
+    let mut msgs = vec![v1::WriteFileChunk { part: Some(Part::Header(header)) }];
+    msgs.extend(
+        data.chunks(chunk).map(|c| v1::WriteFileChunk {
+            part: Some(Part::Data(bytes::Bytes::copy_from_slice(c))),
+        }),
+    );
+    files.write(req(project, futures::stream::iter(msgs))).await.map(tonic::Response::into_inner)
+}
+
+async fn read(
+    files: &mut FilesClient<Channel>,
+    project: &str,
+    cell: &str,
+    path: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, tonic::Status> {
+    let r = v1::ReadFileRequest { cell_id: cell.into(), path: path.into(), offset, length };
+    let mut chunks = files.read(req(project, r)).await?.into_inner();
+    let mut out = Vec::new();
+    while let Some(c) = chunks.message().await? {
+        out.extend_from_slice(&c.data);
+    }
+    Ok(out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_are_written_read_listed_watched_and_removed() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let cell = create(&mut api.cells(), "p", 1, v1_spec("python", &[])).await.remove(0);
+    let mut files = api.files();
+    // The fake's cells see the host's files, so the test works in a directory of its own.
+    let dir = s.0.join("files");
+    let at = |p: &str| dir.join(p).to_str().unwrap().to_string();
+
+    let path = at("sub/small.txt");
+    let info = write(&mut files, "p", &cell.id, &path, b"hello", 5).await.unwrap();
+    assert_eq!((info.size, info.r#type(), info.mode & 0o777), (5, v1::FileType::File, 0o644));
+    assert_eq!(read(&mut files, "p", &cell.id, &path, 0, 0).await.unwrap(), b"hello");
+    assert_eq!(read(&mut files, "p", &cell.id, &path, 1, 3).await.unwrap(), b"ell");
+
+    // Big enough to be streamed to the drone, in chunks that do not line up with anything.
+    let big: Vec<u8> = (0..5_000_000u32).map(|i| (i % 251) as u8).collect();
+    let path = at("big.bin");
+    let info = write(&mut files, "p", &cell.id, &path, &big, 100_003).await.unwrap();
+    assert_eq!(info.size, big.len() as u64);
+    assert_eq!(read(&mut files, "p", &cell.id, &path, 0, 0).await.unwrap(), big);
+    let got = read(&mut files, "p", &cell.id, &path, 4_999_990, 100).await.unwrap();
+    assert_eq!(got, &big[4_999_990..]);
+    // An empty file is still written.
+    let info = write(&mut files, "p", &cell.id, &at("empty"), b"", 1).await.unwrap();
+    assert_eq!(info.size, 0);
+
+    let stat = |path: &str| v1::PathRequest {
+        cell_id: cell.id.clone(),
+        path: path.into(),
+        recursive: false,
+    };
+    let info = files.stat(req("p", stat(&at("sub")))).await.unwrap().into_inner();
+    assert_eq!(info.r#type(), v1::FileType::Dir);
+    std::os::unix::fs::symlink("big.bin", dir.join("link")).unwrap();
+    let info = files.stat(req("p", stat(&at("link")))).await.unwrap().into_inner();
+    assert_eq!((info.r#type(), info.symlink_target.as_str()), (v1::FileType::Symlink, "big.bin"));
+    let e = files.stat(req("p", stat(&at("nothing")))).await.unwrap_err();
+    let e = hive_proto::convert::error_from_status(&e);
+    assert_eq!((e.reason, e.errno.as_deref()), (Reason::FileError, Some("ENOENT")));
+
+    let list = |depth| v1::ListDirRequest { cell_id: cell.id.clone(), path: at(""), depth };
+    let names = |r: v1::ListDirResponse| -> Vec<String> {
+        r.entries.into_iter().map(|e| e.path.rsplit('/').next().unwrap().to_string()).collect()
+    };
+    let r = files.list(req("p", list(1))).await.unwrap().into_inner();
+    assert!(!r.truncated);
+    assert_eq!(names(r), ["big.bin", "empty", "link", "sub"]);
+    let r = files.list(req("p", list(2))).await.unwrap().into_inner();
+    assert_eq!(names(r), ["big.bin", "empty", "link", "sub", "small.txt"]);
+
+    // A watch sees a file made after it started. The drone writes a file next to it first and
+    // moves it into place, so the file's own name comes after that one's.
+    let w = v1::WatchDirRequest { cell_id: cell.id.clone(), path: at(""), recursive: true };
+    let mut events = files.watch(req("p", w)).await.unwrap().into_inner();
+    write(&mut files, "p", &cell.id, &at("sub/new"), b"x", 1).await.unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(e) = events.message().await.unwrap() {
+            if e.path == at("sub/new") {
+                return e.kind();
+            }
+        }
+        panic!("the watch ended");
+    });
+    assert_eq!(seen.await.unwrap(), v1::FsEventKind::Create);
+    drop(events);
+
+    // A tar is unpacked where the caller says.
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.set_size(3);
+    h.set_mode(0o600);
+    h.set_cksum();
+    tar.append_data(&mut h, "a/b.txt", &b"abc"[..]).unwrap();
+    let apply = v1::ApplyRequest {
+        cell_id: cell.id.clone(),
+        path: at("unpacked"),
+        content: Some(v1::apply_request::Content::Tar(tar.into_inner().unwrap().into())),
+    };
+    files.apply(req("p", apply)).await.unwrap();
+    assert_eq!(std::fs::read(dir.join("unpacked/a/b.txt")).unwrap(), b"abc");
+
+    // Another project's caller cannot reach the cell's files.
+    let e = read(&mut files, "q", &cell.id, &at("big.bin"), 0, 0).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::CellNotFound);
+    let e = write(&mut files, "q", &cell.id, &at("x"), b"x", 1).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::CellNotFound);
+    assert!(!dir.join("x").exists());
+
+    // A directory goes only when asked to go with what is in it.
+    let mut rm = stat(&at("sub"));
+    assert!(files.remove(req("p", rm.clone())).await.is_err());
+    rm.recursive = true;
+    files.remove(req("p", rm)).await.unwrap();
+    assert!(!dir.join("sub").exists());
+    api.stop.cancel();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_socket_is_the_owners_only_and_replaced_on_restart() {
     use std::os::unix::fs::PermissionsExt;
@@ -440,8 +587,8 @@ fn summary(samples: &mut [Duration]) -> String {
 }
 
 /// A request stream fed from a channel.
-fn tokio_stream_of(
-    mut rx: tokio::sync::mpsc::Receiver<v1::ProcessInput>,
-) -> impl futures::Stream<Item = v1::ProcessInput> + Send + 'static {
+fn tokio_stream_of<T: Send + 'static>(
+    mut rx: tokio::sync::mpsc::Receiver<T>,
+) -> impl futures::Stream<Item = T> + Send + 'static {
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }

@@ -1,5 +1,5 @@
-//! The local API: the `hivebox.v1` Cells and Exec services on a Unix socket, for standalone mode,
-//! where no gate sits in front of the comb.
+//! The local API: the `hivebox.v1` Cells, Exec and Files services on a Unix socket, for
+//! standalone mode, where no gate sits in front of the comb.
 //!
 //! Whoever can open the socket is trusted, the way whoever can open the Docker socket is. The
 //! socket is made with mode 0600, so that is root unless the operator hands it on. A caller names
@@ -8,13 +8,14 @@
 
 use crate::cell::{CellInfo, Status as CellStatus};
 use crate::comb::{Comb, CreateRequest};
-use futures::stream::{self, BoxStream, FuturesUnordered, StreamExt};
+use futures::stream::{self, BoxStream, FuturesUnordered, StreamExt, TryStreamExt};
 use hive_drone::Output;
 use hive_proto::convert;
 use hive_proto::drone::api as drone;
 use hive_proto::v1;
 use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_server::{Exec, ExecServer};
+use hive_proto::v1::files_server::{Files, FilesServer};
 use hive_types::{CellId, CellState, Error, Reason, is_name};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -41,6 +42,8 @@ const PAGE: usize = 1000;
 const MAX_PAGE: usize = 10_000;
 /// The biggest request message, which is mostly stdin for a run.
 const MAX_REQUEST: usize = 64 << 20;
+/// A write this small or smaller goes to the drone in one message instead of a stream.
+const SMALL_WRITE: usize = 32 << 10;
 
 /// Serves the local API on `listener`, from [`bind`], until `stop` is cancelled.
 pub async fn serve(comb: Comb, listener: UnixListener, stop: CancellationToken) -> io::Result<()> {
@@ -84,13 +87,15 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 struct Router {
     cells: CellsServer<Api>,
     exec: ExecServer<Api>,
+    files: FilesServer<Api>,
 }
 
 impl Router {
     fn new(api: Api) -> Self {
         Self {
             cells: CellsServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
-            exec: ExecServer::new(api).max_decoding_message_size(MAX_REQUEST),
+            exec: ExecServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
+            files: FilesServer::new(api).max_decoding_message_size(MAX_REQUEST),
         }
     }
 }
@@ -116,6 +121,7 @@ where
         match service.map(|(s, _)| s) {
             Some(<CellsServer<Api> as NamedService>::NAME) => Box::pin(self.cells.call(req)),
             Some(<ExecServer<Api> as NamedService>::NAME) => Box::pin(self.exec.call(req)),
+            Some(<FilesServer<Api> as NamedService>::NAME) => Box::pin(self.files.call(req)),
             _ => {
                 let status = Status::unimplemented(format!("no service at {}", req.uri().path()));
                 Box::pin(async move { Ok(status.into_http()) })
@@ -648,6 +654,152 @@ impl Exec for Api {
     }
 }
 
+#[tonic::async_trait]
+impl Files for Api {
+    type ReadStream = BoxStream<'static, Result<v1::Chunk, Status>>;
+    type WatchStream = BoxStream<'static, Result<v1::FsEvent, Status>>;
+
+    async fn read(
+        &self,
+        req: Request<v1::ReadFileRequest>,
+    ) -> Result<Response<Self::ReadStream>, Status> {
+        let project = project(&req)?;
+        let r = req.into_inner();
+        let (_, drone) = self.drone(&project, &r.cell_id).await?;
+        let read = drone::FsRead { path: r.path, offset: r.offset, length: r.length };
+        let reader = drone.fs_open(&read).await.map_err(status)?;
+        let chunks = stream::try_unfold(reader, |mut reader| async move {
+            let chunk = reader.next().await.map_err(status)?;
+            Ok(chunk.map(|data| (v1::Chunk { data }, reader)))
+        });
+        Ok(Response::new(chunks.boxed()))
+    }
+
+    async fn write(
+        &self,
+        req: Request<Streaming<v1::WriteFileChunk>>,
+    ) -> Result<Response<v1::FileInfo>, Status> {
+        use v1::write_file_chunk::Part;
+        let project = project(&req)?;
+        let mut input = req.into_inner();
+        let Some(Part::Header(h)) = input.message().await?.and_then(|m| m.part) else {
+            return Err(invalid("the first message must be a header"));
+        };
+        let (_, drone) = self.drone(&project, &h.cell_id).await?;
+        let mut write = drone::FsWrite {
+            path: h.path,
+            data: bytes::Bytes::new(),
+            mode: h.mode,
+            make_parents: h.make_parents,
+            append: h.append,
+            uid: None,
+            gid: None,
+        };
+        // Most writes are small files, which go in one message. Past that the file is streamed,
+        // with what came so far as its start.
+        let mut head = bytes::BytesMut::new();
+        let mut next = None;
+        while let Some(m) = input.message().await? {
+            let Some(Part::Data(b)) = m.part else {
+                return Err(invalid("only the first message may be a header"));
+            };
+            if head.len() + b.len() > SMALL_WRITE {
+                next = Some(b);
+                break;
+            }
+            head.extend_from_slice(&b);
+        }
+        write.data = head.freeze();
+        let Some(first) = next else {
+            let info = drone.fs_write(&write).await.map_err(status)?;
+            return Ok(Response::new(info_to_v1(info)));
+        };
+        let mut w = drone.fs_create(&write).await.map_err(status)?;
+        w.write(first).await.map_err(status)?;
+        while let Some(m) = input.message().await? {
+            let Some(Part::Data(b)) = m.part else {
+                return Err(invalid("only the first message may be a header"));
+            };
+            w.write(b).await.map_err(status)?;
+        }
+        let info = w.finish().await.map_err(status)?;
+        Ok(Response::new(info_to_v1(info)))
+    }
+
+    async fn stat(&self, req: Request<v1::PathRequest>) -> Result<Response<v1::FileInfo>, Status> {
+        let project = project(&req)?;
+        let r = req.into_inner();
+        let (_, drone) = self.drone(&project, &r.cell_id).await?;
+        let path = drone::FsPath { path: r.path, follow: false, recursive: false };
+        let info = drone.fs_stat(&path).await.map_err(status)?;
+        Ok(Response::new(info_to_v1(info)))
+    }
+
+    async fn list(
+        &self,
+        req: Request<v1::ListDirRequest>,
+    ) -> Result<Response<v1::ListDirResponse>, Status> {
+        let project = project(&req)?;
+        let r = req.into_inner();
+        let (_, drone) = self.drone(&project, &r.cell_id).await?;
+        let list = drone.fs_list(&drone::FsList { path: r.path, depth: r.depth }).await;
+        let list = list.map_err(status)?;
+        Ok(Response::new(v1::ListDirResponse {
+            entries: list.entries.into_iter().map(info_to_v1).collect(),
+            truncated: list.truncated,
+        }))
+    }
+
+    async fn remove(&self, req: Request<v1::PathRequest>) -> Result<Response<v1::Empty>, Status> {
+        let project = project(&req)?;
+        let r = req.into_inner();
+        let (_, drone) = self.drone(&project, &r.cell_id).await?;
+        let path = drone::FsPath { path: r.path, follow: false, recursive: r.recursive };
+        drone.fs_remove(&path).await.map_err(status)?;
+        Ok(Response::new(v1::Empty {}))
+    }
+
+    async fn watch(
+        &self,
+        req: Request<v1::WatchDirRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let project = project(&req)?;
+        let r = req.into_inner();
+        let (_, drone) = self.drone(&project, &r.cell_id).await?;
+        let path = drone::FsPath { path: r.path, follow: false, recursive: r.recursive };
+        let watcher = drone.fs_watch(&path).await.map_err(status)?;
+        // The drone sends changes in batches, and the caller gets them one at a time.
+        let events = stream::try_unfold(watcher, |mut w| async move {
+            let batch = w.next().await.map_err(status)?;
+            Ok::<_, Status>(batch.map(|b| (stream::iter(b.events.into_iter().map(Ok)), w)))
+        })
+        .try_flatten()
+        .map_ok(|e| v1::FsEvent { kind: e.kind, path: e.path })
+        .take_until(self.stop.clone().cancelled_owned());
+        Ok(Response::new(events.boxed()))
+    }
+
+    async fn diff(&self, _: Request<v1::DiffRequest>) -> Result<Response<v1::DiffResult>, Status> {
+        Err(Status::unimplemented("Diff is not built yet"))
+    }
+
+    async fn apply(&self, req: Request<v1::ApplyRequest>) -> Result<Response<v1::Empty>, Status> {
+        let project = project(&req)?;
+        let r = req.into_inner();
+        let tar = match r.content {
+            Some(v1::apply_request::Content::Tar(t)) => t,
+            Some(v1::apply_request::Content::Patch(_)) => {
+                return Err(Status::unimplemented("applying a patch is not built yet"));
+            }
+            None => return Err(invalid("the request has no patch or tar")),
+        };
+        let (_, drone) = self.drone(&project, &r.cell_id).await?;
+        let upload = drone::FsUpload { path: r.path, make_parents: true, uid: None, gid: None };
+        drone.fs_upload(&upload, tar).await.map_err(status)?;
+        Ok(Response::new(v1::Empty {}))
+    }
+}
+
 /// The output side of an `Exec.Start` call. Dropping it tells the input side to finish.
 struct Started {
     rx: hive_drone::ProcessOutput,
@@ -750,6 +902,23 @@ fn result_to_v1(r: drone::RunResult) -> v1::RunResult {
         wall: Some(convert::duration_to_v1(Duration::from_nanos(r.wall_nanos))),
         usage: None,
         signal: r.signal,
+    }
+}
+
+/// A file's description for the wire. The kinds are numbered the same on both sides.
+fn info_to_v1(i: drone::FileInfo) -> v1::FileInfo {
+    let nanos = i.modified_unix_nanos;
+    v1::FileInfo {
+        path: i.path,
+        r#type: i.kind,
+        size: i.size,
+        mode: i.mode,
+        modified_at: Some(prost_types::Timestamp {
+            seconds: nanos.div_euclid(1_000_000_000),
+            // Always in 0..1e9, so it fits.
+            nanos: i32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0),
+        }),
+        symlink_target: i.symlink_target,
     }
 }
 
