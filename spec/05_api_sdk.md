@@ -93,6 +93,17 @@ message RunResult    { int32 exit_code = 1; bytes stdout = 2; bytes stderr = 3; 
                        bool timed_out = 5; Duration wall = 6; ResourceUsage usage = 7; }
 ```
 
+### 1.2 Local API
+
+A comb in standalone mode serves Cells and Exec itself, on a Unix socket (`/run/hivebox/comb.sock` by default, mode 0600), so one node is usable with no gate in front of it. The calls and messages are the same as through a gate, with these differences:
+
+- There is no auth. Whoever can open the socket is trusted, the same as with the Docker socket. The caller names its project in the `x-hive-project` header, `local` when it names none, and sees only that project's cells.
+- `Create` with a count makes the cells at once and streams each one as it is ready. A count over 1 with an idempotency key gives cell `i` the key `<key>/<i>`, so a retry of the whole batch gets the same cells back. At most 1,024 cells per call.
+- `Watch` by id ends once the cell has ended. A watcher that falls more than 4,096 changes behind gets the current state of every cell that moved since it last heard, instead of the changes it missed.
+- `Pause`, `Resume` and `Stop` by labels pick only the cells the call can act on (running, paused and not yet ended), so `matched` counts those.
+- `Exec.Signal` reaches processes started with `Exec.Start` on the same comb. `user` is a uid or `uid:gid`.
+- Not served yet: `ExtendTtl`, `UpdatePolicy`, `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
+
 ## 2. Error model
 
 Errors use the gRPC status plus `google.rpc.ErrorInfo{reason, domain:"hivebox.dev", metadata}`. The `reason` codes are stable:

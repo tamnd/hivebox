@@ -4,6 +4,9 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Every cell gets its own network namespace with loopback up, taken from a pool of 400 spares the comb refills in the background. Namespaces are made on up to 4 threads, which took server2 from about 230 to about 430 a second, and removed up to 64 at a time, about 5,700 a second there. Both pools now retry a failed refill after a backoff from 10ms to 5s, and every connection to a guest agent has a 2s limit (#26).
+- `hive-comb` runs on its own with a local gRPC API on a unix socket that only its owner can open, and reads `/etc/hivebox/comb.toml` or `--config`. It serves Cells (create with a count up to 1024, get, list with paging and label selectors, watch, pause, resume and stop by id or labels) and Exec (run, start with stdin and signals, and shell sessions), scoped to the project named in the `x-hive-project` header. On server2 with a fake driver, a Get costs 144 us p50, running `true` through the API costs about 1ms more at p50 than calling the drone directly, one caller makes and stops 480 cells a second, 16 callers make and stop 1,318 a second, and one create call with count 64 takes 18ms (#27).
+
 ## 0.0.3
 
 The start of hive-comb, the node agent, in standalone mode.
