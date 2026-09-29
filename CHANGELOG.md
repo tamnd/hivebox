@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- A create that waits its turn behind a burst now gets the whole `create_deadline` again once it starts, instead of what was left of it. Before, with 1000 creates asked for at once on server3, 169 got a turn with almost no time left and failed as `DRONE_UNREACHABLE`, which blamed the guest agent for the queue. A create that waits past the deadline for its turn still fails with `CAPACITY_UNAVAILABLE`, and is now counted in `hive_create_total`.
 - `hive-comb` counts what it does and serves it on `/metrics` when `[node] metrics` names an address. `hive_create_seconds{backend,stage}` times each create stage by stage (admit, pool, rootfs, prepare, wal, start, handshake and total), `hive_create_total{backend,result}` counts how creates ended, and `hive_exec_seconds{op}` times exec calls from the comb's side. On server3 at load 14, 50 container creates at 10 a second took 93 ms at p50, of which 66 ms was the OCI worker starting the container, 8 ms the drone handshake, 6 ms the two WAL writes and 4 ms preparing the bundle.
 
 ## 0.0.8
