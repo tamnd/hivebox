@@ -31,4 +31,4 @@ pub mod worker;
 #[cfg(target_os = "linux")]
 pub use driver::{Config, OciDriver};
 #[cfg(target_os = "linux")]
-pub use import::import;
+pub use import::{import, import_layer};
