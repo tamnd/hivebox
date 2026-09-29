@@ -1,11 +1,14 @@
 //! The pool of network namespaces, from `spec/08_node_agent.md`, section 3.
 //!
 //! Each cell gets a namespace of its own at `<dir>/cell-<n>`, made ahead of time by a background
-//! task with loopback up. That is the whole of the `none` profile. Namespaces are never reused: one
+//! task with loopback up and, when the node has [`Net`], its interface wired with the guard on it.
+//! Namespaces are never reused: one
 //! a cell has used can still hold its `TIME_WAIT` sockets and any sysctl it changed, and the next
 //! tenant would see both.
 
+use crate::net::Net;
 use hive_cell::netns;
+use hive_guard::wire::Veth;
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,32 +25,42 @@ const BATCH: usize = 32;
 /// over 1,000. The cap keeps a burst of them from taking every blocking thread tokio has.
 const REAPERS: usize = 64;
 
+/// A namespace for a cell, and its interface if the node wires them.
+#[derive(Debug)]
+pub(crate) struct Spare {
+    pub(crate) path: PathBuf,
+    pub(crate) veth: Option<Veth>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Namespaces {
     dir: PathBuf,
     depth: usize,
     next: AtomicU64,
-    ready: Mutex<Vec<PathBuf>>,
+    net: Option<Arc<Net>>,
+    ready: Mutex<Vec<Spare>>,
     refill: Notify,
     reapers: Semaphore,
 }
 
 impl Namespaces {
-    /// Uses `dir` for namespaces, keeping `depth` of them ready.
-    pub(crate) fn init(dir: &Path, depth: usize) -> io::Result<Self> {
+    /// Uses `dir` for namespaces, keeping `depth` of them ready, wired through `net` if there is
+    /// one.
+    pub(crate) fn init(dir: &Path, depth: usize, net: Option<Arc<Net>>) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let next = names(dir)?.iter().filter_map(|p| number(p)).max().map_or(0, |n| n + 1);
         Ok(Self {
             dir: dir.to_path_buf(),
             depth,
             next: AtomicU64::new(next),
+            net,
             ready: Mutex::new(Vec::with_capacity(depth)),
             refill: Notify::new(),
             reapers: Semaphore::new(REAPERS),
         })
     }
 
-    fn ready(&self) -> MutexGuard<'_, Vec<PathBuf>> {
+    fn ready(&self) -> MutexGuard<'_, Vec<Spare>> {
         self.ready.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -56,8 +69,9 @@ impl Namespaces {
         (first..first + n as u64).map(|i| self.dir.join(format!("cell-{i}"))).collect()
     }
 
-    /// A namespace for a new cell. Blocks for about a millisecond if none is ready.
-    pub(crate) fn take(&self) -> io::Result<PathBuf> {
+    /// A namespace for a new cell. If none is ready it makes one, which takes about a millisecond,
+    /// and more with an interface to wire.
+    pub(crate) fn take(&self) -> io::Result<Spare> {
         let (ready, left) = {
             let mut ready = self.ready();
             (ready.pop(), ready.len())
@@ -70,7 +84,35 @@ impl Namespaces {
         }
         let path = self.fresh(1).pop().expect("asked for one");
         netns::create(std::slice::from_ref(&path)).pop().expect("one result per path")?;
-        Ok(path)
+        self.wire(path)
+    }
+
+    /// Wires a namespace just made. One that cannot be wired is removed.
+    fn wire(&self, path: PathBuf) -> io::Result<Spare> {
+        let Some(net) = &self.net else { return Ok(Spare { path, veth: None }) };
+        let n = number(&path).expect("named by fresh");
+        match net.wire(&path, n) {
+            Ok(v) => Ok(Spare { path, veth: Some(v) }),
+            Err(e) => {
+                let _ = netns::remove(&path);
+                Err(e)
+            }
+        }
+    }
+
+    /// The interface a cell's namespace had before a restart.
+    pub(crate) fn recover(&self, path: &Path) -> Option<Veth> {
+        self.net.as_ref()?.recover(number(path)?)
+    }
+
+    /// Where cells send DNS queries, when they have a network.
+    pub(crate) fn nameserver(&self) -> Option<std::net::Ipv4Addr> {
+        self.net.as_ref().map(|_| Net::nameserver())
+    }
+
+    /// The node's cell networking, if it has any beyond loopback.
+    pub(crate) fn net(&self) -> Option<&Arc<Net>> {
+        self.net.as_ref()
     }
 
     /// Namespaces ready for new cells.
@@ -88,10 +130,19 @@ impl Namespaces {
         Ok(n)
     }
 
-    /// Removes the namespace at `path`, off the async threads.
+    /// Removes the namespace at `path`, and the program from its interface first, off the async
+    /// threads. The interface goes with the namespace.
     pub(crate) async fn remove(&self, path: PathBuf) -> io::Result<()> {
         let _turn = self.reapers.acquire().await.map_err(io::Error::other)?;
-        tokio::task::spawn_blocking(move || netns::remove(&path)).await.map_err(io::Error::other)?
+        let net = self.net.clone();
+        tokio::task::spawn_blocking(move || {
+            if let (Some(net), Some(n)) = (net, number(&path)) {
+                net.forget(n);
+            }
+            netns::remove(&path)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     /// Keeps the pool topped up until `stop` fires.
@@ -111,8 +162,8 @@ impl Namespaces {
         let results = netns::create(&paths);
         let mut failed = None;
         for (path, made) in paths.into_iter().zip(results) {
-            match made {
-                Ok(()) => self.ready().push(path),
+            match made.and_then(|()| self.wire(path)) {
+                Ok(spare) => self.ready().push(spare),
                 Err(e) => failed = Some(e),
             }
         }
@@ -181,9 +232,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_pool_fills_hands_out_and_sweeps() {
         let Some(d) = Dir::new() else { return };
-        let pool = Arc::new(Namespaces::init(&d.0, 6).unwrap());
+        let pool = Arc::new(Namespaces::init(&d.0, 6, None).unwrap());
         // With nothing ready a take makes one on the spot.
-        let first = pool.take().unwrap();
+        let first = pool.take().unwrap().path;
         assert!(first.exists());
 
         let stop = CancellationToken::new();
@@ -193,7 +244,7 @@ mod tests {
             assert!(std::time::Instant::now() < until, "only {} ready", pool.depth());
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        let taken: Vec<PathBuf> = (0..4).map(|_| pool.take().unwrap()).collect();
+        let taken: Vec<PathBuf> = (0..4).map(|_| pool.take().unwrap().path).collect();
         let mut all: HashSet<PathBuf> = taken.iter().cloned().collect();
         all.insert(first.clone());
         assert_eq!(all.len(), 5, "every take is a different namespace");
@@ -202,7 +253,7 @@ mod tests {
         drop(pool);
 
         // The next comb keeps the two that cells hold and removes the rest.
-        let pool = Namespaces::init(&d.0, 6).unwrap();
+        let pool = Namespaces::init(&d.0, 6, None).unwrap();
         let keep = HashSet::from([first.clone(), taken[0].clone()]);
         let left = names(&d.0).unwrap().len();
         assert_eq!(pool.sweep(&keep).await.unwrap(), left - 2);
@@ -212,7 +263,7 @@ mod tests {
         want.sort();
         assert_eq!(now, want);
         // New names never reuse an old one.
-        let fresh = pool.take().unwrap();
+        let fresh = pool.take().unwrap().path;
         assert!(number(&fresh) > taken.iter().map(|p| number(p)).max().unwrap());
         pool.remove(fresh.clone()).await.unwrap();
         assert!(!fresh.exists());

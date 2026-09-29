@@ -14,14 +14,48 @@ use common::*;
 struct Node {
     cfg: Config,
     drone: PathBuf,
-    // Dropped in this order: the comb before its cgroups and its directory.
+    // Dropped in this order: the comb before its cgroups, its pins and its directory.
     comb: Comb,
+    guard: Option<Guarded>,
     _tree: Tree,
     _scratch: Scratch,
 }
 
+/// What a node with `hive-guard` adds to the host, removed however the test ends.
+struct Guarded {
+    pins: PathBuf,
+    made_vips: bool,
+}
+
+impl Guarded {
+    const RULE: [&str; 6] = ["INPUT", "-i", "hv+", "-j", "ACCEPT", "-w"];
+
+    fn new() -> Self {
+        // A host firewall that drops input, as ufw does, would hide what the guard passes.
+        let _ = std::process::Command::new("iptables").arg("-I").args(Self::RULE).output();
+        Self {
+            pins: format!("/sys/fs/bpf/hive-comb-test-{}", std::process::id()).into(),
+            made_vips: !Path::new("/sys/class/net/hive0").exists(),
+        }
+    }
+}
+
+impl Drop for Guarded {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("iptables").arg("-D").args(Self::RULE).output();
+        if self.made_vips {
+            let _ = std::process::Command::new("ip").args(["link", "del", "hive0"]).output();
+        }
+        let _ = std::fs::remove_dir_all(&self.pins);
+    }
+}
+
 impl Node {
     async fn new(depth: usize) -> Option<Self> {
+        Self::with(depth, false).await
+    }
+
+    async fn with(depth: usize, guard: bool) -> Option<Self> {
         let Some(drone) = std::env::var_os("HIVE_OCI_DRONE") else {
             eprintln!("skipped: set HIVE_OCI_DRONE to run it");
             return None;
@@ -54,7 +88,17 @@ impl Node {
             (None, Some(image)) => std::os::unix::fs::symlink(image, &python).unwrap(),
             (None, None) => unreachable!(),
         }
+        let guard = guard.then(Guarded::new);
+        let network = match &guard {
+            Some(g) => Network {
+                guard: true,
+                cells: (std::net::Ipv4Addr::new(100, 64, 240, 0), 24),
+                pin_dir: g.pins.clone(),
+            },
+            None => Network { guard: false, ..Network::default() },
+        };
         let cfg = Config {
+            network,
             cgroup_root: Some(tree.0.clone()),
             cgroup_depth: depth,
             netns_dir: Some(scratch.0.join("netns")),
@@ -68,7 +112,7 @@ impl Node {
         };
         let drone = PathBuf::from(drone);
         let comb = open_oci(&cfg, &drone).await;
-        Some(Self { cfg, drone, comb, _tree: tree, _scratch: scratch })
+        Some(Self { cfg, drone, comb, guard, _tree: tree, _scratch: scratch })
     }
 
     /// Shuts the comb down, which leaves its cells running, and opens a new one on the same data.
@@ -136,14 +180,78 @@ async fn a_container_cell_goes_through_the_comb_and_outlives_it() {
     node.comb.shutdown().await;
 }
 
+/// Whether a TCP connect from the cell got an answer from `ip`, refused or not, within a second.
+async fn reaches(comb: &Comb, id: CellId, ip: &str, port: u16) -> bool {
+    let script = format!(
+        "python3 -c 'import socket\ns = socket.socket()\ns.settimeout(1)\ntry:\n    s.connect((\"{ip}\", {port}))\nexcept ConnectionRefusedError:\n    pass\nexcept OSError:\n    print(\"no\")'"
+    );
+    sh(comb, id, &script).await.is_empty()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guarded_cell_reaches_the_node_resolver_and_nothing_else() {
+    if !Path::new("/sys/fs/bpf").exists() {
+        eprintln!("skipped: no bpf filesystem");
+        return;
+    }
+    let Some(mut node) = Node::with(4, true).await else { return };
+    let comb = node.comb.clone();
+    let id = comb.create(request(spec("python"))).await.unwrap().id;
+    let links = sh(&comb, id, "tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sort").await;
+    assert_eq!(links, "eth0\nlo\n", "the guard did not load, see the comb's output");
+    let addr = sh(&comb, id, "python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect((\"169.254.77.53\", 53)); print(s.getsockname()[0])'").await;
+    assert!(addr.starts_with("100.64.240."), "{addr}");
+    assert_eq!(
+        sh(&comb, id, "cat /etc/resolv.conf").await.lines().next(),
+        Some("nameserver 169.254.77.53")
+    );
+    assert!(reaches(&comb, id, "169.254.77.53", 53).await, "every profile has the resolver");
+    assert!(!reaches(&comb, id, "169.254.77.80", 80).await, "none has no mirrors");
+    assert!(!reaches(&comb, id, "1.1.1.1", 443).await);
+    assert!(!reaches(&comb, id, "169.254.77.1", 22).await, "nor the node itself");
+    // Writing its own resolver changes nothing, since the file is read only.
+    assert!(
+        sh(&comb, id, "echo nameserver 1.1.1.1 > /etc/resolv.conf 2>/dev/null || echo ro").await
+            == "ro\n"
+    );
+
+    // After a restart the comb still knows the cell's interface, and frees it on stop.
+    node.restart().await;
+    assert!(reaches(&node.comb, id, "169.254.77.53", 53).await);
+    let mirrors = {
+        let mut s = spec("python");
+        s.network_profile = "mirrors".into();
+        s
+    };
+    let other = node.comb.create(request(mirrors)).await.unwrap().id;
+    assert!(reaches(&node.comb, other, "169.254.77.80", 80).await, "mirrors has the mirror proxy");
+    let mut open = spec("python");
+    open.network_profile = "open".into();
+    let e = node.comb.create(request(open)).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+    for id in [id, other] {
+        node.comb.stop(id, None).await.unwrap();
+    }
+    // Only the spares keep a program, once the pool is full again.
+    let dir = node.guard.as_ref().unwrap().pins.join("links");
+    let until = Instant::now() + Duration::from_secs(20);
+    while std::fs::read_dir(&dir).unwrap().count() != 4 || node.comb.spare_netns() != Some(4) {
+        assert!(Instant::now() < until, "{} links", std::fs::read_dir(&dir).unwrap().count());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    node.comb.shutdown().await;
+}
+
 /// What a container cell costs through the comb. Run it with
 /// `cargo test --release -p hive-comb --test oci -- --ignored --nocapture`, with `CELLS` to change
-/// how many are made at once.
+/// how many are made at once and `GUARD` set to wire every cell's interface with the guard on.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement, not a test"]
 async fn oci_through_the_comb() {
     let cells: usize = std::env::var("CELLS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-    let Some(node) = Node::new(cells).await else { return };
+    let guard = std::env::var_os("GUARD").is_some();
+    let t = Instant::now();
+    let Some(node) = Node::with(cells, guard).await else { return };
     let comb = node.comb.clone();
     // Starts from full pools, as a node that has been up a while would.
     while comb.spare_netns().is_some_and(|d| d < cells)
@@ -151,6 +259,7 @@ async fn oci_through_the_comb() {
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    println!("guard {guard}: pools of {cells} full in {:?}", t.elapsed());
 
     let mut one = Vec::new();
     for _ in 0..20 {

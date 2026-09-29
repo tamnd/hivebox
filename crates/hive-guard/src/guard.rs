@@ -220,6 +220,12 @@ impl Guard {
     pub fn remove_cell(&mut self, ifindex: u32) -> io::Result<()> {
         match self.cells.remove(&ifindex) {
             Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+            // aya reports a delete of a missing key as the syscall's ENOENT.
+            Err(aya::maps::MapError::SyscallError(e))
+                if e.io_error.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
             Err(e) => Err(failed("cells", e)),
         }
     }
@@ -306,7 +312,7 @@ fn boottime() -> u64 {
     u64::try_from(t.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(t.tv_nsec).unwrap_or(0)
 }
 
-fn ifindex(iface: &str) -> io::Result<u32> {
+pub(crate) fn ifindex(iface: &str) -> io::Result<u32> {
     if iface.is_empty() || iface.contains('/') || iface.starts_with('.') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

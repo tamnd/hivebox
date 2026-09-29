@@ -12,6 +12,7 @@ mod cell;
 mod cgroups;
 mod comb;
 mod config;
+mod net;
 mod netns;
 mod pool;
 mod record;
@@ -19,4 +20,4 @@ mod wal;
 
 pub use cell::{CellInfo, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, WalStats};
-pub use config::{Config, ContainerBackend, Images};
+pub use config::{Config, ContainerBackend, Images, Network};

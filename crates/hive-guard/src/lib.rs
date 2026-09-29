@@ -13,6 +13,9 @@
 //!
 //! IPv6 and every other protocol are dropped, and so is anything from an interface with no cell.
 //! The design is in `spec/12_networking.md`.
+//!
+//! [`wire`] gives a network namespace its interface, a veth pair with the cell's address, routes
+//! and neighbours set on both ends, through the small rtnetlink client in [`link`].
 
 #![deny(unsafe_code)]
 
@@ -22,7 +25,11 @@ use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 mod guard;
 #[cfg(target_os = "linux")]
+pub mod link;
+#[cfg(target_os = "linux")]
 mod maps;
+#[cfg(target_os = "linux")]
+pub mod wire;
 
 #[cfg(target_os = "linux")]
 pub use guard::Guard;

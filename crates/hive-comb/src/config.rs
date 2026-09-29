@@ -1,6 +1,7 @@
 use hive_types::Backend;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -47,6 +48,30 @@ pub struct Config {
     pub container: ContainerBackend,
     /// Where images come from.
     pub images: Images,
+    /// How cells reach the network.
+    pub network: Network,
+}
+
+/// How cells in their own network namespaces reach anything. Needs [`Config::netns_dir`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Network {
+    /// Off gives each cell loopback and nothing else. On, the comb also runs cells with loopback
+    /// only if `hive-guard` cannot load, and says so.
+    pub guard: bool,
+    /// The range this node's cells get their addresses from, as a base and a prefix length.
+    pub cells: (Ipv4Addr, u8),
+    /// Where the guard pins its maps and links, under a bpf filesystem.
+    pub pin_dir: PathBuf,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            guard: true,
+            cells: (Ipv4Addr::new(100, 64, 0, 0), 20),
+            pin_dir: PathBuf::from("/sys/fs/bpf/hive/guard-v1"),
+        }
+    }
 }
 
 /// Where the comb gets images made by `hive-nectar`. An image name is looked up in
@@ -131,6 +156,7 @@ impl Default for Config {
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             container: ContainerBackend::default(),
             images: Images::default(),
+            network: Network::default(),
         }
     }
 }
@@ -161,6 +187,9 @@ impl Config {
     /// [backends.container]
     /// drone = "/usr/lib/hivebox/hive-drone"
     /// workers = 8
+    ///
+    /// [network]
+    /// cells = "100.64.16.0/20"
     ///
     /// [images]
     /// store = "/srv/hivebox/store"
@@ -236,6 +265,15 @@ impl Config {
         c.images.cache_dir = i.cache_dir.unwrap_or_else(|| c.data_dir.join("cache"));
         set(&mut c.images.cache_bytes, i.cache_bytes);
         set(&mut c.images.layers_dir, i.layers_dir);
+        let w = file.network;
+        set(&mut c.network.guard, w.guard);
+        set(&mut c.network.pin_dir, w.pin_dir);
+        if let Some(text) = w.cells {
+            c.network.cells =
+                cidr(&text).filter(|(_, len)| (8..=30).contains(len)).ok_or_else(|| {
+                    format!("network.cells = {text:?} is not a range like 100.64.0.0/20")
+                })?;
+        }
         if c.node == 0 {
             return Err("node.node must not be 0".into());
         }
@@ -272,6 +310,21 @@ struct File {
     lifecycle: LifecycleFile,
     backends: BackendsFile,
     images: ImagesFile,
+    network: NetworkFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NetworkFile {
+    guard: Option<bool>,
+    cells: Option<String>,
+    pin_dir: Option<PathBuf>,
+}
+
+fn cidr(text: &str) -> Option<(Ipv4Addr, u8)> {
+    let (ip, len) = text.split_once('/')?;
+    let len: u8 = len.parse().ok()?;
+    (len <= 32).then_some((ip.parse().ok()?, len))
 }
 
 #[derive(Default, Deserialize)]
@@ -371,6 +424,9 @@ mod tests {
             [images]
             store = "/srv/store"
             cache_bytes = 1048576
+
+            [network]
+            cells = "100.64.16.0/20"
             "#,
         )
         .unwrap();
@@ -392,6 +448,8 @@ mod tests {
         assert_eq!(c.images.store, Some(PathBuf::from("/srv/store")));
         assert_eq!(c.images.cache_bytes, 1 << 20);
         assert_eq!(c.images.layers_dir, Images::default().layers_dir);
+        assert_eq!(c.network.cells, (Ipv4Addr::new(100, 64, 16, 0), 20));
+        assert!(c.network.guard);
     }
 
     #[test]
@@ -401,6 +459,8 @@ mod tests {
         assert!(Config::from_toml("[lifecycle]\nstop_grace = \"1d\"").is_err());
         assert!(Config::from_toml("[backends.create_limit]\nauto = 1").is_err());
         assert!(Config::from_toml("[node]\nnode = 0").is_err());
+        assert!(Config::from_toml("[network]\ncells = \"100.64.0.0\"").is_err());
+        assert!(Config::from_toml("[network]\ncells = \"100.64.0.0/31\"").is_err());
         assert!(Config::from_toml("[backends.container]\nworkers = 0").is_err());
         assert!(Config::from_toml("[backends.container]\nuid_base = 4294967295").is_err());
     }

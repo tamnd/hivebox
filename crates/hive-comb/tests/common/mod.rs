@@ -9,7 +9,7 @@ pub use hive_cell::{
     CellDriver, CellHandle, DriverCaps, DriverRegistry, ExitInfo, GuestChannel, Liveness, NodeFit,
     PauseMode, RootfsPlan, Slot,
 };
-pub use hive_comb::{CellInfo, Comb, Config, CreateRequest, Images};
+pub use hive_comb::{CellInfo, Comb, Config, CreateRequest, Images, Network};
 pub use hive_drone::Drone;
 pub use hive_proto::drone::api::{Command, RunRequest};
 pub use hive_types::{
@@ -262,6 +262,7 @@ pub fn config(dir: &Path) -> Config {
         keep_ended: Duration::from_secs(60),
         cgroup_root: None,
         netns_dir: None,
+        network: Network { guard: false, ..Network::default() },
         ..Config::default()
     }
 }

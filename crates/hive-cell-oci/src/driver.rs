@@ -140,11 +140,16 @@ impl OciDriver {
         let cgroup = slot.cgroup.strip_prefix(CGROUP_ROOT).map_err(|_| {
             std::io::Error::other(format!("{} is not under {CGROUP_ROOT}", slot.cgroup.display()))
         })?;
+        let resolv = dir.join("resolv.conf");
+        if let Some(ns) = slot.nameserver {
+            std::fs::write(&resolv, format!("nameserver {ns}\noptions timeout:2 attempts:2\n"))?;
+        }
         let host = Host {
             drone: &self.cfg.drone,
             cgroup: &Path::new("/").join(cgroup),
             uid_base: self.cfg.uid_base,
             uid_count: self.cfg.uid_count,
+            resolv: slot.nameserver.map(|_| resolv.as_path()),
         };
         let config = spec::config(spec, &host);
         std::fs::write(dir.join("config.json"), serde_json::to_vec(&config)?)?;

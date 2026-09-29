@@ -61,6 +61,8 @@ pub(crate) struct Host<'a> {
     pub(crate) uid_base: u32,
     /// How many ids the cell has.
     pub(crate) uid_count: u32,
+    /// The file the cell sees as `/etc/resolv.conf`, when it has a network.
+    pub(crate) resolv: Option<&'a Path>,
 }
 
 /// The whole `config.json` for a cell.
@@ -93,6 +95,22 @@ pub(crate) fn config(spec: &CellSpec, host: &Host<'_>) -> Value {
     ];
     let map = [json!({"containerID": 0, "hostID": host.uid_base, "size": host.uid_count})];
     let files = u64::from(spec.resources.open_files.max(64));
+    let mut mounts = vec![
+        json!({"destination": "/proc", "type": "proc", "source": "proc", "options": ["nosuid", "noexec", "nodev"]}),
+        json!({"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]}),
+        json!({"destination": "/dev/pts", "type": "devpts", "source": "devpts", "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"]}),
+        json!({"destination": "/dev/shm", "type": "tmpfs", "source": "shm", "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]}),
+        json!({"destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue", "options": ["nosuid", "noexec", "nodev"]}),
+        // A fresh sysfs needs a network namespace the cell's user namespace owns, and the comb
+        // makes those outside it, so this is the host's, read only.
+        json!({"destination": "/sys", "type": "none", "source": "/sys", "options": ["rbind", "nosuid", "noexec", "nodev", "ro"]}),
+        json!({"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup", "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]}),
+        json!({"destination": DRONE, "type": "bind", "source": host.drone, "options": ["bind", "ro", "nosuid", "nodev"]}),
+    ];
+    if let Some(resolv) = host.resolv {
+        // Read only, so the cell cannot point itself at a resolver the guard would drop anyway.
+        mounts.push(json!({"destination": "/etc/resolv.conf", "type": "bind", "source": resolv, "options": ["bind", "ro", "nosuid", "nodev", "noexec"]}));
+    }
     json!({
         "ociVersion": "1.0.2",
         "root": {"path": "rootfs", "readonly": false},
@@ -108,18 +126,7 @@ pub(crate) fn config(spec: &CellSpec, host: &Host<'_>) -> Value {
             "rlimits": [{"type": "RLIMIT_NOFILE", "hard": files, "soft": files}],
             "noNewPrivileges": true,
         },
-        "mounts": [
-            {"destination": "/proc", "type": "proc", "source": "proc", "options": ["nosuid", "noexec", "nodev"]},
-            {"destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
-            {"destination": "/dev/pts", "type": "devpts", "source": "devpts", "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"]},
-            {"destination": "/dev/shm", "type": "tmpfs", "source": "shm", "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]},
-            {"destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue", "options": ["nosuid", "noexec", "nodev"]},
-            // A fresh sysfs needs a network namespace the cell's user namespace owns, and the
-            // comb makes those outside it, so this is the host's, read only.
-            {"destination": "/sys", "type": "none", "source": "/sys", "options": ["rbind", "nosuid", "noexec", "nodev", "ro"]},
-            {"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup", "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]},
-            {"destination": DRONE, "type": "bind", "source": host.drone, "options": ["bind", "ro", "nosuid", "nodev"]},
-        ],
+        "mounts": mounts,
         "linux": {
             "namespaces": namespaces,
             "uidMappings": map,
@@ -142,6 +149,7 @@ mod tests {
             cgroup: Path::new("/hive.slice/std.slice/c1"),
             uid_base: 1_000_000,
             uid_count: 65536,
+            resolv: None,
         }
     }
 
@@ -171,5 +179,19 @@ mod tests {
         assert!(ns.iter().all(|n| n["type"] != "network"));
         let files = u64::from(spec.resources.open_files);
         assert_eq!(c["process"]["rlimits"][0]["hard"], files);
+        assert!(
+            c["mounts"].as_array().unwrap().iter().all(|m| m["destination"] != "/etc/resolv.conf")
+        );
+    }
+
+    #[test]
+    fn a_cell_with_a_network_gets_the_node_resolver() {
+        let spec = CellSpec::new(Source::Image("python".into()), Backend::Container);
+        let resolv = Path::new("/run/hivebox/oci/c1/resolv.conf");
+        let c = config(&spec, &Host { resolv: Some(resolv), ..host() });
+        let m = c["mounts"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(m["destination"], "/etc/resolv.conf");
+        assert_eq!(m["source"], resolv.to_str().unwrap());
+        assert!(m["options"].as_array().unwrap().iter().any(|o| o == "ro"));
     }
 }

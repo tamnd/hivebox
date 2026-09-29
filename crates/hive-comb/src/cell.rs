@@ -10,6 +10,7 @@ use crate::comb::Inner;
 use crate::record::{Handle, Record, now_ms, time};
 use hive_cell::{CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, Slot};
 use hive_drone::Client;
+use hive_guard::wire::Veth;
 use hive_types::{Cause, CellId, CellSpec, CellState, Error, IdleAction, Reason};
 use prost::Message;
 use std::io;
@@ -154,6 +155,8 @@ pub(crate) struct Actor {
     cgroup: Option<PathBuf>,
     /// The cell's own network namespace, the same way.
     netns: Option<PathBuf>,
+    /// The cell's interface in that namespace, when the node wires them.
+    veth: Option<Veth>,
 }
 
 impl Actor {
@@ -175,6 +178,7 @@ impl Actor {
             handle: None,
             cgroup: None,
             netns: None,
+            veth: None,
         }
     }
 
@@ -315,14 +319,26 @@ impl Actor {
             cgroup = taken.map_err(|e| io_error("setting up the cell's cgroup", &e))?;
             self.cgroup = Some(cgroup.clone());
         }
+        let mut nameserver = None;
         if let Some(pool) = self.inner.netns.clone() {
+            let profile = self.inner.profile(&self.cell.spec.network_profile)?;
             let taken = tokio::task::spawn_blocking(move || pool.take())
                 .await
                 .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
-            self.netns =
-                Some(taken.map_err(|e| io_error("making the cell's network namespace", &e))?);
+            let spare = taken.map_err(|e| io_error("making the cell's network namespace", &e))?;
+            self.netns = Some(spare.path);
+            self.veth = spare.veth;
+            if let (Some(veth), Some(net), Some(profile)) =
+                (&self.veth, self.inner.netns.as_ref().and_then(|p| p.net()), profile)
+            {
+                // The low bits of the sequence number are unique among every cell the node has at
+                // once, and never go back to one that just ended.
+                net.assign(veth, self.cell.id.seq() as u32, profile)
+                    .map_err(|e| io_error("putting the cell on its interface", &e))?;
+                nameserver = self.inner.netns.as_ref().and_then(|p| p.nameserver());
+            }
         }
-        Ok(Slot { cgroup, netns: self.netns.clone(), dir, secret })
+        Ok(Slot { cgroup, netns: self.netns.clone(), nameserver, dir, secret })
     }
 
     /// Undoes whatever a failed create got as far as, and records the failure.
@@ -343,6 +359,9 @@ impl Actor {
         self.cgroup =
             self.handle.as_ref().map(|h| h.cgroup.clone()).filter(|c| !c.as_os_str().is_empty());
         self.netns = self.handle.as_ref().and_then(|h| h.netns.clone());
+        if let (Some(ns), Some(pool)) = (&self.netns, &self.inner.netns) {
+            self.veth = pool.recover(ns);
+        }
         let state = self.record.cell_state().unwrap_or(CellState::Failed);
         if state.is_terminal() {
             // Already over and cleaned up. It only stays for others to see how it ended.
@@ -621,7 +640,11 @@ impl Actor {
             });
         }
         if let (Some(ns), Some(pool)) = (self.netns.take(), self.inner.netns.clone()) {
-            // The kernel frees the namespace itself once no mount and no process holds it.
+            if let (Some(veth), Some(net)) = (self.veth.take(), pool.net()) {
+                net.release(&veth);
+            }
+            // The kernel frees the namespace itself once no mount and no process holds it, and
+            // the cell's interface with it.
             tokio::spawn(async move {
                 if let Err(e) = pool.remove(ns).await {
                     eprintln!("hive-comb: removing a cell's network namespace: {e}");

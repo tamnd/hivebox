@@ -22,6 +22,7 @@ bytes.workspace = true
 futures.workspace = true
 hive-cell.workspace = true
 hive-drone.workspace = true
+hive-guard.workspace = true
 hive-nectar.workspace = true
 hive-proto.workspace = true
 hive-rt.workspace = true
