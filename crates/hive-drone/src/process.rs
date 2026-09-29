@@ -116,9 +116,13 @@ pub(crate) async fn start(cfg: &Config, c: Command, stream: &mut Stream) -> Resu
 
     while status.is_none() || stdout.is_some() || stderr.is_some() {
         // Input is only taken when there is room for it, so a command that does not read its
-        // stdin pushes back on the node instead of on its own output.
-        let room = stdin.as_ref().is_none_or(|tx| tx.capacity() > 0);
+        // stdin pushes back on the node instead of on its own output. A closed pipe always has
+        // room, since what is sent to it is dropped.
+        let room = stdin.as_ref().is_none_or(|tx| tx.is_closed() || tx.capacity() > 0);
         tokio::select! {
+            // Without this a command that reads its stdin and writes nothing would sleep here
+            // until its timeout once the channel filled.
+            () = freed(stdin.as_ref()), if !room => {}
             n = read(&mut stdout, &mut out_buf) => {
                 if n == 0 {
                     stdout = None;
@@ -261,6 +265,13 @@ async fn pump<R: AsyncRead + Unpin>(source: Option<R>, ring: Arc<Mutex<Ring>>) {
     let mut buf = vec![0u8; READ_BUF];
     while let Ok(n @ 1..) = source.read(&mut buf).await {
         lock(&ring).push(&buf[..n]);
+    }
+}
+
+// Returns once `tx` has room again, or its receiver is gone.
+async fn freed(tx: Option<&mpsc::Sender<Bytes>>) {
+    if let Some(tx) = tx {
+        let _ = tx.reserve().await;
     }
 }
 

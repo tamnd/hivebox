@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Fixed: a streamed command that reads its stdin and prints nothing no longer stalls until its timeout once 16 chunks of input are waiting. The drone now wakes when the command's pipe has room again. On server3, 100 MB piped into `cat > file` in a cell takes about 1 s where it used to wait out the 10 minute default.
 - The local API in `hive-comb` serves Files: read, write, stat, list, remove and watch go to the drone in the cell, and `Apply` unpacks a tar. Small writes go in one message and bigger ones are streamed, and `ListDirResponse` now says when a listing stopped at the cell's limit.
 
 ## 0.0.7

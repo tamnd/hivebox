@@ -146,6 +146,23 @@ async fn streamed_commands_echo_their_input() {
 }
 
 #[tokio::test]
+async fn streamed_input_flows_to_a_command_that_prints_nothing() {
+    let c = pair().await;
+    let cmd = Command { shell: "cat > /dev/null".into(), timeout_ms: 20_000, ..Command::default() };
+    let (mut input, output) = c.start(&cmd).await.unwrap().split();
+    let t = Instant::now();
+    let writer = tokio::spawn(async move {
+        input.write(&vec![b'y'; 16 << 20]).await.unwrap();
+        input.close_stdin().await.unwrap();
+        input
+    });
+    let r = output.wait().await.unwrap();
+    writer.await.unwrap().finish().await.unwrap();
+    assert_eq!((r.exit_code, r.timed_out), (0, false));
+    assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
+}
+
+#[tokio::test]
 async fn streamed_commands_take_signals() {
     let c = pair().await;
     let mut p = c.start(&Command { shell: "sleep 30".into(), ..Command::default() }).await.unwrap();
