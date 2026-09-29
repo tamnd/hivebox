@@ -752,6 +752,7 @@ dependencies = [
  "hive-nectar",
  "hive-proto",
  "hive-rt",
+ "hive-telemetry",
  "hive-types",
  "hyper-util",
  "prost",

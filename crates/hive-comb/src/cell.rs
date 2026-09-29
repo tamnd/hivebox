@@ -270,6 +270,8 @@ impl Actor {
                 return self.fail_start(e).await;
             }
         };
+        let backend = self.cell.spec.backend;
+        self.inner.metrics.stage(backend, "admit", started.elapsed());
         self.record.secret = secret.to_vec();
         // Not written down: a restart that finds no record for a cell cleans up its directory, which
         // is all a preparing cell has. The first record is the one with the driver's handle in it.
@@ -283,28 +285,51 @@ impl Actor {
             )),
         };
         drop(permit);
+        let m = &self.inner.metrics;
         match result {
-            Ok(()) => Ok(()),
-            Err(e) => self.fail_start(e).await,
+            Ok(()) => {
+                m.stage(backend, "total", started.elapsed());
+                m.created(backend, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                m.created(backend, e.reason.as_str());
+                self.fail_start(e).await
+            }
         }
     }
 
     async fn bring_up(&mut self, secret: [u8; 32]) -> Result<(), Error> {
+        let inner = self.inner.clone();
+        let backend = self.cell.spec.backend;
+        let mut t = Instant::now();
+        let mut lap = |stage: &str| {
+            inner.metrics.stage(backend, stage, t.elapsed());
+            t = Instant::now();
+        };
         let slot = self.slot(secret).await?;
+        lap("pool");
         let rootfs = self.inner.rootfs(&self.cell.spec, &slot).await?;
+        lap("rootfs");
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
         self.handle = Some(handle);
+        lap("prepare");
         self.commit(CellState::Starting, None, "").await?;
+        lap("wal");
         let driver = self.driver.clone();
         let handle = self.handle.as_mut().expect("set just above");
         driver.start(handle).await?;
+        lap("start");
         let client = tokio::select! {
             c = connect(&handle.channel, &secret, None) => c?,
             e = died(&*driver, handle) => return Err(e),
         };
+        lap("handshake");
         self.record.secret = client.established().next_secret.to_vec();
         self.cell.set_drone(Some(client));
-        self.commit(CellState::Running, None, "").await
+        self.commit(CellState::Running, None, "").await?;
+        lap("wal");
+        Ok(())
     }
 
     async fn slot(&mut self, secret: [u8; 32]) -> Result<Slot, Error> {

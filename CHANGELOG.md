@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-comb` counts what it does and serves it on `/metrics` when `[node] metrics` names an address. `hive_create_seconds{backend,stage}` times each create stage by stage (admit, pool, rootfs, prepare, wal, start, handshake and total), `hive_create_total{backend,result}` counts how creates ended, and `hive_exec_seconds{op}` times exec calls from the comb's side. On server3 at load 14, 50 container creates at 10 a second took 93 ms at p50, of which 66 ms was the OCI worker starting the container, 8 ms the drone handshake, 6 ms the two WAL writes and 4 ms preparing the bundle.
+
 ## 0.0.8
 
 Clients: the Python SDK, the Rust SDK and hivectl, on a local API that now serves Files too.

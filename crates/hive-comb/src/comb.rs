@@ -4,6 +4,7 @@ use crate::admit::{self, Admission};
 use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::net::Net;
 use crate::netns::Namespaces;
 use crate::record::{Record, SEQ_KEY, Seq, time};
@@ -78,6 +79,7 @@ pub(crate) struct Inner {
     pub(crate) cgroups: Option<Arc<Cgroups>>,
     pub(crate) netns: Option<Arc<Namespaces>>,
     images: Option<Nectar>,
+    pub(crate) metrics: Metrics,
     shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
     seq: tokio::sync::Mutex<SeqBlock>,
@@ -177,6 +179,7 @@ impl Comb {
             cgroups,
             netns,
             images,
+            metrics: Metrics::default(),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
             // Whatever was reserved before the restart may have been handed out, so the new block
@@ -442,6 +445,12 @@ impl Comb {
     #[must_use]
     pub fn committed(&self) -> (usize, u64) {
         self.inner.admission.committed()
+    }
+
+    /// The comb's metrics, for the `/metrics` endpoint.
+    #[must_use]
+    pub fn metrics(&self) -> &Metrics {
+        &self.inner.metrics
     }
 
     /// What the WAL has done since the comb opened.
