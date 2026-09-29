@@ -263,6 +263,9 @@ impl Actor {
                 return self.fail_start(Error::new(Reason::Internal, "no create permit")).await;
             }
             Err(_) => {
+                self.inner
+                    .metrics
+                    .created(self.cell.spec.backend, Reason::CapacityUnavailable.as_str());
                 let e = Error::new(
                     Reason::CapacityUnavailable,
                     "the node was too busy making other cells to start this one in time",
@@ -272,12 +275,13 @@ impl Actor {
         };
         let backend = self.cell.spec.backend;
         self.inner.metrics.stage(backend, "admit", started.elapsed());
+        // The bring up gets the whole deadline again, so a create that queued behind a burst is
+        // not failed for the time the cells ahead of it took.
         self.record.secret = secret.to_vec();
         // Not written down: a restart that finds no record for a cell cleans up its directory, which
         // is all a preparing cell has. The first record is the one with the driver's handle in it.
         self.show(CellState::Preparing, None, "");
-        let left = deadline.saturating_sub(started.elapsed());
-        let result = match tokio::time::timeout(left, self.bring_up(secret)).await {
+        let result = match tokio::time::timeout(deadline, self.bring_up(secret)).await {
             Ok(r) => r,
             Err(_) => Err(Error::new(
                 Reason::DroneUnreachable,

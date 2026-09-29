@@ -117,6 +117,43 @@ async fn admission_and_bad_requests_leave_nothing_behind() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_waits_its_turn_still_gets_the_whole_deadline() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    fake.start_ms.store(1000, Ordering::Relaxed);
+    let cfg = Config {
+        create_limit: [(Backend::Container, 1)].into(),
+        create_deadline: Duration::from_millis(1500),
+        ..config(&s.0)
+    };
+    let comb = Arc::new(open(cfg, &fake).await);
+    let creates: Vec<_> = (0..3)
+        .map(|i| {
+            let comb = comb.clone();
+            tokio::spawn(async move {
+                // Staggered so they queue in this order.
+                tokio::time::sleep(Duration::from_millis(100 * i)).await;
+                comb.create(request(spec("python"))).await.map(|_| ()).map_err(|e| e.reason)
+            })
+        })
+        .collect();
+    let mut got = Vec::new();
+    for c in creates {
+        got.push(c.await.unwrap());
+    }
+    // The second waits about a second for the first and then takes a second itself, which is
+    // past the deadline counted from the request but inside it counted from its turn. The third
+    // waits about two seconds for its turn, which is past the deadline.
+    assert_eq!(got, [Ok(()), Ok(()), Err(Reason::CapacityUnavailable)]);
+    let text = comb.metrics().registry().render();
+    assert!(
+        text.contains(r#"hive_create_total{backend="container",result="CAPACITY_UNAVAILABLE"} 1"#),
+        "{text}"
+    );
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cell_that_dies_while_starting_fails_and_is_cleaned_up() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());

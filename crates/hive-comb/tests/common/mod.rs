@@ -56,6 +56,8 @@ pub struct Fake {
     pub stops: AtomicU64,
     // A real process per cell, put in the cell's cgroup when it has one.
     pub workers: Mutex<HashMap<CellId, std::process::Child>>,
+    // How long each start takes, in milliseconds, before the cell is up.
+    pub start_ms: AtomicU64,
 }
 
 impl Fake {
@@ -127,6 +129,10 @@ impl CellDriver for Fake {
 
     fn start<'a>(&'a self, h: &'a mut CellHandle) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
+            let slow = self.start_ms.load(Ordering::Relaxed);
+            if slow > 0 {
+                tokio::time::sleep(Duration::from_millis(slow)).await;
+            }
             let (drone, links) = self.with(h.id, |g| (g.drone.clone(), g.links.clone()));
             let Some(drone) = drone else {
                 self.with(h.id, |g| g.end(ExitInfo { code: Some(2), ..ExitInfo::default() }));

@@ -26,7 +26,8 @@ pub struct Config {
     pub max_cells: usize,
     /// Most creates in flight per backend. More wait their turn.
     pub create_limit: BTreeMap<Backend, usize>,
-    /// Longest a create may take, from admission to the guest agent's handshake.
+    /// Longest a create may wait for its turn, and then longest it may take from its turn to the
+    /// guest agent's handshake. A create that waits too long fails with `CAPACITY_UNAVAILABLE`.
     pub create_deadline: Duration,
     /// How long a stop waits for the workload to end on its own before killing it.
     pub stop_grace: Duration,
