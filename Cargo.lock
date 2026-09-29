@@ -862,6 +862,16 @@ version = "0.0.7"
 [[package]]
 name = "hive-sdk"
 version = "0.0.7"
+dependencies = [
+ "bytes",
+ "futures",
+ "hive-proto",
+ "hive-types",
+ "hyper-util",
+ "tokio",
+ "tonic",
+ "tower",
+]
 
 [[package]]
 name = "hive-sim"
@@ -897,6 +907,13 @@ version = "0.0.7"
 [[package]]
 name = "hivectl"
 version = "0.0.7"
+dependencies = [
+ "futures",
+ "hive-proto",
+ "hive-sdk",
+ "hive-types",
+ "tokio",
+]
 
 [[package]]
 name = "home"
