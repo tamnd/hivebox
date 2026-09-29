@@ -14,6 +14,14 @@ use tokio::signal::unix::{SignalKind, signal};
 
 /// Starts `/proc/self/exe` with `args` and stays its parent until it ends.
 pub fn run(args: Vec<OsString>) -> ExitCode {
+    // Every process in the container is a descendant and runs as the same user, so without this
+    // any of them could trace PID 1. The drone does the same for itself when it hardens.
+    if let Err(e) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        eprintln!("hive-drone init: {e}");
+        return ExitCode::FAILURE;
+    }
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {

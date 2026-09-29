@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 /// What was applied, for the drone to report when it starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hardened {
-    /// Whether the kernel enforced the whole Landlock ruleset, only part of it, or none.
+    /// Whether the kernel enforced the whole Landlock ruleset, only part of it, or none, or that
+    /// there was nothing to protect.
     pub landlock: &'static str,
     /// Syscalls on the allowlist, for this architecture.
     pub allowed: usize,
@@ -41,7 +42,12 @@ pub struct Hardened {
 /// A new entry in a directory on the way to a protected path cannot be made, since those
 /// directories are read only too.
 pub fn apply(protect: &[PathBuf]) -> Result<Hardened, String> {
-    let landlock = landlock(protect)?;
+    // With nothing to protect, a ruleset would allow everything and only cost a lookup per open.
+    let landlock = if protect.is_empty() { "not needed" } else { landlock(protect)? };
+    // A process that is not dumpable can only be traced by one with CAP_SYS_PTRACE, which a
+    // cell's root does not get, so nothing the drone runs can read the secret out of its memory.
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| format!("making the drone not dumpable: {e}"))?;
     let arch = TargetArch::try_from(std::env::consts::ARCH)
         .map_err(|e| format!("seccomp on {}: {e:?}", std::env::consts::ARCH))?;
     let allow = allow_filter(arch)?;

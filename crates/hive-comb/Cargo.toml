@@ -33,6 +33,9 @@ tokio-util.workspace = true
 toml = { workspace = true, features = ["parse", "serde"] }
 tonic = { workspace = true, features = ["server"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+hive-cell-oci.workspace = true
+
 [dev-dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
 tonic = { workspace = true, features = ["channel"] }

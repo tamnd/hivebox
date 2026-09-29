@@ -1,7 +1,7 @@
 //! The `hive-drone` binary.
 //!
 //! ```text
-//! hive-drone [--init] --listen unix:/run/hive/drone.sock (--secret-stdin | --secret-file PATH)
+//! hive-drone [--init] --listen (unix:PATH | fd:N) (--secret-stdin | --secret-file PATH)
 //!            [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell /bin/sh]
 //!            [--session-shell /bin/bash] [--workdir /] [--uid N] [--gid N] [--root PATH]...
 //! ```
@@ -10,9 +10,11 @@
 //! it never shows up in the process list or the environment of a command. `--init`, which has to
 //! come first, runs the drone under a small PID 1 that waits on orphans. `--harden` applies
 //! Landlock and seccomp before serving, and makes each `--protect` path read only. `--env` adds
-//! to the environment every command starts with.
+//! to the environment every command starts with. `--listen fd:N` takes a socket that is already
+//! listening from its parent, which is how a container gets one bound outside it.
 
-#![forbid(unsafe_code)]
+// Unsafe is denied everywhere but the one call that takes the inherited socket in `bind`.
+#![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 use hive_drone::{Config, Drone};
@@ -22,7 +24,7 @@ use std::io::Read;
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: hive-drone [--init] --listen unix:PATH (--secret-stdin | --secret-file PATH) [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
+const USAGE: &str = "usage: hive-drone [--init] --listen (unix:PATH | fd:N) (--secret-stdin | --secret-file PATH) [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
 
 #[cfg(target_os = "linux")]
 struct Args {
@@ -171,15 +173,34 @@ fn read_secret(file: Option<&std::path::Path>) -> std::io::Result<[u8; 32]> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn bind(listen: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
-    let Some(path) = listen.strip_prefix("unix:") else {
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    let listener = if let Some(fd) = listen.strip_prefix("fd:") {
+        let fd: RawFd =
+            fd.parse().ok().filter(|n| *n > 2).ok_or_else(|| {
+                std::io::Error::other(format!("{listen} is not an inherited socket"))
+            })?;
+        rustix::io::fcntl_getfd(
+            // SAFETY: only borrowed here, to check that the descriptor is open at all.
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+        )
+        .map_err(|e| std::io::Error::other(format!("{listen}: {e}")))?;
+        // SAFETY: the parent passed this descriptor down for the drone alone, it is open as the
+        // check above found, and nothing else in this process has taken it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // Commands the drone starts must not get the socket too.
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        std::os::unix::net::UnixListener::from(fd)
+    } else if let Some(path) = listen.strip_prefix("unix:") {
+        // A socket left by an earlier run would make bind fail.
+        let _ = std::fs::remove_file(path);
+        std::os::unix::net::UnixListener::bind(path)?
+    } else {
         return Err(std::io::Error::other(format!(
-            "cannot listen on {listen}, only unix:PATH is supported so far"
+            "cannot listen on {listen}, only unix:PATH and fd:N are supported"
         )));
     };
-    // A socket left by an earlier run would make bind fail.
-    let _ = std::fs::remove_file(path);
-    let listener = std::os::unix::net::UnixListener::bind(path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }

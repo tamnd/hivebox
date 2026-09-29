@@ -309,3 +309,47 @@ pub fn inode(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).unwrap().ino()
 }
+
+/// A cgroup tree of the test's own, or `None` when not running as root on cgroup v2.
+pub struct Tree(pub PathBuf);
+
+impl Tree {
+    pub fn new() -> Option<Self> {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let uid = status.lines().find_map(|l| l.strip_prefix("Uid:")).unwrap();
+        if uid.split_whitespace().nth(1) != Some("0")
+            || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+        {
+            eprintln!("skipped: needs root and cgroup v2");
+            return None;
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let name = format!("hive-comb-{}-{n}.slice", std::process::id());
+        Some(Self(Path::new("/sys/fs/cgroup").join(name)))
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        fn clear(dir: &Path) {
+            // A refill batch still running on a blocking thread can add leaves after they were
+            // listed, so they are listed again on every try.
+            for _ in 0..1000 {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        if e.file_type().is_ok_and(|t| t.is_dir()) {
+                            clear(&e.path());
+                        }
+                    }
+                }
+                let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+                if std::fs::remove_dir(dir).is_ok() || !dir.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        clear(&self.0);
+    }
+}
