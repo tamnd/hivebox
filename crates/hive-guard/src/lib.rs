@@ -16,12 +16,16 @@
 //!
 //! [`wire`] gives a network namespace its interface, a veth pair with the cell's address, routes
 //! and neighbours set on both ends, through the small rtnetlink client in [`link`].
+//!
+//! [`dns`] is the proxy on [`DNS_VIP`]. It answers only the names a profile lists, and lets the
+//! cell reach the addresses in each answer.
 
 #![deny(unsafe_code)]
 
 use std::fmt;
 use std::net::Ipv4Addr;
 
+pub mod dns;
 #[cfg(target_os = "linux")]
 mod guard;
 #[cfg(target_os = "linux")]
@@ -32,7 +36,7 @@ mod maps;
 pub mod wire;
 
 #[cfg(target_os = "linux")]
-pub use guard::Guard;
+pub use guard::{DnsAllow, Guard};
 
 /// Where the maps and links are pinned. Each layout of the maps gets its own directory, so a
 /// newer program never reads a map made for an older one.

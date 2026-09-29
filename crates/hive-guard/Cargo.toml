@@ -16,6 +16,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+hickory-proto.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 aya.workspace = true
 rustix = { workspace = true, features = ["net", "thread", "time"] }

@@ -2,14 +2,21 @@
 //! pair with `hive-guard` on the host end, an address from the node's range and a default route to
 //! the gateway. What a cell may reach is one entry in the guard's maps, written when the cell is
 //! made, so a create costs a map write and no netlink.
+//!
+//! The DNS proxy runs here too, on the guard's DNS address, and answers each cell by the profile
+//! it was made with.
 
+use hive_guard::dns::{self, Cells, Policy, Proxy, Settings};
 use hive_guard::link::Netlink;
 use hive_guard::wire::{self, Veth};
-use hive_guard::{CellNet, DNS_VIP, Guard, Profile};
+use hive_guard::{CellNet, DNS_VIP, DnsAllow, Guard, Profile, Rule};
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::Duration;
 
 use crate::config::Network;
 
@@ -17,7 +24,13 @@ use crate::config::Network;
 /// its own RTNL lock for each of them anyway.
 pub(crate) struct Net {
     state: Mutex<State>,
+    book: Arc<Book>,
+    profiles: HashMap<String, Profile>,
+    proxy: Arc<Proxy>,
 }
+
+/// The first id a profile from the config gets. The ones below are for built-in profiles.
+const FIRST_CUSTOM: u32 = 16;
 
 struct State {
     guard: Guard,
@@ -32,16 +45,76 @@ impl std::fmt::Debug for Net {
 }
 
 impl Net {
-    /// Loads the guard, brings up the VIPs and writes the built-in profiles.
+    /// Loads the guard, brings up the VIPs and writes the profiles, built in and from the config.
+    /// The profiles from the config get ids in the order of their names, from 16 on, and reach
+    /// the DNS proxy and what it resolves for them.
     pub(crate) fn open(cfg: &Network) -> io::Result<Self> {
         let ips = Ips::new(cfg.cells.0, cfg.cells.1)?;
         let mut guard = Guard::open(&cfg.pin_dir)?;
+        let mut profiles = HashMap::new();
+        let mut policies = HashMap::new();
         for p in [Profile::NONE, Profile::MIRRORS] {
             guard.set_profile(p, &p.builtin_rules())?;
         }
+        profiles.insert("none".to_string(), Profile::NONE);
+        profiles.insert("mirrors".to_string(), Profile::MIRRORS);
+        for (id, (name, domains)) in (FIRST_CUSTOM..).zip(&cfg.profiles) {
+            let p = Profile(id);
+            let rules: Vec<Rule> = Profile::NONE
+                .builtin_rules()
+                .into_iter()
+                .map(|r| Rule { profile: p, ..r })
+                .collect();
+            guard.set_profile(p, &rules)?;
+            let policy = Policy::new(domains).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("profile {name}: {e}"))
+            })?;
+            profiles.insert(name.clone(), p);
+            policies.insert(p, policy);
+        }
+        let mut upstream = cfg.upstream.clone();
+        if upstream.is_empty() {
+            upstream = dns::upstreams(&std::fs::read_to_string("/etc/resolv.conf")?);
+        }
+        if upstream.is_empty() {
+            eprintln!("hive-comb: no resolvers to ask, so every lookup a cell makes fails");
+        }
+        let book =
+            Arc::new(Book { cells: RwLock::default(), allow: Mutex::new(guard.dns_allow()?) });
+        let settings = Settings { upstream, policies, ..Settings::default() };
+        let proxy = Arc::new(Proxy::new(settings, book.clone()));
         let mut nl = Netlink::open()?;
         wire::vips(&mut nl)?;
-        Ok(Self { state: Mutex::new(State { guard, nl, ips }) })
+        Ok(Self { state: Mutex::new(State { guard, nl, ips }), book, profiles, proxy })
+    }
+
+    /// The DNS proxy on the guard's DNS address, to run until the comb stops. The comb before a
+    /// restart can hold the port for a moment while its last answers go out, so binding is tried
+    /// for a few seconds before the proxy gives up and says so.
+    pub(crate) fn dns(&self) -> impl Future<Output = ()> + use<> {
+        let proxy = self.proxy.clone();
+        async move {
+            let mut tries = 0;
+            let sock = loop {
+                match tokio::net::UdpSocket::bind((DNS_VIP, 53)).await {
+                    Ok(sock) => break sock,
+                    Err(e) if e.kind() == io::ErrorKind::AddrInUse && tries < 50 => {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("hive-comb: the DNS proxy did not start: {e}");
+                        return;
+                    }
+                }
+            };
+            proxy.serve(sock).await;
+        }
+    }
+
+    /// The profile a spec's `network_profile` names.
+    pub(crate) fn profile(&self, name: &str) -> Option<Profile> {
+        self.profiles.get(name).copied()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -75,12 +148,15 @@ impl Net {
     /// Puts a cell on its interface: from now on it reaches what `profile` allows.
     pub(crate) fn assign(&self, veth: &Veth, idx: u32, profile: Profile) -> io::Result<()> {
         let cell = CellNet { idx, ip: veth.ip, mac: Some(veth.mac), profile };
-        self.state().guard.set_cell(veth.ifindex, &cell)
+        self.state().guard.set_cell(veth.ifindex, &cell)?;
+        self.book.set(veth.ip, Some((idx, profile)));
+        Ok(())
     }
 
     /// Takes the program and the cell off an interface and frees its address. The interface
     /// itself goes with its namespace.
     pub(crate) fn release(&self, veth: &Veth) {
+        self.book.set(veth.ip, None);
         let mut s = self.state();
         let _ = s.guard.remove_cell(veth.ifindex);
         let _ = s.guard.detach(veth.ifindex);
@@ -95,6 +171,7 @@ impl Net {
         let mut s = self.state();
         let cell = s.guard.cell(ifindex).ok()??;
         s.ips.claim(cell.ip);
+        self.book.set(cell.ip, Some((cell.idx, cell.profile)));
         Some(Veth { host, ifindex, ip: cell.ip, mac: cell.mac.unwrap_or(wire::macs(n).1) })
     }
 
@@ -106,6 +183,9 @@ impl Net {
             && let Ok(ifindex) = i.trim().parse()
         {
             let mut s = self.state();
+            if let Ok(Some(cell)) = s.guard.cell(ifindex) {
+                self.book.set(cell.ip, None);
+            }
             let _ = s.guard.remove_cell(ifindex);
             let _ = s.guard.detach(ifindex);
         }
@@ -114,6 +194,34 @@ impl Net {
     /// Where cells send DNS queries.
     pub(crate) fn nameserver() -> Ipv4Addr {
         DNS_VIP
+    }
+}
+
+/// Which cell has which address, for the DNS proxy, which reads it on every query and so has it
+/// apart from the lock wiring holds.
+struct Book {
+    cells: RwLock<HashMap<Ipv4Addr, (u32, Profile)>>,
+    allow: Mutex<DnsAllow>,
+}
+
+impl Book {
+    fn set(&self, ip: Ipv4Addr, cell: Option<(u32, Profile)>) {
+        let mut cells = self.cells.write().unwrap_or_else(PoisonError::into_inner);
+        match cell {
+            Some(c) => cells.insert(ip, c),
+            None => cells.remove(&ip),
+        };
+    }
+}
+
+impl Cells for Book {
+    fn cell(&self, ip: Ipv4Addr) -> Option<(u32, Profile)> {
+        self.cells.read().unwrap_or_else(PoisonError::into_inner).get(&ip).copied()
+    }
+
+    fn allow(&self, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
+        let mut allow = self.allow.lock().unwrap_or_else(PoisonError::into_inner);
+        ips.iter().try_for_each(|&ip| allow.allow(idx, ip, ttl))
     }
 }
 

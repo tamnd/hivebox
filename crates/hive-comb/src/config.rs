@@ -1,7 +1,7 @@
 use hive_types::Backend;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -62,6 +62,12 @@ pub struct Network {
     pub cells: (Ipv4Addr, u8),
     /// Where the guard pins its maps and links, under a bpf filesystem.
     pub pin_dir: PathBuf,
+    /// The resolvers the DNS proxy asks. Empty means the ones in the host's `/etc/resolv.conf`.
+    pub upstream: Vec<SocketAddr>,
+    /// Profiles of the node's own, by name, each with the names its cells may look up, like
+    /// `pypi.org` or `*.pythonhosted.org`. A cell reaches the proxy and whatever it resolved for
+    /// it, and nothing else.
+    pub profiles: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Network {
@@ -70,6 +76,8 @@ impl Default for Network {
             guard: true,
             cells: (Ipv4Addr::new(100, 64, 0, 0), 20),
             pin_dir: PathBuf::from("/sys/fs/bpf/hive/guard-v1"),
+            upstream: Vec::new(),
+            profiles: BTreeMap::new(),
         }
     }
 }
@@ -190,6 +198,10 @@ impl Config {
     ///
     /// [network]
     /// cells = "100.64.16.0/20"
+    /// upstream = ["1.1.1.1", "8.8.8.8:53"]
+    ///
+    /// [network.profiles.pypi]
+    /// domains = ["pypi.org", "*.pythonhosted.org"]
     ///
     /// [images]
     /// store = "/srv/hivebox/store"
@@ -274,6 +286,20 @@ impl Config {
                     format!("network.cells = {text:?} is not a range like 100.64.0.0/20")
                 })?;
         }
+        for text in w.upstream {
+            let addr = text.parse().or_else(|_| text.parse().map(|ip| SocketAddr::new(ip, 53)));
+            c.network.upstream.push(addr.map_err(|_| {
+                format!("network.upstream has {text:?}, which is not an address like 1.1.1.1")
+            })?);
+        }
+        for (name, p) in w.profiles {
+            if hive_guard::Profile::builtin(&name).is_some() {
+                return Err(format!("network.profiles.{name} is built in and cannot be changed"));
+            }
+            hive_guard::dns::Policy::new(&p.domains)
+                .map_err(|e| format!("network.profiles.{name}.domains: {e}"))?;
+            c.network.profiles.insert(name, p.domains);
+        }
         if c.node == 0 {
             return Err("node.node must not be 0".into());
         }
@@ -319,6 +345,14 @@ struct NetworkFile {
     guard: Option<bool>,
     cells: Option<String>,
     pin_dir: Option<PathBuf>,
+    upstream: Vec<String>,
+    profiles: BTreeMap<String, ProfileFile>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProfileFile {
+    domains: Vec<String>,
 }
 
 fn cidr(text: &str) -> Option<(Ipv4Addr, u8)> {
@@ -427,6 +461,10 @@ mod tests {
 
             [network]
             cells = "100.64.16.0/20"
+            upstream = ["1.1.1.1", "[2606:4700::1111]:53"]
+
+            [network.profiles.pypi]
+            domains = ["pypi.org", "*.pythonhosted.org"]
             "#,
         )
         .unwrap();
@@ -450,6 +488,11 @@ mod tests {
         assert_eq!(c.images.layers_dir, Images::default().layers_dir);
         assert_eq!(c.network.cells, (Ipv4Addr::new(100, 64, 16, 0), 20));
         assert!(c.network.guard);
+        assert_eq!(
+            c.network.upstream,
+            ["1.1.1.1:53".parse().unwrap(), "[2606:4700::1111]:53".parse().unwrap()]
+        );
+        assert_eq!(c.network.profiles["pypi"], ["pypi.org", "*.pythonhosted.org"]);
     }
 
     #[test]
@@ -461,6 +504,10 @@ mod tests {
         assert!(Config::from_toml("[node]\nnode = 0").is_err());
         assert!(Config::from_toml("[network]\ncells = \"100.64.0.0\"").is_err());
         assert!(Config::from_toml("[network]\ncells = \"100.64.0.0/31\"").is_err());
+        assert!(Config::from_toml("[network]\nupstream = [\"dns.google\"]").is_err());
+        assert!(Config::from_toml("[network.profiles.none]\ndomains = [\"a.com\"]").is_err());
+        assert!(Config::from_toml("[network.profiles.x]\ndomains = [\"a.*.com\"]").is_err());
+        assert!(Config::from_toml("[network.profiles.x]\ndomain = [\"a.com\"]").is_err());
         assert!(Config::from_toml("[backends.container]\nworkers = 0").is_err());
         assert!(Config::from_toml("[backends.container]\nuid_base = 4294967295").is_err());
     }
