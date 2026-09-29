@@ -1,4 +1,5 @@
 use hive_types::Backend;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,6 +41,8 @@ pub struct Config {
     pub netns_dir: Option<PathBuf>,
     /// Network namespaces kept ready, so a create does not wait on making one.
     pub netns_depth: usize,
+    /// Where the local API listens.
+    pub api_socket: PathBuf,
 }
 
 impl Default for Config {
@@ -65,6 +68,210 @@ impl Default for Config {
             cgroup_depth: 256,
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
             netns_depth: 400,
+            api_socket: PathBuf::from("/run/hivebox/comb.sock"),
         }
+    }
+}
+
+impl Config {
+    /// Reads a config file. Anything the file leaves out keeps its default, and a key the comb
+    /// does not know is an error, so a typo never passes for a setting.
+    ///
+    /// ```toml
+    /// [node]
+    /// data_dir = "/var/lib/hivebox"
+    /// unit = 1
+    /// node = 7
+    /// socket = "/run/hivebox/comb.sock"
+    /// reserved_mem_mib = 4096
+    ///
+    /// [pools]
+    /// cgroup_root = "/sys/fs/cgroup/hive.slice"
+    /// netns_depth = 400
+    ///
+    /// [lifecycle]
+    /// create_deadline = "30s"
+    /// keep_ended = "10m"
+    ///
+    /// [backends.create_limit]
+    /// container = 128
+    /// ```
+    ///
+    /// An empty `cgroup_root` or `netns_dir` turns that pool off.
+    ///
+    /// # Errors
+    ///
+    /// The file is not TOML, or holds a key or a value the comb does not take.
+    pub fn from_toml(text: &str) -> Result<Self, String> {
+        let file: File = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut c = Self::default();
+        let n = file.node;
+        set(&mut c.data_dir, n.data_dir);
+        set(&mut c.unit, n.unit);
+        set(&mut c.node, n.node);
+        set(&mut c.epoch, n.epoch);
+        set(&mut c.api_socket, n.socket);
+        if n.mem_mib.is_some() {
+            c.mem_mib = n.mem_mib;
+        }
+        set(&mut c.reserved_mem_mib, n.reserved_mem_mib);
+        set(&mut c.max_cells, n.max_cells);
+        let p = file.pools;
+        if let Some(root) = p.cgroup_root {
+            c.cgroup_root = (!root.as_os_str().is_empty()).then_some(root);
+        }
+        if let Some(dir) = p.netns_dir {
+            c.netns_dir = (!dir.as_os_str().is_empty()).then_some(dir);
+        }
+        set(&mut c.cgroup_depth, p.cgroup_depth);
+        set(&mut c.netns_depth, p.netns_depth);
+        let l = file.lifecycle;
+        for (field, value, name) in [
+            (&mut c.create_deadline, l.create_deadline, "create_deadline"),
+            (&mut c.stop_grace, l.stop_grace, "stop_grace"),
+            (&mut c.keep_ended, l.keep_ended, "keep_ended"),
+        ] {
+            if let Some(v) = value {
+                *field = duration(&v).ok_or_else(|| {
+                    format!("lifecycle.{name} = {v:?} is not a duration like 500ms, 30s or 10m")
+                })?;
+            }
+        }
+        for (name, limit) in file.backends.create_limit {
+            let backend = Backend::ALL
+                .into_iter()
+                .find(|b| b.as_str() == name && *b != Backend::Auto)
+                .ok_or_else(|| format!("backends.create_limit has no backend named {name:?}"))?;
+            c.create_limit.insert(backend, limit);
+        }
+        if c.node == 0 {
+            return Err("node.node must not be 0".into());
+        }
+        Ok(c)
+    }
+}
+
+fn set<T>(field: &mut T, value: Option<T>) {
+    if let Some(v) = value {
+        *field = v;
+    }
+}
+
+/// A duration such as `250ms`, `30s`, `10m` or `2h`.
+fn duration(s: &str) -> Option<Duration> {
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let (n, unit) = s.split_at(split);
+    let n: u64 = n.parse().ok()?;
+    let secs = |k: u64| n.checked_mul(k).map(Duration::from_secs);
+    match unit {
+        "ms" => Some(Duration::from_millis(n)),
+        "s" => secs(1),
+        "m" => secs(60),
+        "h" => secs(3600),
+        _ => None,
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct File {
+    node: NodeFile,
+    pools: PoolsFile,
+    lifecycle: LifecycleFile,
+    backends: BackendsFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NodeFile {
+    data_dir: Option<PathBuf>,
+    unit: Option<u8>,
+    node: Option<u16>,
+    epoch: Option<u16>,
+    socket: Option<PathBuf>,
+    mem_mib: Option<u64>,
+    reserved_mem_mib: Option<u64>,
+    max_cells: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PoolsFile {
+    cgroup_root: Option<PathBuf>,
+    cgroup_depth: Option<usize>,
+    netns_dir: Option<PathBuf>,
+    netns_depth: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LifecycleFile {
+    create_deadline: Option<String>,
+    stop_grace: Option<String>,
+    keep_ended: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BackendsFile {
+    create_limit: BTreeMap<String, usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_file_is_the_defaults() {
+        let c = Config::from_toml("").unwrap();
+        assert_eq!(c.data_dir, Config::default().data_dir);
+        assert_eq!(c.netns_depth, 400);
+    }
+
+    #[test]
+    fn a_file_sets_what_it_names() {
+        let c = Config::from_toml(
+            r#"
+            [node]
+            data_dir = "/tmp/hb"
+            node = 7
+            socket = "/tmp/hb/comb.sock"
+            mem_mib = 8192
+
+            [pools]
+            cgroup_root = ""
+            netns_depth = 16
+
+            [lifecycle]
+            create_deadline = "5s"
+            stop_grace = "250ms"
+            keep_ended = "10m"
+
+            [backends.create_limit]
+            container = 8
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.data_dir, PathBuf::from("/tmp/hb"));
+        assert_eq!(c.node, 7);
+        assert_eq!(c.api_socket, PathBuf::from("/tmp/hb/comb.sock"));
+        assert_eq!(c.mem_mib, Some(8192));
+        assert_eq!(c.cgroup_root, None);
+        assert_eq!(c.netns_dir, Config::default().netns_dir);
+        assert_eq!(c.netns_depth, 16);
+        assert_eq!(c.create_deadline, Duration::from_secs(5));
+        assert_eq!(c.stop_grace, Duration::from_millis(250));
+        assert_eq!(c.keep_ended, Duration::from_secs(600));
+        assert_eq!(c.create_limit[&Backend::Container], 8);
+        assert_eq!(c.create_limit[&Backend::Microvm], 64);
+    }
+
+    #[test]
+    fn mistakes_are_errors() {
+        assert!(Config::from_toml("[node]\ndata_dri = \"/x\"").unwrap_err().contains("data_dri"));
+        assert!(Config::from_toml("[lifecycle]\nstop_grace = \"10\"").is_err());
+        assert!(Config::from_toml("[lifecycle]\nstop_grace = \"1d\"").is_err());
+        assert!(Config::from_toml("[backends.create_limit]\nauto = 1").is_err());
+        assert!(Config::from_toml("[node]\nnode = 0").is_err());
     }
 }

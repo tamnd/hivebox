@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod admit;
+pub mod api;
 mod cell;
 mod cgroups;
 mod comb;
