@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.6
+
+Images as EROFS layers with hive-nectar, and container cells running on them.
+
 - `hive-nectar` v0 stores images as EROFS layers. `PosixStore` keeps blobs by BLAKE3 name on a local or shared filesystem, `oci::Importer` turns an OCI image layout into one metadata blob and one data blob per layer by streaming each layer into `mkfs.erofs` through a pipe, and `Cache` is the node's L1 that fetches whole blobs in 256 KiB chunks, resumes after a crash, checks every blob it fetches and evicts the least recently used. Layers build the same bytes every time, so the same layer is stored once. On server3, python:3.12-slim imports in 19 to 41 s depending on how busy the disk is, with 0.7 MiB of metadata for 122.5 MiB of data, and an import of an image already there takes about 25 ms.
 - `hive-comb` runs container cells on `hive-nectar` images. A file in `data_dir/images` holding an image id, which is what `hive-nectar import-oci` prints, names an image in the store set by `[images]` in the config. The first cell to use it fetches its blobs into the node cache and mounts each layer once: EROFS through the new mount API on read only loop devices with direct I/O and autoclear, idmapped to the cells' id range, so layers keep the owners the image has. Mounts left by an earlier run are detached at start, and cells still running on them keep them. On server3 at load about 30, with python:3.12-slim, a create through the comb takes 174 ms at p50 against 164 ms on an unpacked image, 64 at once are all running in 2.64 s against 2.48 s, mounting the 4 layers from a warm cache takes 198 ms and later cells pay nothing for it.
 
