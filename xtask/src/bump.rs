@@ -6,7 +6,13 @@
 
 use std::path::Path;
 
-/// Rewrites `Cargo.toml` and `CHANGELOG.md` under `root` for `version`.
+/// The Python SDK's files that carry the version, and the line in each that starts with it.
+const PYTHON: [(&str, &str); 2] = [
+    ("sdk/python/pyproject.toml", "version = \""),
+    ("sdk/python/hivebox/__init__.py", "__version__ = \""),
+];
+
+/// Rewrites `Cargo.toml`, `CHANGELOG.md` and the Python SDK's version under `root` for `version`.
 pub(crate) fn run(root: &Path, version: &str) -> Result<(), String> {
     if !is_version(version) {
         return Err(format!("{version} is not a version, expected something like 0.1.2"));
@@ -22,6 +28,10 @@ pub(crate) fn run(root: &Path, version: &str) -> Result<(), String> {
     let changelog = changelog_for(&read(&changelog_path)?, version)?;
     write(&manifest_path, &manifest_for(&manifest, &old, version))?;
     write(&changelog_path, &changelog)?;
+    for (file, prefix) in PYTHON {
+        let path = root.join(file);
+        write(&path, &line_for(&read(&path)?, prefix, &old, version))?;
+    }
 
     println!("{old} -> {version}");
     println!("now run `cargo update --workspace` so the lockfile agrees, then commit");
@@ -51,6 +61,21 @@ fn manifest_for(manifest: &str, old: &str, new: &str) -> String {
             replaced_package = true;
         } else if line.contains("path = \"crates/") {
             out.push_str(&line.replacen(&format!("\"={old}\""), &format!("\"={new}\""), 1));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Moves the first line that starts with `prefix` from `old` to `new`.
+fn line_for(text: &str, prefix: &str, old: &str, new: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut done = false;
+    for line in text.split_inclusive('\n') {
+        if !done && line.starts_with(prefix) {
+            out.push_str(&line.replacen(old, new, 1));
+            done = true;
         } else {
             out.push_str(line);
         }
@@ -93,6 +118,15 @@ mod tests {
         assert!(out.contains("\"=0.0.1\", path = \"crates/hive-types\""));
         assert!(out.contains("tokio = { version = \"0.0.0\" }"));
         assert_eq!(current(&out).as_deref(), Some("0.0.1"));
+    }
+
+    #[test]
+    fn the_python_version_moves_and_nothing_else() {
+        let py = "[project]\nname = \"hivebox\"\nversion = \"0.0.1\"\ndependencies = [\"grpcio>=0.0.1\"]\n";
+        let out = line_for(py, PYTHON[0].1, "0.0.1", "0.0.2");
+        assert!(out.contains("version = \"0.0.2\"\n") && out.contains("grpcio>=0.0.1"));
+        let init = "__version__ = \"0.0.1\"\n";
+        assert_eq!(line_for(init, PYTHON[1].1, "0.0.1", "0.0.2"), "__version__ = \"0.0.2\"\n");
     }
 
     #[test]
