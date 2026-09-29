@@ -17,11 +17,11 @@ pub(crate) fn run(root: &Path, version: &str) -> Result<(), String> {
     if old == version {
         return Err(format!("the workspace is already at {version}"));
     }
-    write(&manifest_path, &manifest_for(&manifest, &old, version))?;
-
+    // The changelog is checked first, so a release with nothing in it changes neither file.
     let changelog_path = root.join("CHANGELOG.md");
-    let changelog = read(&changelog_path)?;
-    write(&changelog_path, &changelog_for(&changelog, version)?)?;
+    let changelog = changelog_for(&read(&changelog_path)?, version)?;
+    write(&manifest_path, &manifest_for(&manifest, &old, version))?;
+    write(&changelog_path, &changelog)?;
 
     println!("{old} -> {version}");
     println!("now run `cargo update --workspace` so the lockfile agrees, then commit");
