@@ -4,6 +4,15 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.10
+
+Fixes the SWE-bench Verified run and the 1,000 cell test found, and timing for stops.
+
+- `hive-oci import` no longer refuses a file owned by an id past the cell's range. That owner becomes nobody, which is what an idmapped mount shows. The matplotlib images in SWE-bench Verified have files owned by uid 197609, so none of those tasks could start before.
+- Every container cell gets its own writable `/etc/hosts` and `/etc/hostname`. Images made with docker ship an empty hosts file, so `localhost` did not resolve in a cell, and test suites that bind to it failed before running a test. On server3, matplotlib-13989 failed this way before the fix. After it, its 1.74 GB image in 10 layers imported in 1000 s at load 40 to 60, and the gold patch resolved in a 280 s eval.
+- Fixed: a node could not hold 1,000 cells, and a stop that failed could leave the cell running. The comb ran with a soft limit of 1024 open files and holds a connection to every running cell, so on server3 it ran out at 966 cells, and then writing `cgroup.kill` failed the same way and about 1,070 cells kept running with no record left. The comb now raises the soft limit to the hard one at startup, and retries a cgroup removal that fails for about 100 s before leaving it for the next comb. On server3 at load 57 to 75, 1,000 cells with 512 MiB each ran at once, all answered, and all stopped with nothing left running.
+- `hive_stop_seconds{backend,stage}` times each stop by stage (wal, driver, release and total), and the unmount and delete of a stopped cell now run on the blocking pool instead of the runtime's threads. A single stop on server3 takes 104 ms at p50 over 20 stops. A bulk stop still gets through about 30 cells a second.
+
 ## 0.0.9
 
 What the first node benchmarks turned up: create stage metrics, a fairer create deadline, and images imported layer by layer.
