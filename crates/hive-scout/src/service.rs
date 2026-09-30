@@ -1,5 +1,5 @@
-//! Scout as a service: combs stream reports in over `hivebox.internal.v1.Scout`, and a timer
-//! publishes snapshots.
+//! Scout as a service: combs stream reports in over `hivebox.internal.v1.Scout`, a timer
+//! publishes snapshots, and watchers follow them as deltas.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{Applied, NodeReport, Scout, Snapshot};
+use crate::{Applied, NodeReport, Scout, Snapshot, wire};
 
 /// How often snapshots go out when no report asks for one sooner.
 pub const TICK: Duration = Duration::from_millis(100);
@@ -48,6 +48,7 @@ struct Metrics {
     mem_admit: GaugeVec,
     mem_committed: GaugeVec,
     version: GaugeVec,
+    watchers: GaugeVec,
 }
 
 impl Default for Service {
@@ -82,6 +83,11 @@ impl Service {
             version: registry.gauge(
                 "hive_scout_snapshot_version",
                 "The last snapshot's version.",
+                &[],
+            ),
+            watchers: registry.gauge(
+                "hive_scout_watchers",
+                "Streams following the cluster through Watch.",
                 &[],
             ),
             registry,
@@ -208,5 +214,41 @@ impl ScoutRpc for Service {
         });
         let closing = self.inner.closing.clone().cancelled_owned();
         Ok(Response::new(acks.take_until(closing).boxed()))
+    }
+
+    type WatchStream = BoxStream<'static, Result<pb::ClusterDelta, Status>>;
+
+    /// The whole cluster first, then after each snapshot only the nodes that changed. A watcher
+    /// that falls behind skips the snapshots it missed, and the next delta covers them.
+    async fn watch(
+        &self,
+        _req: Request<pb::WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let rx = self.subscribe();
+        let watchers = self.inner.metrics.watchers.with(&[]);
+        watchers.add(1);
+        let guard = Watching(watchers);
+        let deltas = futures::stream::unfold(
+            (rx, None::<Arc<Snapshot>>, guard),
+            |(mut rx, prev, guard)| async move {
+                if prev.is_some() && rx.changed().await.is_err() {
+                    return None;
+                }
+                let snap = rx.borrow_and_update().clone();
+                let delta = wire::delta(prev.as_deref(), &snap);
+                Some((Ok(delta), (rx, Some(snap), guard)))
+            },
+        );
+        let closing = self.inner.closing.clone().cancelled_owned();
+        Ok(Response::new(deltas.take_until(closing).boxed()))
+    }
+}
+
+/// Counts a watcher until its stream is dropped.
+struct Watching(hive_telemetry::Gauge);
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        self.0.add(-1);
     }
 }

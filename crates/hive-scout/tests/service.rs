@@ -143,3 +143,88 @@ async fn shutting_down_ends_streams_that_would_report_forever() {
     assert!(end.is_none_or(|r| r.is_err()), "the stream ended");
     drop(tx);
 }
+
+#[tokio::test]
+async fn a_follower_keeps_up_with_the_cluster_and_comes_back_after_a_restart() {
+    let (service, addr, stop, server) = serve_until().await;
+    let follow_stop = CancellationToken::new();
+    let mut rx = hive_scout::follow(addr.clone(), follow_stop.clone());
+    let mut client = client(addr.clone()).await;
+    let digest = *blake3::hash(b"layer").as_bytes();
+    let mut bloom = LayerBloom::default();
+    bloom.insert(&digest);
+    let sent = vec![
+        pb::NodeReport::from(&NodeReport { layers: Some(bloom), ..report(4, 1) }),
+        pb::NodeReport::from(&report(5, 1)),
+    ];
+    let _ = client.report(futures::stream::iter(sent)).await.unwrap().into_inner().count().await;
+    let snap = rx.wait_for(|s| s.view.nodes.len() == 2).await.unwrap().clone();
+    assert!(snap.view.nodes[0].layers.contains(&digest));
+    assert_eq!(snap.addr(5).map(|a| &**a), Some("unix:/run/hivebox/comb.sock"));
+    assert!(service.registry().render().contains("hive_scout_watchers 1"));
+
+    // Only node 5 changes, and the follower still has node 4's filter.
+    let more = vec![pb::NodeReport::from(&NodeReport { cells: 20, ..report(5, 2) })];
+    let _ = client.report(futures::stream::iter(more)).await.unwrap().into_inner().count().await;
+    let snap = rx.wait_for(|s| s.totals.cells == 28).await.unwrap().clone();
+    assert!(snap.view.nodes[0].layers.contains(&digest));
+    assert_eq!(snap.version, service.snapshot().version);
+
+    // A new scout on the same address starts empty, and the follower picks it up.
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    let port = addr.rsplit(':').next().unwrap();
+    let service = Service::new();
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
+    let incoming = futures::stream::unfold(listener, |l| async move {
+        Some((l.accept().await.map(|(s, _)| s), l))
+    });
+    let server = tonic::transport::Server::builder().add_service(service.server());
+    tokio::spawn(server.serve_with_incoming(incoming));
+    let stop = CancellationToken::new();
+    tokio::spawn(service.clone().run(stop.clone()));
+    let mut client =
+        ScoutClient::new(tonic::transport::Endpoint::from_shared(addr).unwrap().connect_lazy());
+    let sent = vec![pb::NodeReport::from(&report(9, 1))];
+    let _ = client.report(futures::stream::iter(sent)).await.unwrap().into_inner().count().await;
+    let snap = tokio::time::timeout(
+        Duration::from_secs(10),
+        rx.wait_for(|s| s.view.nodes.len() == 1 && s.view.nodes[0].node == 9),
+    )
+    .await
+    .expect("the follower reconnected")
+    .unwrap()
+    .clone();
+    assert_eq!(snap.totals.cells, 8);
+    follow_stop.cancel();
+    stop.cancel();
+}
+
+#[tokio::test]
+async fn a_follower_takes_a_cluster_past_4_mib() {
+    let (_service, addr, stop) = serve().await;
+    let mut rx = hive_scout::follow(addr.clone(), stop.clone());
+    let mut client = client(addr).await;
+    // Each node's filter is 4 KiB, so 1,500 of them make a first message of about 6 MB.
+    let sent: Vec<pb::NodeReport> = (0u16..1500)
+        .map(|n| {
+            let mut bloom = LayerBloom::default();
+            bloom.insert(blake3::hash(&n.to_le_bytes()).as_bytes());
+            pb::NodeReport::from(&NodeReport { layers: Some(bloom), ..report(n, 1) })
+        })
+        .collect();
+    let _ = client.report(futures::stream::iter(sent)).await.unwrap().into_inner().count().await;
+    let snap =
+        tokio::time::timeout(Duration::from_secs(10), rx.wait_for(|s| s.view.nodes.len() == 1500))
+            .await
+            .expect("the follower took the whole cluster")
+            .unwrap()
+            .clone();
+    // Each node reports once, so on a slow host some may already show as down, but every
+    // filter came across.
+    for (n, node) in (0u16..).zip(&snap.view.nodes) {
+        assert_eq!(node.node, n);
+        assert!(node.layers.contains(blake3::hash(&n.to_le_bytes()).as_bytes()));
+    }
+    stop.cancel();
+}
