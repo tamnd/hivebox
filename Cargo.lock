@@ -835,6 +835,26 @@ dependencies = [
 [[package]]
 name = "hive-gate"
 version = "0.0.11"
+dependencies = [
+ "blake3",
+ "bytes",
+ "futures",
+ "getrandom 0.4.3",
+ "hive-proto",
+ "hive-scout",
+ "hive-telemetry",
+ "hive-types",
+ "hive-waggle",
+ "http-body",
+ "hyper-util",
+ "prost",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tonic",
+ "tower",
+]
 
 [[package]]
 name = "hive-guard"

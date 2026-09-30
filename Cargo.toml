@@ -61,6 +61,7 @@ flate2 = "1.1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 getrandom = "0.4"
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+http-body = "1"
 hyper-util = { version = "0.1", default-features = false }
 landlock = "0.4"
 libc = "0.2"

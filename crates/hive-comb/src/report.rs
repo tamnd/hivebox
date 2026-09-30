@@ -13,6 +13,7 @@ use futures::StreamExt;
 use hive_proto::internal as pb;
 use hive_proto::internal::scout_client::ScoutClient;
 use hive_scout::NodeReport;
+pub use hive_scout::project_id;
 use hive_types::{Backend, Qos};
 use hive_waggle::{BackendSet, LayerBloom};
 use tokio::sync::mpsc;
@@ -37,15 +38,6 @@ const TOP_PROJECTS: usize = 8;
 
 /// Pool depth a node without pools reports, which placement reads as a full pool.
 const NO_POOL: u32 = 64;
-
-/// The name scout and waggle know a project by: the first 8 bytes of the BLAKE3 hash of its name.
-#[must_use]
-pub fn project_id(name: &str) -> u64 {
-    let hash = blake3::hash(name.as_bytes());
-    let mut first = [0u8; 8];
-    first.copy_from_slice(&hash.as_bytes()[..8]);
-    u64::from_le_bytes(first)
-}
 
 /// Sends reports to `link` until `stop`.
 pub async fn run(comb: Comb, link: ScoutLink, stop: CancellationToken) {
