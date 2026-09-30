@@ -171,11 +171,17 @@ impl OciDriver {
     }
 
     /// Takes down whatever `prepare` made. Fine to call on a cell that is half made or gone.
-    fn clean(&self, id: CellId) {
+    /// Forgets the cell and removes its directory. The unmount and the delete run on the blocking
+    /// pool: a bulk stop does a thousand of these at once, and on the runtime's own threads they
+    /// held up every other call on the node.
+    async fn clean(&self, id: CellId) {
         self.secrets.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
         let dir = self.dir(id);
-        let _ = rustix::mount::unmount(dir.join("rootfs"), rustix::mount::UnmountFlags::DETACH);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = rustix::mount::unmount(dir.join("rootfs"), rustix::mount::UnmountFlags::DETACH);
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .await;
     }
 
     async fn wait_gone(&self, pidfd: &OwnedFd, limit: Duration) -> bool {
@@ -258,10 +264,16 @@ impl CellDriver for OciDriver {
                 return Err(Error::new(Reason::Internal, "a container cell needs a cgroup"));
             }
             // A mount and a few small files, a millisecond or so, so it runs right here.
-            let h = self.prepare_now(id, spec, rootfs, slot).map_err(|e| {
-                self.clean(id);
-                Error::new(Reason::Internal, format!("preparing the container: {e}"))
-            })?;
+            let h = match self.prepare_now(id, spec, rootfs, slot) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.clean(id).await;
+                    return Err(Error::new(
+                        Reason::Internal,
+                        format!("preparing the container: {e}"),
+                    ));
+                }
+            };
             self.secrets.lock().unwrap_or_else(PoisonError::into_inner).insert(id, slot.secret);
             Ok(h)
         })
@@ -367,7 +379,7 @@ impl CellDriver for OciDriver {
                 exit = self.exit_of(pid, wait).await.unwrap_or_default();
             }
             exit.oom = cgroup::oom_kills(&h.cgroup) > 0;
-            self.clean(h.id);
+            self.clean(h.id).await;
             Ok(exit)
         })
     }

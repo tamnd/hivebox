@@ -379,7 +379,7 @@ impl Actor {
         if let Some(h) = &self.handle {
             let _ = self.driver.stop(h, Duration::ZERO).await;
         }
-        self.release();
+        self.release().await;
         let message = e.to_string();
         let _ = self.commit(CellState::Failed, Some(Cause::StartFailed), &message).await;
         Err(e)
@@ -401,7 +401,7 @@ impl Actor {
         }
         let Some(handle) = self.handle.clone() else {
             // It never got as far as the driver, so there is nothing to find or undo.
-            self.release();
+            self.release().await;
             let _ = self
                 .commit(
                     CellState::Failed,
@@ -638,7 +638,16 @@ impl Actor {
         if self.cell.state().is_terminal() {
             return;
         }
+        let inner = self.inner.clone();
+        let backend = self.cell.spec.backend;
+        let started = Instant::now();
+        let mut t = started;
+        let mut lap = |stage: &str| {
+            inner.metrics.stopped(backend, stage, t.elapsed());
+            t = Instant::now();
+        };
         let _ = self.commit(CellState::Stopping, Some(cause), "").await;
+        lap("wal");
         self.cell.set_drone(None);
         let mut cause = cause;
         let mut message = String::new();
@@ -649,19 +658,25 @@ impl Actor {
                 Err(e) => message = format!("stopping it failed: {e}"),
             }
         }
-        self.release();
+        lap("driver");
+        self.release().await;
+        lap("release");
         let state = match cause {
             Cause::HardTtl => CellState::Expired,
             c if c.is_infra() => CellState::Failed,
             _ => CellState::Stopped,
         };
         let _ = self.commit(state, Some(cause), &message).await;
+        lap("wal");
+        self.inner.metrics.stopped(backend, "total", started.elapsed());
     }
 
-    /// Gives back the cell's share of the node and removes its directory.
-    fn release(&mut self) {
+    /// Gives back the cell's share of the node and removes its directory, on the blocking pool so a
+    /// bulk stop does not hold up the runtime.
+    async fn release(&mut self) {
         self.reservation = None;
-        let _ = std::fs::remove_dir_all(self.inner.cell_dir(self.cell.id));
+        let dir = self.inner.cell_dir(self.cell.id);
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
         if let Some(dir) = self.cgroup.take() {
             // Kills anything the driver left behind. A failure is often passing, like running out
             // of open files under load, and giving up would leave the cell's processes running, so
