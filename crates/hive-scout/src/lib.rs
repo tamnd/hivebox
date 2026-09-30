@@ -30,6 +30,15 @@ pub use mirror::{Mirror, follow};
 pub use service::{MIN_GAP, Service, TICK};
 pub use wire::BadReport;
 
+/// The name scout and waggle know a project by: the first 8 bytes of the BLAKE3 hash of its name.
+#[must_use]
+pub fn project_id(name: &str) -> u64 {
+    let hash = blake3::hash(name.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
 /// How long a node may go without a report before it is shown as down. Three missed reports.
 pub const STALE_AFTER: Duration = Duration::from_secs(3);
 
