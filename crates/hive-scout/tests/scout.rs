@@ -147,7 +147,7 @@ fn project_cells_add_up_over_the_healthy_nodes() {
 #[test]
 fn a_newer_report_clears_what_waggle_placed_against_the_older_one() {
     let mut scout = Scout::new();
-    scout.apply(NodeReport { burst_cap: 10, ..report(0, 1) }, secs(1));
+    scout.apply(NodeReport { max_cells: 10, ..report(0, 1) }, secs(1));
     let snap = scout.tick(secs(1)).unwrap();
     let mut placer = Placer::new(1);
     let req = PlaceReq {
@@ -162,7 +162,7 @@ fn a_newer_report_clears_what_waggle_placed_against_the_older_one() {
     assert_eq!(placer.place(&snap.view, &req, secs(1)).unplaced, 0);
     // Until the node reports them, it is full.
     assert_eq!(placer.place(&snap.view, &req, secs(1)).unplaced, 10);
-    scout.apply(NodeReport { burst_cap: 10, cells: 10, ..report(0, 2) }, secs(2));
+    scout.apply(NodeReport { max_cells: 20, cells: 10, ..report(0, 2) }, secs(2));
     let snap = scout.tick(secs(2)).unwrap();
     assert_eq!(placer.place(&snap.view, &req, secs(2)).unplaced, 0);
 }
