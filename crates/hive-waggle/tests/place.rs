@@ -80,20 +80,37 @@ fn no_node_is_ever_given_more_than_it_has_room_for() {
                 v.mem_committed_mib + mem <= v.mem_admit_mib,
                 "seed {seed}: node {node} memory"
             );
-            assert!(cells <= v.burst_cap, "seed {seed}: node {node} past its burst cap");
         }
     }
 }
 
 #[test]
 fn a_batch_fills_the_room_there_is_and_says_what_did_not_fit() {
+    let mut view = cluster(4);
+    for node in &mut view.nodes {
+        node.max_cells = 350;
+    }
+    let p = Placer::new(1).place(&view, &req(1500, res(100, 64)), T0);
+    assert_eq!(total(&p), 1400);
+    assert_eq!(p.unplaced, 100);
+    assert!(p.nodes.iter().all(|&(_, n)| n == 350));
+}
+
+#[test]
+fn burst_caps_spread_a_batch_and_only_a_bigger_one_goes_past_them() {
     let view = cluster(4);
-    let mut placer = Placer::new(1);
-    // Each node takes its burst cap of 300 at once, so 1,200 in all.
-    let p = placer.place(&view, &req(1500, res(100, 64)), T0);
-    assert_eq!(total(&p), 1200);
-    assert_eq!(p.unplaced, 300);
-    assert!(p.nodes.iter().all(|&(_, n)| n == 300));
+    // Each node takes its burst cap of 300 first, so 1,200 go out evenly.
+    let p = Placer::new(2).place(&view, &req(1200, res(100, 64)), T0);
+    assert!(p.nodes.iter().all(|&(_, n)| n == 300), "{:?}", p.nodes);
+    // Past the caps the combs queue what is left rather than it being turned away.
+    let mut placer = Placer::new(2);
+    let p = placer.place(&view, &req(2000, res(100, 64)), T0);
+    assert_eq!(total(&p), 2000);
+    assert!(p.nodes.iter().all(|&(_, n)| n >= 300), "{:?}", p.nodes);
+    // One node alone, as in a small cluster, still takes more than its cap.
+    let one = cluster(1);
+    let p = Placer::new(3).place(&one, &req(700, res(100, 64)), T0);
+    assert_eq!(total(&p), 700);
 }
 
 #[test]
@@ -140,7 +157,7 @@ fn back_to_back_single_cells_do_not_pile_onto_one_node() {
 #[test]
 fn the_overlay_clears_on_a_newer_report_or_after_a_while() {
     let mut view = cluster(1);
-    view.nodes[0].burst_cap = 10;
+    view.nodes[0].max_cells = 10;
     let mut placer = Placer::new(9);
     assert_eq!(total(&placer.place(&view, &req(10, res(100, 64)), T0)), 10);
     // Full until the node says it has them, or the entry runs out.
@@ -154,7 +171,7 @@ fn the_overlay_clears_on_a_newer_report_or_after_a_while() {
 #[test]
 fn what_a_comb_refused_is_room_again() {
     let mut view = cluster(1);
-    view.nodes[0].burst_cap = 10;
+    view.nodes[0].max_cells = 10;
     let mut placer = Placer::new(11);
     placer.place(&view, &req(10, res(100, 64)), T0);
     placer.refused(0, 4, &res(100, 64));

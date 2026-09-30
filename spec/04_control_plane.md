@@ -93,7 +93,7 @@ score(x) = w1*mem_headroom_ratio + w2*cpu_headroom + w3*layer_locality(bloom, sp
 
 - Pack vs spread (Hermes hybrid): below 60% cluster utilization, locality (`w3`) gets a high weight, which keeps L1 warm and uses fewer active nodes. Above 60%, headroom gets the weight and cells spread out.
 - Fork and restore affinity: children prefer the parent's node because they share pages. Snapshot restores prefer nodes that hold the snapshot in L1.
-- Burst cap per node: at most the comb's advertised `create_concurrency` (≈150/s for microVM, 300/s for container), so one 32K burst spreads over ≥100 nodes.
+- Burst cap per node: at most the comb's advertised `create_concurrency` (≈150/s for microVM, 300/s for container), so one 32K burst spreads over ≥100 nodes. The cap is soft: once every node has had its cap, the cells left go where there is room and the combs queue them, so a small cluster still takes a big batch, only slower.
 - `inflight_overlay` entries expire when the next NodeReport reflects them, or after 3 s.
 - Randomized sampling and a per-replica overlay avoid herding between waggle replicas. Conflicts show up as a comb admission reject, and the request is retried.
 

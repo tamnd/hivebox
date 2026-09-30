@@ -112,38 +112,27 @@ impl Placer {
             {
                 continue;
             }
-            let load = self.load(node, now);
-            let cap = load.cap(node, &req.resources);
-            if cap > 0 {
-                feasible.push((node, Load { cap, ..load }));
+            let mut load = self.load(node, now);
+            (load.room, load.cap) = load.limits(node, &req.resources);
+            if load.room > 0 {
+                feasible.push((node, load));
             }
         }
         let k = (2 * req.n as usize).clamp(MIN_SAMPLE, feasible.len().max(MIN_SAMPLE));
         let picked = self.sample(&feasible, k, req.affinity);
-        let mut heap: BinaryHeap<Scored> = picked
-            .iter()
-            .map(|&i| {
-                let (node, load) = &feasible[i];
-                let fixed = fixed(node, req, weights);
-                Scored { score: score(node, load, 0, req, weights) + fixed, fixed, at: i, given: 0 }
-            })
-            .collect();
         let mut given = vec![0u32; feasible.len()];
         let mut left = req.n;
-        while left > 0 {
-            let Some(mut top) = heap.pop() else { break };
-            let (node, load) = &feasible[top.at];
-            // Hand out a share at a time rather than one cell, so a batch of thousands costs a
-            // few hundred heap operations, and still levels off across the nodes.
-            let share = left.div_ceil(2 * (heap.len() as u32 + 1)).max(1);
-            let take = share.min(load.cap - top.given).min(left);
-            top.given += take;
-            given[top.at] = top.given;
-            left -= take;
-            if top.given < load.cap {
-                top.score = score(node, load, top.given, req, weights) + top.fixed;
-                heap.push(top);
+        // First the sampled nodes up to their burst caps, then any node up to its burst cap, and
+        // only then any node up to its room. A comb queues creates past its burst cap, so a batch
+        // too big for the caps still goes out, just slower, rather than being turned away.
+        let all: Vec<usize> = (0..feasible.len()).collect();
+        let passes: [(&[usize], Limit); 3] =
+            [(&picked, |l| l.cap), (&all, |l| l.cap), (&all, |l| l.room)];
+        for (from, limit) in passes {
+            if left == 0 {
+                break;
             }
+            left = fill(&feasible, from, limit, &mut given, left, req, weights);
         }
         let mut placed: Vec<(usize, u32)> =
             given.iter().enumerate().filter(|(_, g)| **g > 0).map(|(i, g)| (i, *g)).collect();
@@ -208,6 +197,7 @@ impl Placer {
             mem_mib: node.mem_committed_mib,
             cpu_milli: node.cpu_committed_milli,
             fresh: 0,
+            room: 0,
             cap: 0,
         };
         if let Some(list) = self.inflight.get_mut(usize::from(node.node)) {
@@ -242,7 +232,7 @@ impl Placer {
                     return (f64::NEG_INFINITY, i);
                 }
                 let u = self.rng.unit();
-                (-u.ln() / f64::from(load.cap), i)
+                (-u.ln() / f64::from(load.cap.max(1)), i)
             })
             .collect();
         keys.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
@@ -259,20 +249,67 @@ struct Load {
     cpu_milli: u64,
     /// Cells placed on it in the last few seconds that its reports do not show yet.
     fresh: u32,
+    /// How many more cells of the spec fit, by cells and memory.
+    room: u32,
+    /// The same, and no more than the node's burst cap less what it was just sent.
     cap: u32,
 }
 
 impl Load {
-    fn cap(&self, node: &NodeView, r: &Resources) -> u32 {
+    /// The node's room and its cap for cells of `r`.
+    fn limits(&self, node: &NodeView, r: &Resources) -> (u32, u32) {
         let by_cells = node.max_cells.saturating_sub(self.cells);
         let mem_free = node.mem_admit_mib.saturating_sub(self.mem_mib);
         let by_mem = match r.mem_mib {
             0 => u32::MAX,
             m => u32::try_from(mem_free / u64::from(m)).unwrap_or(u32::MAX),
         };
-        let by_burst = node.burst_cap.saturating_sub(self.fresh);
-        by_cells.min(by_mem).min(by_burst)
+        let room = by_cells.min(by_mem);
+        (room, room.min(node.burst_cap.saturating_sub(self.fresh)))
     }
+}
+
+/// How many cells a node may take in one pass of [`fill`].
+type Limit = fn(&Load) -> u32;
+
+/// Hands out up to `left` cells to the nodes at `from`, best score first and rescoring as each
+/// fills, until each has `limit` of its load. Returns what is left.
+fn fill(
+    feasible: &[(&NodeView, Load)],
+    from: &[usize],
+    limit: Limit,
+    given: &mut [u32],
+    mut left: u32,
+    req: &PlaceReq<'_>,
+    weights: Weights,
+) -> u32 {
+    let mut heap: BinaryHeap<Scored> = from
+        .iter()
+        .filter(|&&i| given[i] < limit(&feasible[i].1))
+        .map(|&i| {
+            let (node, load) = &feasible[i];
+            let fixed = fixed(node, req, weights);
+            let score = score(node, load, given[i], req, weights) + fixed;
+            Scored { score, fixed, at: i, given: given[i] }
+        })
+        .collect();
+    while left > 0 {
+        let Some(mut top) = heap.pop() else { break };
+        let (node, load) = &feasible[top.at];
+        let most = limit(load);
+        // Hand out a share at a time rather than one cell, so a batch of thousands costs a few
+        // hundred heap operations, and still levels off across the nodes.
+        let share = left.div_ceil(2 * (heap.len() as u32 + 1)).max(1);
+        let take = share.min(most - top.given).min(left);
+        top.given += take;
+        given[top.at] = top.given;
+        left -= take;
+        if top.given < most {
+            top.score = score(node, load, top.given, req, weights) + top.fixed;
+            heap.push(top);
+        }
+    }
+    left
 }
 
 /// The part of a node's score that does not change as it fills: cached layers and affinity.

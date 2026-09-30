@@ -11,7 +11,8 @@
 //!   how many of the project's cells it has. Below 60% of the cluster in use, cached layers count
 //!   most and cells pack. Above it, free room counts most and cells spread.
 //! - The cells are handed out best score first, rescoring as a node fills, up to what it has room
-//!   for and its burst cap.
+//!   for and its burst cap. Cells past every cap then go where there is room, and the combs queue
+//!   them.
 //!
 //! The comb's admission has the final word. What it refuses goes back through
 //! [`Placer::refused`] and is placed again with that node excluded.
