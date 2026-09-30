@@ -63,7 +63,14 @@ pub(crate) struct Host<'a> {
     pub(crate) uid_count: u32,
     /// The file the cell sees as `/etc/resolv.conf`, when it has a network.
     pub(crate) resolv: Option<&'a Path>,
+    /// The directory with the cell's own `hosts` and `hostname`.
+    pub(crate) etc: &'a Path,
 }
+
+/// The cell's `/etc/hosts`. An image made with docker has an empty one, since docker mounts its
+/// own over it, and without this `localhost` does not resolve in the cell.
+pub(crate) const HOSTS: &str =
+    "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\tcell\n";
 
 /// The whole `config.json` for a cell.
 pub(crate) fn config(spec: &CellSpec, host: &Host<'_>) -> Value {
@@ -107,6 +114,11 @@ pub(crate) fn config(spec: &CellSpec, host: &Host<'_>) -> Value {
         json!({"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup", "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]}),
         json!({"destination": DRONE, "type": "bind", "source": host.drone, "options": ["bind", "ro", "nosuid", "nodev"]}),
     ];
+    // Writable, as docker has them, since test suites add names to the hosts file.
+    for name in ["hosts", "hostname"] {
+        let source = host.etc.join(name);
+        mounts.push(json!({"destination": format!("/etc/{name}"), "type": "bind", "source": source, "options": ["bind", "nosuid", "nodev", "noexec"]}));
+    }
     if let Some(resolv) = host.resolv {
         // Read only, so the cell cannot point itself at a resolver the guard would drop anyway.
         mounts.push(json!({"destination": "/etc/resolv.conf", "type": "bind", "source": resolv, "options": ["bind", "ro", "nosuid", "nodev", "noexec"]}));
@@ -150,6 +162,7 @@ mod tests {
             uid_base: 1_000_000,
             uid_count: 65536,
             resolv: None,
+            etc: Path::new("/run/hivebox/oci/c1"),
         }
     }
 
@@ -182,6 +195,23 @@ mod tests {
         assert!(
             c["mounts"].as_array().unwrap().iter().all(|m| m["destination"] != "/etc/resolv.conf")
         );
+    }
+
+    #[test]
+    fn every_cell_gets_its_own_hosts_and_hostname() {
+        let spec = CellSpec::new(Source::Image("python".into()), Backend::Container);
+        let c = config(&spec, &host());
+        for name in ["hosts", "hostname"] {
+            let m = c["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["destination"] == format!("/etc/{name}"))
+                .unwrap();
+            assert_eq!(m["source"], format!("/run/hivebox/oci/c1/{name}"));
+            assert!(m["options"].as_array().unwrap().iter().all(|o| o != "ro"));
+        }
+        assert!(HOSTS.starts_with("127.0.0.1\tlocalhost\n"));
     }
 
     #[test]
