@@ -4,6 +4,9 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-waggle` places a batch of cells: it samples `clamp(2n, 8, nodes)` nodes weighted by room, fills them from a heap a share at a time, packs for cached layers below 60% memory use and spreads above it, and keeps an overlay of what it placed until the node's report counts it. On server3 a single cell on 1,000 nodes takes 40.9 us of CPU at p50, and 32,000 cells on 1,000 nodes take 1.18 ms.
+- `hive-scout` folds node reports into a versioned snapshot for waggle and the gate. It drops late reports and ones from a replaced comb, carries the 4 KiB layer filter over when a report leaves it out, shows a node silent for 3 s as down and forgets it after 60 s, and flags a report as urgent when a node is new, came back, changed health or moved its room by more than 5%. On server3 taking a report costs about 1 us of CPU and a snapshot of 1,000 nodes 311 us at p50.
+
 ## 0.0.10
 
 Fixes the SWE-bench Verified run and the 1,000 cell test found, and timing for stops.
