@@ -52,6 +52,7 @@ fn main() -> ExitCode {
         println!("hive-comb {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    raise_open_files();
     let cfg = match config() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -71,6 +72,20 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("hive-comb: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Raises the soft limit on open files to the hard one. The comb holds a connection to every
+/// running cell's guest agent, so the usual soft limit of 1024 stops a node short of 1000 cells.
+#[cfg(target_os = "linux")]
+fn raise_open_files() {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let mut limit = getrlimit(Resource::Nofile);
+    if limit.current < limit.maximum {
+        limit.current = limit.maximum;
+        if let Err(e) = setrlimit(Resource::Nofile, limit) {
+            eprintln!("hive-comb: raising the open files limit: {e}");
         }
     }
 }

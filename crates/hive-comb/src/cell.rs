@@ -24,6 +24,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 /// How long a cell that is still there gets to answer on a new channel before it counts as lost.
 const RECONNECT_PATIENCE: Duration = Duration::from_secs(5);
+/// The tries at removing an ended cell's cgroup stop once the wait between them, which doubles from
+/// 100 ms, reaches this. That is about 100 s in all.
+const REMOVE_PATIENCE: Duration = Duration::from_secs(60);
 /// Longest one connection attempt with its handshake may take. A local one takes well under a
 /// millisecond.
 const ATTEMPT: Duration = Duration::from_secs(2);
@@ -660,11 +663,23 @@ impl Actor {
         self.reservation = None;
         let _ = std::fs::remove_dir_all(self.inner.cell_dir(self.cell.id));
         if let Some(dir) = self.cgroup.take() {
-            // Kills anything the driver left behind. A leaf that cannot go now is swept by the
-            // next comb.
+            // Kills anything the driver left behind. A failure is often passing, like running out
+            // of open files under load, and giving up would leave the cell's processes running, so
+            // it tries again for a while. A leaf that still cannot go is swept by the next comb.
             tokio::spawn(async move {
-                if let Err(e) = crate::cgroups::remove(dir).await {
-                    eprintln!("hive-comb: removing a cell's cgroup: {e}");
+                let mut wait = Duration::from_millis(100);
+                loop {
+                    match crate::cgroups::remove(dir.clone()).await {
+                        Ok(()) => break,
+                        Err(_) if wait < REMOVE_PATIENCE => {
+                            tokio::time::sleep(wait).await;
+                            wait *= 2;
+                        }
+                        Err(e) => {
+                            eprintln!("hive-comb: removing a cell's cgroup: {e}");
+                            break;
+                        }
+                    }
                 }
             });
         }

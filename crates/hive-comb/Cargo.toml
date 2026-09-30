@@ -38,6 +38,7 @@ tonic = { workspace = true, features = ["server"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hive-cell-oci.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 hyper-util = { workspace = true, features = ["tokio"] }
