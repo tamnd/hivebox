@@ -95,7 +95,7 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio_util::sync::CancellationToken;
 
-    let (socket, metrics) = (cfg.api_socket.clone(), cfg.metrics);
+    let (socket, metrics, scout) = (cfg.api_socket.clone(), cfg.metrics, cfg.scout.clone());
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let drivers = drivers(&cfg).await;
@@ -122,6 +122,10 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
         socket.display()
     );
     let stop = CancellationToken::new();
+    if let Some(link) = scout {
+        eprintln!("hive-comb: reporting to scout at {}", link.endpoint);
+        tokio::spawn(hive_comb::report::run(comb.clone(), link, stop.clone()));
+    }
     let mut server = tokio::spawn(hive_comb::api::serve(comb.clone(), listener, stop.clone()));
     let served = tokio::select! {
         _ = term.recv() => None,

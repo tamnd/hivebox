@@ -67,7 +67,7 @@ pub struct CellEvent {
 /// The node agent. Cloning it is cheap, and every clone is the same comb.
 #[derive(Clone, Debug)]
 pub struct Comb {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 pub(crate) struct Inner {
@@ -80,7 +80,7 @@ pub(crate) struct Inner {
     pub(crate) netns: Option<Arc<Namespaces>>,
     images: Option<Nectar>,
     pub(crate) metrics: Metrics,
-    shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
+    pub(crate) shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
     seq: tokio::sync::Mutex<SeqBlock>,
     events: broadcast::Sender<CellEvent>,
@@ -486,6 +486,13 @@ impl Comb {
 }
 
 impl Inner {
+    /// The names of the image layers mounted on this node.
+    pub(crate) fn mounted_layers(&self) -> Vec<[u8; 32]> {
+        self.images
+            .as_ref()
+            .map_or_else(Vec::new, |n| n.layers.mounted().iter().map(|d| *d.as_bytes()).collect())
+    }
+
     /// The guard's profile for a spec's `network_profile`, or `None` when cells have loopback only,
     /// which serves `none` and nothing else.
     pub(crate) fn profile(&self, name: &str) -> Result<Option<Profile>, Error> {

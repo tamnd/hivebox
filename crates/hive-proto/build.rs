@@ -1,4 +1,4 @@
-//! Compiles the `hivebox.v1` protos. protox parses them in Rust, so building needs no protoc.
+//! Compiles the `hivebox.v1` and `hivebox.internal.v1` protos. protox parses them in Rust, so building needs no protoc.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const FILES: &[&str] = &[
@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/hivebox/v1/snapshots.proto",
         "proto/hivebox/v1/images.proto",
         "proto/hivebox/v1/verify.proto",
+        "proto/hivebox/internal/v1/scout.proto",
     ];
     println!("cargo:rerun-if-changed=proto");
     let fds = protox::compile(FILES, ["proto"])?;

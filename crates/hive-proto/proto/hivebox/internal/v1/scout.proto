@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+// Services between hivebox's own parts. Clients outside hivebox never call these, so they can
+// change between releases as long as a comb and a scout of neighbouring versions still talk.
+package hivebox.internal.v1;
+
+// Scout collects what every comb reports about itself.
+service Scout {
+  // A comb keeps one stream open and sends a report once a second, and at once after a big
+  // change. Scout answers every report. When the stream breaks the comb opens a new one.
+  rpc Report(stream NodeReport) returns (stream ReportAck);
+}
+
+message NodeReport {
+  // The comb's registered index.
+  uint32 node = 1;
+  // The comb's registration epoch. A report from an older epoch than scout has seen is dropped.
+  uint32 epoch = 2;
+  // Goes up with every report within an epoch, across comb restarts too.
+  uint64 seq = 3;
+  // Where the gate reaches the comb.
+  string addr = 4;
+  // Whether the comb is taking creates.
+  bool healthy = 5;
+  // The backends it runs, as bits: 1 fncall, 2 container, 4 microvm, 8 fullvm.
+  uint32 backends = 6;
+  // CPU on the node and CPU given to its cells, in thousandths of a core.
+  uint64 cpu_milli = 7;
+  uint64 cpu_committed_milli = 8;
+  // The memory it admits standard cells up to and the memory given to its cells, in MiB.
+  uint64 mem_admit_mib = 9;
+  uint64 mem_committed_mib = 10;
+  // Cells on it now and the most it takes.
+  uint32 cells = 11;
+  uint32 max_cells = 12;
+  // Cgroups and network namespaces ready in its pools.
+  uint32 pool_depth = 13;
+  // Creates a second lately.
+  double create_rate = 14;
+  // Most creates it takes at once.
+  uint32 burst_cap = 15;
+  // A 4096 byte bloom filter of the layers it has mounted, or empty when that has not changed
+  // since the last report on this stream. The first report on a stream always carries it.
+  bytes layers = 16;
+  // The projects with the most cells on it.
+  repeated ProjectCells top_projects = 17;
+}
+
+message ProjectCells {
+  uint64 project = 1;
+  uint32 cells = 2;
+}
+
+message ReportAck {
+  // The report's seq.
+  uint64 seq = 1;
+  // Scout already had a newer report from this node, so this one was dropped.
+  bool stale = 2;
+}

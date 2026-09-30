@@ -108,6 +108,18 @@ impl BackendSet {
         self.0 & Self::bit(backend) != 0
     }
 
+    /// The set as the bits a node report carries: 1 fncall, 2 container, 4 microVM, 8 full VM.
+    #[must_use]
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The set from a node report's bits. Bits it does not know are dropped.
+    #[must_use]
+    pub fn from_bits(bits: u8) -> Self {
+        Self(bits & 0b1111)
+    }
+
     fn bit(backend: Backend) -> u8 {
         match backend {
             Backend::Fncall => 1,

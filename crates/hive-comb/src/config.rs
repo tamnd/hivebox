@@ -53,6 +53,18 @@ pub struct Config {
     pub images: Images,
     /// How cells reach the network.
     pub network: Network,
+    /// The scout this comb reports to. `None` is standalone, reporting to no one.
+    pub scout: Option<ScoutLink>,
+}
+
+/// Where the comb sends its reports, and how it says it can be reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoutLink {
+    /// The scout's address, like `http://10.0.0.5:7410`.
+    pub endpoint: String,
+    /// Where the gate reaches this comb, which goes in every report. By default the API socket,
+    /// as `unix:PATH`, which only a gate on the same machine can use.
+    pub advertise: String,
 }
 
 /// How cells in their own network namespaces reach anything. Needs [`Config::netns_dir`].
@@ -169,6 +181,7 @@ impl Default for Config {
             container: ContainerBackend::default(),
             images: Images::default(),
             network: Network::default(),
+            scout: None,
         }
     }
 }
@@ -212,6 +225,10 @@ impl Config {
     /// store = "/srv/hivebox/store"
     /// cache_dir = "/var/lib/hivebox/cache"
     /// cache_bytes = 68719476736
+    ///
+    /// [scout]
+    /// endpoint = "http://10.0.0.5:7410"
+    /// advertise = "http://10.0.0.7:7400"
     /// ```
     ///
     /// An empty `cgroup_root` or `netns_dir` turns that pool off.
@@ -310,6 +327,19 @@ impl Config {
                 .map_err(|e| format!("network.profiles.{name}.domains: {e}"))?;
             c.network.profiles.insert(name, p.domains);
         }
+        let s = file.scout;
+        if let Some(endpoint) = s.endpoint.filter(|e| !e.is_empty()) {
+            if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                return Err(format!(
+                    "scout.endpoint = {endpoint:?} is not a URL like http://10.0.0.5:7410"
+                ));
+            }
+            let advertise =
+                s.advertise.unwrap_or_else(|| format!("unix:{}", c.api_socket.display()));
+            c.scout = Some(ScoutLink { endpoint, advertise });
+        } else if s.advertise.is_some() {
+            return Err("scout.advertise needs scout.endpoint".into());
+        }
         if c.node == 0 {
             return Err("node.node must not be 0".into());
         }
@@ -347,6 +377,14 @@ struct File {
     backends: BackendsFile,
     images: ImagesFile,
     network: NetworkFile,
+    scout: ScoutFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ScoutFile {
+    endpoint: Option<String>,
+    advertise: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -506,6 +544,22 @@ mod tests {
             ["1.1.1.1:53".parse().unwrap(), "[2606:4700::1111]:53".parse().unwrap()]
         );
         assert_eq!(c.network.profiles["pypi"], ["pypi.org", "*.pythonhosted.org"]);
+        assert_eq!(c.scout, None);
+    }
+
+    #[test]
+    fn a_scout_endpoint_turns_reports_on() {
+        let c = Config::from_toml(
+            "[node]\nsocket = \"/tmp/c.sock\"\n[scout]\nendpoint = \"http://10.0.0.5:7410\"",
+        )
+        .unwrap();
+        let s = c.scout.unwrap();
+        assert_eq!(s.endpoint, "http://10.0.0.5:7410");
+        assert_eq!(s.advertise, "unix:/tmp/c.sock");
+        let e = Config::from_toml("[scout]\nendpoint = \"10.0.0.5:7410\"").unwrap_err();
+        assert!(e.contains("not a URL"), "{e}");
+        let e = Config::from_toml("[scout]\nadvertise = \"http://a:1\"").unwrap_err();
+        assert!(e.contains("needs scout.endpoint"), "{e}");
     }
 
     #[test]

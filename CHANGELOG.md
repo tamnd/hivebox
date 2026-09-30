@@ -6,6 +6,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 - `hive-waggle` places a batch of cells: it samples `clamp(2n, 8, nodes)` nodes weighted by room, fills them from a heap a share at a time, packs for cached layers below 60% memory use and spreads above it, and keeps an overlay of what it placed until the node's report counts it. On server3 a single cell on 1,000 nodes takes 40.9 us of CPU at p50, and 32,000 cells on 1,000 nodes take 1.18 ms.
 - `hive-scout` folds node reports into a versioned snapshot for waggle and the gate. It drops late reports and ones from a replaced comb, carries the 4 KiB layer filter over when a report leaves it out, shows a node silent for 3 s as down and forgets it after 60 s, and flags a report as urgent when a node is new, came back, changed health or moved its room by more than 5%. On server3 taking a report costs about 1 us of CPU and a snapshot of 1,000 nodes 311 us at p50.
+- Combs report to scout over gRPC. `hive-scout` is now a binary that takes reports on `hivebox.internal.v1.Scout/Report` and publishes a snapshot every 100 ms, or within 10 ms of an urgent report, and a comb with a `[scout] endpoint` in its config keeps a stream open and reports once a second and at once when its cells or memory move by more than 5%. On server3 at load 21 to 30, scout kept 250 streaming nodes with every report answered, 3.3 ms at p50, on 4.5% of a core, and 1,000 nodes on 12% of a core. Over four scout restarts the comb was back in the snapshot 352 to 1,180 ms after scout started again.
 
 ## 0.0.10
 

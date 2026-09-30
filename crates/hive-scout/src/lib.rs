@@ -7,8 +7,9 @@
 //! dropped. Scout keeps nothing on disk: a new one has the whole cluster again one report
 //! interval after it starts.
 //!
-//! Like waggle it does no I/O and takes the time from the caller, so the simulator drives it the
-//! same way the service does.
+//! [`Scout`] itself does no I/O and takes the time from the caller, so the simulator drives it
+//! the same way [`Service`] does. The service takes reports over `hivebox.internal.v1.Scout`
+//! and publishes a snapshot every [`TICK`], or at once after an urgent report.
 
 #![forbid(unsafe_code)]
 
@@ -18,6 +19,12 @@ use std::time::Duration;
 
 use hive_waggle::{BackendSet, ClusterView, LayerBloom, NodeView};
 use tokio::sync::watch;
+
+mod service;
+mod wire;
+
+pub use service::{MIN_GAP, Service, TICK};
+pub use wire::BadReport;
 
 /// How long a node may go without a report before it is shown as down. Three missed reports.
 pub const STALE_AFTER: Duration = Duration::from_secs(3);

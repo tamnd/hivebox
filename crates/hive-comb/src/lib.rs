@@ -17,9 +17,10 @@ mod net;
 mod netns;
 mod pool;
 mod record;
+pub mod report;
 mod wal;
 
 pub use cell::{CellInfo, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, WalStats};
-pub use config::{Config, ContainerBackend, Images, Network};
+pub use config::{Config, ContainerBackend, Images, Network, ScoutLink};
 pub use metrics::Metrics;
