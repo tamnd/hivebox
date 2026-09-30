@@ -1,6 +1,8 @@
 //! What waggle knows about the cluster: one [`NodeView`] per comb, built by scout from the reports
 //! the combs push.
 
+use std::sync::Arc;
+
 use hive_types::Backend;
 
 /// The cluster as scout last saw it.
@@ -119,15 +121,18 @@ impl BackendSet {
 
 /// Which image layers a node has cached, as a 4 KiB bloom filter over their digests. A layer the
 /// filter says is there almost always is, and one it says is not never is.
+///
+/// Clones share the bits until one of them inserts, so scout can hand out a view of a thousand
+/// nodes without copying 4 MiB.
 #[derive(Clone)]
-pub struct LayerBloom(Box<[u64; WORDS]>);
+pub struct LayerBloom(Arc<[u64; WORDS]>);
 
 const WORDS: usize = 512;
 const BITS: u32 = (WORDS * 64) as u32;
 
 impl Default for LayerBloom {
     fn default() -> Self {
-        Self(Box::new([0; WORDS]))
+        Self(Arc::new([0; WORDS]))
     }
 }
 
@@ -141,8 +146,9 @@ impl std::fmt::Debug for LayerBloom {
 impl LayerBloom {
     /// Adds a layer by its digest.
     pub fn insert(&mut self, digest: &[u8; 32]) {
+        let words = Arc::make_mut(&mut self.0);
         for bit in Self::bits(digest) {
-            self.0[(bit / 64) as usize] |= 1 << (bit % 64);
+            words[(bit / 64) as usize] |= 1 << (bit % 64);
         }
     }
 
@@ -164,11 +170,11 @@ impl LayerBloom {
         if bytes.len() != WORDS * 8 {
             return None;
         }
-        let mut words = Box::new([0u64; WORDS]);
+        let mut words = [0u64; WORDS];
         for (w, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
             *w = u64::from_le_bytes(*chunk);
         }
-        Some(Self(words))
+        Some(Self(Arc::new(words)))
     }
 
     /// Three bit positions from the digest, which is already a uniform hash.

@@ -860,6 +860,13 @@ dependencies = [
 [[package]]
 name = "hive-scout"
 version = "0.0.10"
+dependencies = [
+ "blake3",
+ "hive-types",
+ "hive-waggle",
+ "rustix 1.1.5",
+ "tokio",
+]
 
 [[package]]
 name = "hive-sdk"
