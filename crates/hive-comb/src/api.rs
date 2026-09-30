@@ -1,10 +1,12 @@
 //! The local API: the `hivebox.v1` Cells, Exec and Files services on a Unix socket, for
-//! standalone mode, where no gate sits in front of the comb.
+//! standalone mode, where no gate sits in front of the comb, and on TCP for gates when
+//! `node.listen` is set.
 //!
 //! Whoever can open the socket is trusted, the way whoever can open the Docker socket is. The
-//! socket is made with mode 0600, so that is root unless the operator hands it on. A caller names
-//! its project in the `x-hive-project` header and gets `local` without one, and every call sees
-//! and touches only that project's cells.
+//! socket is made with mode 0600, so that is root unless the operator hands it on. The TCP port
+//! trusts its callers the same way, so it belongs on the private network that only gates reach.
+//! A caller names its project in the `x-hive-project` header and gets `local` without one, and
+//! every call sees and touches only that project's cells.
 
 use crate::cell::{CellInfo, Status as CellStatus};
 use crate::comb::{Comb, CreateRequest};
@@ -24,7 +26,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::{BoxFuture, Service, http};
@@ -45,17 +47,54 @@ const MAX_REQUEST: usize = 64 << 20;
 /// A write this small or smaller goes to the drone in one message instead of a stream.
 const SMALL_WRITE: usize = 32 << 10;
 
-/// Serves the local API on `listener`, from [`bind`], until `stop` is cancelled.
-pub async fn serve(comb: Comb, listener: UnixListener, stop: CancellationToken) -> io::Result<()> {
-    let incoming = stream::unfold(listener, |l| async move {
+/// Serves the local API on `listener`, from [`bind`], and on `tcp` for gates when there is one,
+/// until `stop` is cancelled. Both share one set of services, so a process started over one can
+/// be signalled over the other.
+///
+/// # Errors
+///
+/// Either server fails. The other is stopped then too.
+pub async fn serve(
+    comb: Comb,
+    listener: UnixListener,
+    tcp: Option<TcpListener>,
+    stop: CancellationToken,
+) -> io::Result<()> {
+    let router = Router::new(Api::new(comb, stop.clone()));
+    let unix = stream::unfold(listener, |l| async move {
         let conn = l.accept().await.map(|(s, _)| s);
         Some((conn, l))
     });
-    let api = Api::new(comb, stop.clone());
-    tonic::transport::Server::builder()
-        .serve_with_incoming_shutdown(Router::new(api), incoming, stop.cancelled_owned())
-        .await
-        .map_err(io::Error::other)
+    let local = tonic::transport::Server::builder().serve_with_incoming_shutdown(
+        router.clone(),
+        unix,
+        stop.clone().cancelled_owned(),
+    );
+    let Some(tcp) = tcp else { return local.await.map_err(io::Error::other) };
+    let incoming = stream::unfold(tcp, |l| async move {
+        let conn = l.accept().await.map(|(s, _)| {
+            // Small messages go out at once rather than waiting for more to fill a packet.
+            let _ = s.set_nodelay(true);
+            s
+        });
+        Some((conn, l))
+    });
+    let remote = tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(Duration::from_secs(20)))
+        .serve_with_incoming_shutdown(router, incoming, stop.clone().cancelled_owned());
+    let (a, b) = tokio::join!(
+        async {
+            let r = local.await;
+            stop.cancel();
+            r
+        },
+        async {
+            let r = remote.await;
+            stop.cancel();
+            r
+        }
+    );
+    a.and(b).map_err(io::Error::other)
 }
 
 /// Makes the API socket at `path`, replacing one an earlier run left there. It binds under a

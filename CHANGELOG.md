@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- A comb can serve its API on TCP for gates as well as on its Unix socket. Set `node.listen`, and the comb advertises `http://ADDR` to scout unless `scout.advertise` says otherwise. A listen address of 0.0.0.0 needs `scout.advertise` to name the address gates should use.
 - Gates and placers can follow scout. `hivebox.internal.v1.Scout/Watch` sends the whole cluster once and then, after each snapshot, only the nodes that changed, with a node's 4 KiB layer filter only when it changed and the nodes scout forgot. `hive_scout::follow` keeps a `Mirror` of scout's snapshot from that stream and reconnects when it breaks. On server3 with 1,000 nodes reporting once a second, a follower got 95 KB a second where the whole cluster at every snapshot would be 34 MB a second, and seven more followers added 0.3 to 0.9 s of scout CPU over a 70 s run.
 
 ## 0.0.11

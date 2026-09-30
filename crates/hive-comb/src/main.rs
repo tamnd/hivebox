@@ -95,7 +95,8 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     use tokio_util::sync::CancellationToken;
 
-    let (socket, metrics, scout) = (cfg.api_socket.clone(), cfg.metrics, cfg.scout.clone());
+    let (socket, listen, metrics, scout) =
+        (cfg.api_socket.clone(), cfg.listen, cfg.metrics, cfg.scout.clone());
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let drivers = drivers(&cfg).await;
@@ -104,6 +105,12 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     }
     let comb = hive_comb::Comb::open(cfg, drivers).await?;
     let listener = hive_comb::api::bind(&socket)?;
+    let tcp = match listen {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("serving the API on {addr}: {e}"))
+        })?),
+        None => None,
+    };
     if let Some(addr) = metrics {
         let scrape = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
             std::io::Error::new(e.kind(), format!("serving metrics on {addr}: {e}"))
@@ -116,17 +123,18 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
         });
     }
     eprintln!(
-        "hive-comb {}: {} cells, serving on {}",
+        "hive-comb {}: {} cells, serving on {}{}",
         env!("CARGO_PKG_VERSION"),
         comb.list().len(),
-        socket.display()
+        socket.display(),
+        listen.map_or(String::new(), |a| format!(" and {a}")),
     );
     let stop = CancellationToken::new();
     if let Some(link) = scout {
         eprintln!("hive-comb: reporting to scout at {}", link.endpoint);
         tokio::spawn(hive_comb::report::run(comb.clone(), link, stop.clone()));
     }
-    let mut server = tokio::spawn(hive_comb::api::serve(comb.clone(), listener, stop.clone()));
+    let mut server = tokio::spawn(hive_comb::api::serve(comb.clone(), listener, tcp, stop.clone()));
     let served = tokio::select! {
         _ = term.recv() => None,
         _ = int.recv() => None,
