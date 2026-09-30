@@ -183,6 +183,11 @@ async fn a_container_cell_runs_python_and_keeps_to_itself() {
     // Its own network, with nothing but loopback, and its own processes.
     let links = ok(&c, "cat /proc/net/dev").await;
     assert!(links.contains("lo:") && links.lines().count() == 3, "{links}");
+    // localhost resolves, which test suites that bind to it need, and the cell can add names.
+    let bound =
+        "import socket; s = socket.socket(); s.bind(('localhost', 0)); print(s.getsockname()[0])";
+    assert_eq!(ok(&c, &format!("python3 -c \"{bound}\"")).await, "127.0.0.1\n");
+    ok(&c, "echo '10.9.9.9 extra' >> /etc/hosts && getent hosts extra").await;
     let procs = ok(&c, "ls /proc | grep -c '^[0-9]'").await;
     assert!(procs.trim().parse::<u32>().unwrap() < 10, "{procs} processes");
     // Its cgroup, read only, with its limit on it.
