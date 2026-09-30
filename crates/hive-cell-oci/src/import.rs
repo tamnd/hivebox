@@ -14,12 +14,11 @@ use std::io::Read;
 use std::path::Path;
 
 /// Unpacks the tar stream `from` into `dir`, which must not exist yet, adding `base` to every
-/// owner. Returns how many entries it wrote.
+/// owner. An owner at or past `count` becomes nobody. Returns how many entries it wrote.
 ///
 /// # Errors
 ///
-/// `dir` exists, the stream is not a tar, an entry would land outside `dir`, or an owner is past
-/// the end of the range.
+/// `dir` exists, the stream is not a tar, or an entry would land outside `dir`.
 pub fn import(from: impl Read, dir: &Path, base: u32, count: u32) -> std::io::Result<u64> {
     std::fs::create_dir(dir)?;
     unpack(from, dir, base, count, false)
@@ -35,8 +34,7 @@ pub fn import(from: impl Read, dir: &Path, base: u32, count: u32) -> std::io::Re
 ///
 /// # Errors
 ///
-/// The stream is not a tar, an entry would land outside `dir`, or an owner is past the end of the
-/// range.
+/// The stream is not a tar or an entry would land outside `dir`.
 pub fn import_layer(from: impl Read, dir: &Path, base: u32, count: u32) -> std::io::Result<u64> {
     std::fs::create_dir_all(dir)?;
     unpack(from, dir, base, count, true)
@@ -75,12 +73,7 @@ fn unpack(from: impl Read, dir: &Path, base: u32, count: u32, layer: bool) -> st
         let (uid, gid) = (header.uid()?, header.gid()?);
         let mode = header.mode()?;
         let kind = header.entry_type();
-        let shift = |id: u64| {
-            u32::try_from(id).ok().filter(|id| *id < count).map(|id| id + base).ok_or_else(|| {
-                std::io::Error::other(format!("owner {id} is past the cells' {count} ids"))
-            })
-        };
-        let (uid, gid) = (shift(uid)?, shift(gid)?);
+        let (uid, gid) = (shift(uid, base, count), shift(gid, base, count));
         let path = dir.join(&rel);
         if layer {
             // A lower layer may have something else at this path, which tar will not replace
@@ -110,6 +103,16 @@ fn unpack(from: impl Read, dir: &Path, base: u32, count: u32, layer: bool) -> st
         n += 1;
     }
     Ok(n)
+}
+
+/// The kernel's overflow id, which a user namespace shows for an owner it has no mapping for.
+const NOBODY: u32 = 65534;
+
+/// `id` moved into the cells' range. An owner past the range, which images built on some hosts
+/// have, becomes nobody, which is what the cell would see for it through an idmapped mount too.
+fn shift(id: u64, base: u32, count: u32) -> u32 {
+    let nobody = NOBODY.min(count.saturating_sub(1));
+    base + u32::try_from(id).ok().filter(|id| *id < count).unwrap_or(nobody)
 }
 
 /// `rel` under `dir`, or an error if it would climb out.
@@ -246,5 +249,14 @@ mod tests {
         assert!(import_layer(&climb[..], &dir, me, 1).is_err());
         assert!(dir.join("etc/a").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_owner_past_the_range_becomes_nobody() {
+        assert_eq!(shift(0, 100_000, 65536), 100_000);
+        assert_eq!(shift(1000, 100_000, 65536), 101_000);
+        assert_eq!(shift(197_609, 100_000, 65536), 100_000 + NOBODY);
+        assert_eq!(shift(u64::MAX, 100_000, 65536), 100_000 + NOBODY);
+        assert_eq!(shift(5, 7, 1), 7, "a range too small for nobody falls back to its last id");
     }
 }
