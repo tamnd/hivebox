@@ -28,7 +28,7 @@ impl Served {
         let socket = s.0.join("comb.sock");
         let listener = api::bind(&socket).unwrap();
         let stop = CancellationToken::new();
-        tokio::spawn(api::serve(comb.clone(), listener, stop.clone()));
+        tokio::spawn(api::serve(comb.clone(), listener, None, stop.clone()));
         let channel = connect(&socket).await;
         Self { comb, stop, channel, socket }
     }
@@ -462,7 +462,7 @@ async fn the_socket_is_the_owners_only_and_replaced_on_restart() {
     api.stop.cancel();
     let listener = api::bind(&api.socket).unwrap();
     let stop = CancellationToken::new();
-    tokio::spawn(api::serve(api.comb.clone(), listener, stop.clone()));
+    tokio::spawn(api::serve(api.comb.clone(), listener, None, stop.clone()));
     let mut cells = CellsClient::new(connect(&api.socket).await);
     cells.list(v1::ListCellsRequest::default()).await.unwrap();
     // A path no service answers is refused cleanly.
@@ -474,6 +474,32 @@ async fn the_socket_is_the_owners_only_and_replaced_on_restart() {
     assert_eq!(e.code(), tonic::Code::Unimplemented);
     stop.cancel();
     let _ = std::fs::remove_file(&api.socket);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gates_reach_the_same_api_over_tcp() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let comb = open(config(&s.0), &fake).await;
+    let socket = s.0.join("comb.sock");
+    let listener = api::bind(&socket).unwrap();
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("http://{}", tcp.local_addr().unwrap());
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(api::serve(comb.clone(), listener, Some(tcp), stop.clone()));
+    let mut remote =
+        CellsClient::new(Endpoint::from_shared(addr).unwrap().connect().await.unwrap());
+    let create = v1::CreateRequest { spec: Some(v1_spec("python", &[])), ..Default::default() };
+    let mut events = remote.create(req("swe", create)).await.unwrap().into_inner();
+    let event = events.message().await.unwrap().unwrap();
+    let Some(v1::create_event::Result::Cell(cell)) = event.result else { panic!("{event:?}") };
+    // The same cell, over the socket.
+    let mut local = CellsClient::new(connect(&socket).await);
+    let got = local.get(req("swe", v1::GetCellRequest { id: cell.id.clone() })).await.unwrap();
+    assert_eq!(got.into_inner().id, cell.id);
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+    comb.shutdown().await;
 }
 
 /// Numbers for the API's own cost, next to the same calls made on the comb directly. Run it with

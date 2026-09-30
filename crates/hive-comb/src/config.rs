@@ -45,6 +45,9 @@ pub struct Config {
     pub netns_depth: usize,
     /// Where the local API listens.
     pub api_socket: PathBuf,
+    /// Where gates reach the API over TCP, if anywhere. Whoever can connect is trusted the way
+    /// whoever can open the socket is, so this belongs on the network only gates are on.
+    pub listen: Option<SocketAddr>,
     /// Where `/metrics` is served, if anywhere.
     pub metrics: Option<SocketAddr>,
     /// The container backend.
@@ -62,8 +65,9 @@ pub struct Config {
 pub struct ScoutLink {
     /// The scout's address, like `http://10.0.0.5:7410`.
     pub endpoint: String,
-    /// Where the gate reaches this comb, which goes in every report. By default the API socket,
-    /// as `unix:PATH`, which only a gate on the same machine can use.
+    /// Where the gate reaches this comb, which goes in every report. By default `node.listen`,
+    /// or without one the API socket as `unix:PATH`, which only a gate on the same machine can
+    /// use. A `node.listen` on every address needs this said.
     pub advertise: String,
 }
 
@@ -177,6 +181,7 @@ impl Default for Config {
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
             netns_depth: 400,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
+            listen: None,
             metrics: None,
             container: ContainerBackend::default(),
             images: Images::default(),
@@ -196,6 +201,7 @@ impl Config {
     /// unit = 1
     /// node = 7
     /// socket = "/run/hivebox/comb.sock"
+    /// listen = "10.0.0.7:7400"
     /// metrics = "127.0.0.1:9464"
     /// reserved_mem_mib = 4096
     ///
@@ -245,6 +251,11 @@ impl Config {
         set(&mut c.node, n.node);
         set(&mut c.epoch, n.epoch);
         set(&mut c.api_socket, n.socket);
+        if let Some(text) = n.listen {
+            c.listen = Some(text.parse().map_err(|_| {
+                format!("node.listen = {text:?} is not an address like 10.0.0.7:7400")
+            })?);
+        }
         if let Some(text) = n.metrics {
             c.metrics = Some(text.parse().map_err(|_| {
                 format!("node.metrics = {text:?} is not an address like 127.0.0.1:9464")
@@ -334,8 +345,16 @@ impl Config {
                     "scout.endpoint = {endpoint:?} is not a URL like http://10.0.0.5:7410"
                 ));
             }
-            let advertise =
-                s.advertise.unwrap_or_else(|| format!("unix:{}", c.api_socket.display()));
+            let advertise = match (s.advertise, c.listen) {
+                (Some(a), _) => a,
+                (None, Some(l)) if l.ip().is_unspecified() => {
+                    return Err(format!(
+                        "node.listen = \"{l}\" is every address, so scout.advertise has to say which one gates use"
+                    ));
+                }
+                (None, Some(l)) => format!("http://{l}"),
+                (None, None) => format!("unix:{}", c.api_socket.display()),
+            };
             c.scout = Some(ScoutLink { endpoint, advertise });
         } else if s.advertise.is_some() {
             return Err("scout.advertise needs scout.endpoint".into());
@@ -426,6 +445,7 @@ struct NodeFile {
     node: Option<u16>,
     epoch: Option<u16>,
     socket: Option<PathBuf>,
+    listen: Option<String>,
     metrics: Option<String>,
     mem_mib: Option<u64>,
     reserved_mem_mib: Option<u64>,
@@ -560,6 +580,25 @@ mod tests {
         assert!(e.contains("not a URL"), "{e}");
         let e = Config::from_toml("[scout]\nadvertise = \"http://a:1\"").unwrap_err();
         assert!(e.contains("needs scout.endpoint"), "{e}");
+    }
+
+    #[test]
+    fn a_listen_address_is_what_the_comb_advertises() {
+        let scout = "[scout]\nendpoint = \"http://10.0.0.5:7410\"";
+        let c = Config::from_toml(&format!("[node]\nlisten = \"10.0.0.7:7400\"\n{scout}")).unwrap();
+        assert_eq!(c.listen, Some("10.0.0.7:7400".parse().unwrap()));
+        assert_eq!(c.scout.unwrap().advertise, "http://10.0.0.7:7400");
+        // A gate cannot dial every address.
+        let e =
+            Config::from_toml(&format!("[node]\nlisten = \"0.0.0.0:7400\"\n{scout}")).unwrap_err();
+        assert!(e.contains("scout.advertise has to say"), "{e}");
+        let c = Config::from_toml(&format!(
+            "[node]\nlisten = \"0.0.0.0:7400\"\n{scout}\nadvertise = \"http://10.0.0.7:7400\""
+        ))
+        .unwrap();
+        assert_eq!(c.scout.unwrap().advertise, "http://10.0.0.7:7400");
+        let e = Config::from_toml("[node]\nlisten = \"7400\"").unwrap_err();
+        assert!(e.contains("not an address"), "{e}");
     }
 
     #[test]
