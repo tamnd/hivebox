@@ -352,6 +352,14 @@ impl Layers {
         self.len() == 0
     }
 
+    /// The layers mounted, by name, in no set order. A node reports them so placement can send
+    /// cells to where their image's layers already are.
+    #[must_use]
+    pub fn mounted(&self) -> Vec<BlobId> {
+        let m = self.mounted.lock().unwrap_or_else(PoisonError::into_inner);
+        m.iter().filter(|(_, c)| c.initialized()).map(|(d, _)| *d).collect()
+    }
+
     async fn one(&self, store: &dyn BlobStore, layer: &LayerRef) -> io::Result<Arc<Layer>> {
         let cell = self
             .mounted

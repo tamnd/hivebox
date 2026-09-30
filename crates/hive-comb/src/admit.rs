@@ -24,6 +24,21 @@ pub(crate) struct Admission {
 struct Used {
     cells: usize,
     mem: u64,
+    cpu_milli: u64,
+    admitted: u64,
+}
+
+/// What the node has given out, for its reports to scout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Usage {
+    /// Cells holding a share.
+    pub(crate) cells: usize,
+    /// Memory given to them, in bytes.
+    pub(crate) mem: u64,
+    /// CPU given to them, in thousandths of a core.
+    pub(crate) cpu_milli: u64,
+    /// Creates admitted since the comb started, which scout turns into a rate.
+    pub(crate) admitted: u64,
 }
 
 /// A cell's share of the node. Dropping it gives the share back.
@@ -31,6 +46,7 @@ struct Used {
 pub(crate) struct Reservation {
     admission: Arc<Admission>,
     mem: u64,
+    cpu_milli: u64,
 }
 
 impl Admission {
@@ -69,19 +85,24 @@ impl Admission {
                 ),
             ));
         }
+        let cpu_milli = u64::from(spec.resources.vcpu_milli);
         used.cells += 1;
         used.mem += mem;
-        Ok(Reservation { admission: self.clone(), mem })
+        used.cpu_milli += cpu_milli;
+        used.admitted += 1;
+        Ok(Reservation { admission: self.clone(), mem, cpu_milli })
     }
 
     /// Takes a share for a cell that was already running before a restart. It is there whatever
     /// the limits say, so this never fails.
     pub(crate) fn adopt(self: &Arc<Self>, spec: &CellSpec) -> Reservation {
         let mem = spec.resources.mem_bytes();
+        let cpu_milli = u64::from(spec.resources.vcpu_milli);
         let mut used = self.used();
         used.cells += 1;
         used.mem += mem;
-        Reservation { admission: self.clone(), mem }
+        used.cpu_milli += cpu_milli;
+        Reservation { admission: self.clone(), mem, cpu_milli }
     }
 
     /// Waits for a create permit for `backend`.
@@ -98,6 +119,27 @@ impl Admission {
         let used = self.used();
         (used.cells, used.mem)
     }
+
+    /// What is given out right now.
+    pub(crate) fn usage(&self) -> Usage {
+        let used = self.used();
+        Usage {
+            cells: used.cells,
+            mem: used.mem,
+            cpu_milli: used.cpu_milli,
+            admitted: used.admitted,
+        }
+    }
+
+    /// The memory a cell of `qos` may be admitted up to, in bytes.
+    pub(crate) fn ceiling_for(&self, qos: Qos) -> u64 {
+        self.ceiling(qos)
+    }
+
+    /// Most cells at once.
+    pub(crate) fn max_cells(&self) -> usize {
+        self.max_cells
+    }
 }
 
 impl Drop for Reservation {
@@ -105,6 +147,7 @@ impl Drop for Reservation {
         let mut used = self.admission.used();
         used.cells -= 1;
         used.mem -= self.mem;
+        used.cpu_milli -= self.cpu_milli;
     }
 }
 
@@ -147,8 +190,11 @@ mod tests {
         let best = a.reserve(&spec(1500, Qos::BestEffort)).unwrap();
         assert!(a.reserve(&spec(64, Qos::BestEffort)).is_err());
         assert_eq!(a.committed(), (3, 3000 << 20));
+        assert_eq!(a.usage().cpu_milli, 3 * 1000);
+        assert_eq!(a.usage().admitted, 3);
         drop((latency, standard, best));
         assert_eq!(a.committed(), (0, 0));
+        assert_eq!(a.usage(), Usage { admitted: 3, ..Usage::default() });
         a.reserve(&spec(1000, Qos::Latency)).unwrap();
     }
 

@@ -14,13 +14,19 @@ readme.workspace = true
 publish.workspace = true
 
 [dependencies]
+futures.workspace = true
+hive-proto.workspace = true
+hive-telemetry.workspace = true
 hive-types.workspace = true
 hive-waggle.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util.workspace = true
+tonic = { workspace = true, features = ["router", "server"] }
 
 [dev-dependencies]
 blake3.workspace = true
 rustix = { workspace = true, features = ["time"] }
+tonic = { workspace = true, features = ["channel"] }
 
 [lints]
 workspace = true
