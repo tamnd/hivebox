@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.12
+
+The gate: one endpoint for a cluster of combs, with scout feeding it the nodes and waggle placing its batches.
+
 - `hive-gate` serves the Cells, Exec and Files APIs for a whole cluster. It checks an API key from `authorization: Bearer`, keeps only the key's BLAKE3 hash in its config (`hive-gate key PROJECT` makes one), follows scout for the nodes, places batches of up to 32,768 cells with waggle and sends them to the combs 1,024 at a time, and places again what a comb turns away. Calls about one cell go to the node in the cell id, and Exec and Files calls pass through as bytes after the gate reads the cell id from the first message. List pages across the nodes, and watch, pause, resume and stop by labels ask every node and merge the answers. On server3 through the gate to one comb, 300 cells took 22.9 and 24.7 s against 31.0 and 26.3 s straight to the comb, and the gate used 8 MB of memory and under a second of CPU for 600 creates and 600 runs.
 - Waggle's burst cap is soft now. A batch goes to nodes up to their burst caps first, and what is left then goes wherever there is room, since a comb queues creates past its cap. Before, a gate in front of one comb turned away all but 128 of a 300 cell batch; on server3 it now makes all 300, as the comb does on its own.
 - A comb can serve its API on TCP for gates as well as on its Unix socket. Set `node.listen`, and the comb advertises `http://ADDR` to scout unless `scout.advertise` says otherwise. A listen address of 0.0.0.0 needs `scout.advertise` to name the address gates should use.
