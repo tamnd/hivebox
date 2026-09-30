@@ -905,6 +905,11 @@ version = "0.0.10"
 [[package]]
 name = "hive-waggle"
 version = "0.0.10"
+dependencies = [
+ "blake3",
+ "hive-types",
+ "rustix 1.1.5",
+]
 
 [[package]]
 name = "hivectl"
