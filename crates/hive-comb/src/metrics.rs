@@ -5,6 +5,10 @@
 //! takes a cgroup and a network namespace, `rootfs` finds the image and mounts its layers,
 //! `prepare` has the driver set the cell up, `start` starts it, `handshake` waits for the guest
 //! agent, and `wal` is the two records written on the way. `total` is all of it.
+//!
+//! A stop is timed the same way: `wal` is again the two records, `driver` is the backend taking
+//! the cell down, `release` gives back its share of the node and removes its directory, and
+//! `total` is all of it.
 
 use hive_telemetry::{CounterVec, HistogramVec, Registry};
 use hive_types::Backend;
@@ -16,6 +20,7 @@ pub struct Metrics {
     registry: Registry,
     create_seconds: HistogramVec,
     creates: CounterVec,
+    stop_seconds: HistogramVec,
     exec_seconds: HistogramVec,
 }
 
@@ -32,6 +37,11 @@ impl Default for Metrics {
                 "hive_create_total",
                 "Creates that ended, by how they ended.",
                 &["backend", "result"],
+            ),
+            stop_seconds: registry.histogram(
+                "hive_stop_seconds",
+                "How long each stage of a stop took.",
+                &["backend", "stage"],
             ),
             exec_seconds: registry.histogram(
                 "hive_exec_seconds",
@@ -58,6 +68,10 @@ impl Metrics {
         self.creates.with(&[backend.as_str(), result]).inc();
     }
 
+    pub(crate) fn stopped(&self, backend: Backend, stage: &str, took: Duration) {
+        self.stop_seconds.with(&[backend.as_str(), stage]).observe_duration(took);
+    }
+
     pub(crate) fn exec(&self, op: &str, took: Duration) {
         self.exec_seconds.with(&[op]).observe_duration(took);
     }
@@ -73,9 +87,11 @@ mod tests {
         m.stage(Backend::Container, "pool", Duration::from_millis(3));
         m.created(Backend::Container, "ok");
         m.exec("run", Duration::from_millis(2));
+        m.stopped(Backend::Container, "driver", Duration::from_millis(4));
         let text = m.registry().render();
         assert!(text.contains(r#"hive_create_seconds_count{backend="container",stage="pool"} 1"#));
         assert!(text.contains(r#"hive_create_total{backend="container",result="ok"} 1"#));
         assert!(text.contains(r#"hive_exec_seconds_count{op="run"} 1"#));
+        assert!(text.contains(r#"hive_stop_seconds_count{backend="container",stage="driver"} 1"#));
     }
 }
