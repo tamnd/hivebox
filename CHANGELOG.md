@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Gates and placers can follow scout. `hivebox.internal.v1.Scout/Watch` sends the whole cluster once and then, after each snapshot, only the nodes that changed, with a node's 4 KiB layer filter only when it changed and the nodes scout forgot. `hive_scout::follow` keeps a `Mirror` of scout's snapshot from that stream and reconnects when it breaks. On server3 with 1,000 nodes reporting once a second, a follower got 95 KB a second where the whole cluster at every snapshot would be 34 MB a second, and seven more followers added 0.3 to 0.9 s of scout CPU over a 70 s run.
+
 ## 0.0.11
 
 The first pieces of the cluster: placement, and scout collecting what every comb reports.

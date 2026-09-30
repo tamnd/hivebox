@@ -9,6 +9,10 @@ service Scout {
   // A comb keeps one stream open and sends a report once a second, and at once after a big
   // change. Scout answers every report. When the stream breaks the comb opens a new one.
   rpc Report(stream NodeReport) returns (stream ReportAck);
+
+  // A gate or a placer follows the cluster. The first message is the whole cluster, and each one
+  // after it has only the nodes that changed since the one before, as scout publishes them.
+  rpc Watch(WatchRequest) returns (stream ClusterDelta);
 }
 
 message NodeReport {
@@ -56,4 +60,40 @@ message ReportAck {
   uint64 seq = 1;
   // Scout already had a newer report from this node, so this one was dropped.
   bool stale = 2;
+}
+
+message WatchRequest {}
+
+message ClusterDelta {
+  // The snapshot this brings the reader up to.
+  uint64 version = 1;
+  // This is the whole cluster, and the reader drops what it had.
+  bool full = 2;
+  // Nodes that are new or changed, sorted by node.
+  repeated NodeState nodes = 3;
+  // Nodes scout forgot.
+  repeated uint32 removed = 4;
+}
+
+// A node as placement sees it. The fields are those of NodeReport, except that healthy is false
+// for a node that stopped reporting, and report numbers the reports scout took across all nodes,
+// so a placer can tell a newer report from the one it placed against.
+message NodeState {
+  uint32 node = 1;
+  uint64 report = 2;
+  string addr = 3;
+  bool healthy = 4;
+  uint32 backends = 5;
+  uint64 cpu_milli = 6;
+  uint64 cpu_committed_milli = 7;
+  uint64 mem_admit_mib = 8;
+  uint64 mem_committed_mib = 9;
+  uint32 cells = 10;
+  uint32 max_cells = 11;
+  uint32 pool_depth = 12;
+  double create_rate = 13;
+  uint32 burst_cap = 14;
+  // The 4096 byte layer filter, or empty when the reader already has it.
+  bytes layers = 15;
+  repeated ProjectCells top_projects = 16;
 }

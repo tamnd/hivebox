@@ -21,12 +21,12 @@ hive-types.workspace = true
 hive-waggle.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
-tonic = { workspace = true, features = ["router", "server"] }
+tonic = { workspace = true, features = ["channel", "router", "server"] }
 
 [dev-dependencies]
 blake3.workspace = true
+prost.workspace = true
 rustix = { workspace = true, features = ["time"] }
-tonic = { workspace = true, features = ["channel"] }
 
 [lints]
 workspace = true

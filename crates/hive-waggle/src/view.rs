@@ -139,6 +139,14 @@ impl BackendSet {
 #[derive(Clone)]
 pub struct LayerBloom(Arc<[u64; WORDS]>);
 
+impl PartialEq for LayerBloom {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Eq for LayerBloom {}
+
 const WORDS: usize = 512;
 const BITS: u32 = (WORDS * 64) as u32;
 
