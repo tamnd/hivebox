@@ -108,7 +108,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         hive_gate::keys::follow(keys.clone(), &cfg.keeper, stop.clone())
             .map_err(std::io::Error::other)?;
     }
-    let gate = Gate::new(keys, nodes, &registry);
+    let quotas = if cfg.keeper.is_empty() {
+        None
+    } else {
+        let q = hive_gate::Quotas::new(cfg.name.clone(), &cfg.keeper, nodes.clone(), &registry)
+            .map_err(std::io::Error::other)?;
+        Some(q)
+    };
+    let gate = Gate::new(keys, nodes, quotas.clone(), &registry);
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     tokio::spawn({
@@ -127,5 +134,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         cfg.listen,
         cfg.scout
     );
-    hive_gate::serve(gate, listener, stop).await
+    let served = hive_gate::serve(gate, listener, stop).await;
+    if let Some(q) = quotas {
+        // So the other gates can have this one's shares now rather than when they run out.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), q.give_back()).await;
+    }
+    served
 }

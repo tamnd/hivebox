@@ -26,6 +26,24 @@ pub struct Project {
     pub quota: Quota,
     /// When it was made, in milliseconds since the Unix epoch.
     pub created_ms: u64,
+    /// The shares of its quota the gates hold, by gate.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slices: BTreeMap<String, Slice>,
+}
+
+/// A share of a project's quota that one gate spends on its own until it runs out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Slice {
+    /// How many more cells the gate may make.
+    pub cells: u64,
+    /// How many creates a second it may make.
+    pub creates_per_s: u32,
+    /// When the share runs out and goes back to the project.
+    pub expires_ms: u64,
+    /// Whether the gate got less than it asked for, so the others should give back what they
+    /// do not need soon rather than when their shares run out.
+    #[serde(default)]
+    pub short: bool,
 }
 
 /// An API key, by the BLAKE3 hash of the key. The key itself is never stored.
@@ -114,6 +132,23 @@ pub enum Command {
         /// How long the lease lasts from now.
         ttl_ms: u64,
     },
+    /// A gate taking a share of a project's quota, in place of the one it had.
+    TakeQuota {
+        /// The project.
+        project: String,
+        /// The gate.
+        gate: String,
+        /// The cells it wants to be able to make.
+        cells: u64,
+        /// The creates a second it wants.
+        creates_per_s: u32,
+        /// The project's live cells as the gate sees them.
+        live: u64,
+        /// The time of the call.
+        now_ms: u64,
+        /// How long the share lasts.
+        ttl_ms: u64,
+    },
     /// Several commands in one log entry, applied in order. Calls that arrive together are
     /// sent this way so they cost one round of disk writes instead of one each.
     Batch(Vec<Command>),
@@ -130,6 +165,9 @@ pub enum Reply {
     Key([u8; 32], Key),
     /// The node registered or renewed.
     Node(Node),
+    /// The share a gate got, with the project's whole quota and whether any gate got less than
+    /// it asked for.
+    Slice(Quota, Slice, bool),
     /// The command was refused, and why.
     Refused(Refusal),
     /// The replies to a batch, in its order.
@@ -187,7 +225,12 @@ impl State {
                 if self.projects.contains_key(&name) {
                     return refused(Refusal::Exists(format!("project {name} exists")));
                 }
-                let p = Project { name: name.clone(), quota, created_ms: now_ms };
+                let p = Project {
+                    name: name.clone(),
+                    quota,
+                    created_ms: now_ms,
+                    slices: BTreeMap::new(),
+                };
                 self.projects.insert(name.clone(), p.clone());
                 (Reply::Project(p), Some(Changed::Project(name)))
             }
@@ -277,6 +320,49 @@ impl State {
                 }
                 n.expires_ms = now_ms.saturating_add(ttl_ms);
                 (Reply::Node(n.clone()), Some(Changed::Node(node)))
+            }
+            Command::TakeQuota { project, gate, cells, creates_per_s, live, now_ms, ttl_ms } => {
+                if !hive_types::is_name(&gate) {
+                    return refused(Refusal::Invalid(format!("{gate:?} is not a gate name")));
+                }
+                let Some(p) = self.projects.get_mut(&project) else {
+                    return refused(Refusal::NotFound(format!("no project {project}")));
+                };
+                // Shares that ran out go back to the project, and so does the gate's own, which
+                // the new one replaces.
+                p.slices.retain(|g, s| s.expires_ms > now_ms && *g != gate);
+                let (held_cells, held_rate) = p.slices.values().fold((0u64, 0u64), |(c, r), s| {
+                    (c.saturating_add(s.cells), r + u64::from(s.creates_per_s))
+                });
+                let gates = p.slices.len() as u64 + 1;
+                let q = p.quota;
+                // A gate gets what is free, and at least an even split when the others hold
+                // more than theirs, which they give back the next time they ask. A limit of 0
+                // is no limit, and then the share is all the gate asked for.
+                let cells_got = if q.cells == 0 {
+                    cells
+                } else {
+                    let room = q.cells.saturating_sub(live);
+                    cells.min(room.saturating_sub(held_cells).max(room / gates))
+                };
+                let rate_got = if q.creates_per_s == 0 {
+                    creates_per_s
+                } else {
+                    let all = u64::from(q.creates_per_s);
+                    let free = all.saturating_sub(held_rate).max(all / gates);
+                    creates_per_s.min(u32::try_from(free).unwrap_or(u32::MAX))
+                };
+                let s = Slice {
+                    cells: cells_got,
+                    creates_per_s: rate_got,
+                    expires_ms: now_ms.saturating_add(ttl_ms),
+                    short: cells_got < cells || rate_got < creates_per_s,
+                };
+                let contended = s.short || p.slices.values().any(|o| o.short);
+                if cells_got > 0 || rate_got > 0 {
+                    p.slices.insert(gate, s);
+                }
+                (Reply::Slice(q, s, contended), Some(Changed::Project(project)))
             }
         }
     }
@@ -437,5 +523,60 @@ mod tests {
         assert_eq!(node(register(&mut s, "a", 3, 0)).epoch, 4);
         assert_eq!(node(register(&mut s, "a", 9, 1)).epoch, 10);
         assert_eq!(node(register(&mut s, "a", 10, 2)).epoch, 10);
+    }
+
+    #[test]
+    fn gates_share_a_quota_and_get_it_back_when_a_share_runs_out() {
+        let mut s = State::default();
+        let quota = Quota { cells: 100, creates_per_s: 50 };
+        s.apply(Command::CreateProject { name: "swe".into(), quota, now_ms: 1 });
+        let take = |s: &mut State, gate: &str, cells: u64, rate: u32, live: u64, now_ms: u64| {
+            let cmd = Command::TakeQuota {
+                project: "swe".into(),
+                gate: gate.into(),
+                cells,
+                creates_per_s: rate,
+                live,
+                now_ms,
+                ttl_ms: 30_000,
+            };
+            match s.apply(cmd).0 {
+                Reply::Slice(q, sl, contended) => {
+                    assert_eq!(q, quota);
+                    (sl.cells, sl.creates_per_s, contended)
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        // Ten cells are live, so the first gate gets 60 of the 90 left and 30 creates a second.
+        assert_eq!(take(&mut s, "a", 60, 30, 10, 1), (60, 30, false));
+        // The second gets an even split, more than the first left free, and both hear that
+        // the quota is short.
+        assert_eq!(take(&mut s, "b", 60, 30, 10, 2), (45, 25, true));
+        // A gate asking again replaces its own share rather than adding to it, and now gets
+        // only what the other left.
+        assert_eq!(take(&mut s, "a", 60, 30, 10, 3), (45, 25, true));
+        // Giving a share back frees it for the others.
+        assert_eq!(take(&mut s, "a", 0, 0, 10, 4), (0, 0, true));
+        assert_eq!(take(&mut s, "b", 90, 50, 10, 5), (90, 50, false));
+        // A share that ran out is free again too.
+        assert_eq!(take(&mut s, "a", 90, 50, 10, 30_006), (90, 50, false));
+        assert!(!s.projects["swe"].slices.contains_key("b"));
+
+        // No limit gives whatever was asked.
+        s.apply(Command::CreateProject { name: "free".into(), quota: Quota::default(), now_ms: 1 });
+        let cmd = Command::TakeQuota {
+            project: "free".into(),
+            gate: "a".into(),
+            cells: 7,
+            creates_per_s: 9,
+            live: 1_000_000,
+            now_ms: 2,
+            ttl_ms: 30_000,
+        };
+        assert!(matches!(
+            s.apply(cmd).0,
+            Reply::Slice(_, Slice { cells: 7, creates_per_s: 9, .. }, false)
+        ));
     }
 }

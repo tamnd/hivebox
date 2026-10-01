@@ -15,6 +15,7 @@ mod connect;
 pub mod keys;
 pub mod nodes;
 pub mod proxy;
+pub mod quota;
 
 use std::convert::Infallible;
 use std::io;
@@ -33,6 +34,7 @@ use tonic::codegen::{BoxFuture, Service, http};
 pub use config::Config;
 pub use keys::Keys;
 pub use nodes::Nodes;
+pub use quota::Quotas;
 
 /// The header that tells a comb which project a call is for. The gate sets it from the key and
 /// drops whatever the caller put there.
@@ -51,11 +53,16 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// A gate that lets in `keys` and reaches the combs in `nodes`, with its metrics in
-    /// `registry`.
+    /// A gate that lets in `keys`, reaches the combs in `nodes` and holds creates to `quotas`
+    /// if there are any, with its metrics in `registry`.
     #[must_use]
-    pub fn new(keys: impl Into<Keys>, nodes: Nodes, registry: &Registry) -> Self {
-        let api = cells::Api::new(nodes.clone(), registry);
+    pub fn new(
+        keys: impl Into<Keys>,
+        nodes: Nodes,
+        quotas: Option<Quotas>,
+        registry: &Registry,
+    ) -> Self {
+        let api = cells::Api::new(nodes.clone(), quotas, registry);
         Self {
             keys: keys.into(),
             nodes,

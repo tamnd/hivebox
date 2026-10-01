@@ -5,6 +5,7 @@
 //! cargo run --release -p hive-keeper --example load -- leader ADDR
 //! cargo run --release -p hive-keeper --example load -- nodes ADDR
 //! cargo run --release -p hive-keeper --example load -- key ADDR PROJECT
+//! cargo run --release -p hive-keeper --example load -- quota ADDR PROJECT CELLS RATE
 //! cargo run --release -p hive-keeper --example load -- revoke ADDR PREFIX
 //! ```
 //!
@@ -50,6 +51,21 @@ async fn main() {
         // The project may be there from an earlier run.
         let _ =
             c.create_project(pb::CreateProjectRequest { name: project.clone(), quota: None }).await;
+        let made = c.create_key(pb::CreateKeyRequest { project: project.clone() }).await.unwrap();
+        println!("{}", made.into_inner().key);
+        return;
+    }
+    if let [quota, addr, project, cells, rate] = &args[..]
+        && quota == "quota"
+    {
+        // A project with a quota of CELLS live cells and RATE creates a second, and a key to it.
+        let channel =
+            Channel::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap();
+        let mut c = KeeperClient::new(channel);
+        let quota =
+            pb::Quota { cells: cells.parse().unwrap(), creates_per_s: rate.parse().unwrap() };
+        let req = pb::CreateProjectRequest { name: project.clone(), quota: Some(quota) };
+        c.create_project(req).await.unwrap();
         let made = c.create_key(pb::CreateKeyRequest { project: project.clone() }).await.unwrap();
         println!("{}", made.into_inner().key);
         return;

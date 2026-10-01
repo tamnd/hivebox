@@ -20,6 +20,10 @@ service Keeper {
   // and the comb has to register again and gets a new epoch.
   rpc Renew(RenewRequest) returns (Lease);
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  // A gate takes a share of a project's quota to spend on its own for a while, and asks again
+  // when half of it is spent or it is about to run out. Each call replaces the gate's last
+  // share, and asking for nothing gives it back.
+  rpc TakeQuota(TakeQuotaRequest) returns (QuotaSlice);
   // Where this member stands in the Raft group.
   rpc Status(StatusRequest) returns (StatusResponse);
 }
@@ -106,6 +110,33 @@ message Lease {
   uint64 expires_ms = 3;
   // How long a lease lasts, so the comb can renew without trusting the clocks to agree.
   uint64 ttl_ms = 4;
+}
+
+message TakeQuotaRequest {
+  string project = 1;
+  // The gate asking, by a name that stays the same while it runs.
+  string gate = 2;
+  // How many more cells the gate wants to be able to make.
+  uint64 cells = 3;
+  // How many creates a second it wants.
+  uint32 creates_per_s = 4;
+  // The project's live cells as the gate sees them from scout.
+  uint64 live = 5;
+}
+
+message QuotaSlice {
+  // The project's whole quota. Where it is 0 there is no limit, and the share below means
+  // nothing.
+  Quota quota = 1;
+  // How many more cells the gate may make.
+  uint64 cells = 2;
+  // How many creates a second it may make.
+  uint32 creates_per_s = 3;
+  // How long the share lasts, after which the keeper hands it to others.
+  uint64 ttl_ms = 4;
+  // Some gate got less than it asked for, so every gate should ask again soon and give back
+  // what it does not need.
+  bool contended = 5;
 }
 
 message ListNodesRequest {}
