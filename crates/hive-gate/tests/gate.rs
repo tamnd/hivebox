@@ -303,6 +303,7 @@ fn incoming(l: TcpListener) -> impl futures::Stream<Item = std::io::Result<tokio
 
 struct Cluster {
     combs: Vec<FakeComb>,
+    addr: SocketAddr,
     channel: Channel,
     stop: CancellationToken,
 }
@@ -359,7 +360,7 @@ impl Cluster {
             .connect()
             .await
             .unwrap();
-        Self { combs, channel, stop }
+        Self { combs, addr: gaddr, channel, stop }
     }
 
     fn cells(&self) -> CellsClient<Channel> {
@@ -502,4 +503,111 @@ async fn cells_a_full_node_turns_away_go_to_the_other() {
         let Some(v1::create_event::Result::Error(err)) = &e.result else { panic!("{e:?}") };
         assert_eq!(err.reason, "CAPACITY_UNAVAILABLE");
     }
+}
+
+/// A Connect call over HTTP/1.1: the status, the content type and the body that came back.
+async fn connect(
+    c: &Cluster,
+    path: &str,
+    content_type: &str,
+    key: Option<&str>,
+    body: Vec<u8>,
+) -> (u16, String, bytes::Bytes) {
+    use http_body_util::BodyExt;
+    let stream = tokio::net::TcpStream::connect(c.addr).await.unwrap();
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(conn);
+    let mut req = tonic::codegen::http::Request::post(path)
+        .header("host", "gate")
+        .header("content-type", content_type);
+    if let Some(key) = key {
+        req = req.header("authorization", format!("Bearer {key}"));
+    }
+    let req = req.body(http_body_util::Full::new(bytes::Bytes::from(body))).unwrap();
+    let resp = send.send_request(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    (status, ct, resp.into_body().collect().await.unwrap().to_bytes())
+}
+
+fn envelope(flags: u8, msg: &[u8]) -> Vec<u8> {
+    let mut out = vec![flags];
+    out.extend_from_slice(&u32::try_from(msg.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(msg);
+    out
+}
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_callers_get_the_same_api_over_http_1() {
+    use prost::Message;
+    let c = Cluster::new(100).await;
+    let get = "/hivebox.v1.Cells/Get";
+
+    let (status, ct, body) = connect(&c, get, "application/json", None, b"{}".to_vec()).await;
+    assert_eq!((status, ct.as_str()), (401, "application/json"));
+    assert_eq!(json(&body)["code"], "unauthenticated");
+
+    // A server stream: one envelope in, an envelope a cell and the status last.
+    let create = serde_json::json!({
+        "spec": {
+            "image": { "ref": "python:3.12" },
+            "backend": "BACKEND_CONTAINER",
+            "resources": { "memMib": 256 },
+            "labels": { "run": "connect" },
+        },
+        "count": 4,
+    });
+    let body = envelope(0, &serde_json::to_vec(&create).unwrap());
+    let (status, ct, out) =
+        connect(&c, "/hivebox.v1.Cells/Create", "application/connect+json", Some(KEY), body).await;
+    assert_eq!((status, ct.as_str()), (200, "application/connect+json"));
+    let (mut ids, mut rest, mut end) = (Vec::new(), &out[..], None);
+    while !rest.is_empty() {
+        let len = u32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+        let msg = json(&rest[5..5 + len]);
+        if rest[0] == 2 {
+            end = Some(msg);
+        } else {
+            assert_eq!(msg["cell"]["project"], "swe", "{msg}");
+            ids.push(msg["cell"]["id"].as_str().unwrap().to_string());
+        }
+        rest = &rest[5 + len..];
+    }
+    assert_eq!(ids.len(), 4);
+    assert_eq!(end, Some(serde_json::json!({})));
+
+    for id in &ids {
+        let req = serde_json::to_vec(&serde_json::json!({ "id": id })).unwrap();
+        let (status, _, body) = connect(&c, get, "application/json", Some(KEY), req).await;
+        assert_eq!(status, 200);
+        assert_eq!(json(&body)["id"], id.as_str());
+    }
+
+    // Protobuf in and out, through to the comb that owns the cell.
+    let run = v1::RunRequest { cell_id: ids[0].clone(), stdin: "hi".into(), ..Default::default() };
+    let (status, ct, body) =
+        connect(&c, "/hivebox.v1.Exec/Run", "application/proto", Some(KEY), run.encode_to_vec())
+            .await;
+    assert_eq!((status, ct.as_str()), (200, "application/proto"));
+    let result = v1::RunResult::decode(body).unwrap();
+    assert!(String::from_utf8_lossy(&result.stdout).ends_with("stdin 2"), "{result:?}");
+
+    let lost = CellId::new(1, 9, 1, 1, 5).unwrap().to_string();
+    let req = serde_json::to_vec(&serde_json::json!({ "id": lost })).unwrap();
+    let (status, _, body) = connect(&c, get, "application/json", Some(KEY), req).await;
+    assert_eq!(status, 404);
+    assert_eq!(json(&body)["code"], "not_found");
+
+    let (status, _, body) =
+        connect(&c, get, "application/json", Some(KEY), b"{\"nope\": 1}".to_vec()).await;
+    assert_eq!((status, json(&body)["code"].as_str()), (400, Some("invalid_argument")));
+    let (status, _, _) =
+        connect(&c, "/hivebox.v1.Cells/Create", "application/json", Some(KEY), b"{}".to_vec())
+            .await;
+    assert_eq!(status, 400, "a unary content type on a streaming method");
 }

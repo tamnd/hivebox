@@ -4,6 +4,9 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The gate takes Connect calls as well as gRPC, on the same port, over HTTP/1.1 or HTTP/2. Unary methods take `application/json` or `application/proto`, streaming ones take `application/connect+json` or `application/connect+proto`, and errors come back as Connect error JSON with the hivebox reason in `details`. The gate turns each call into gRPC and routes it the same way, so a client needs nothing but an HTTP library, and `curl` works. On server3 through the gate to one comb, a Python client using only the standard library made 300 cells in 3 calls of 100 in 13.8, 7.8 and 8.8 s against 9.3, 8.4 and 12.3 s over gRPC, and ran `true` in each cell one call at a time at a p50 of 13.8 to 15.3 ms. The gate used 11 MB of memory.
+- A gate forwarding an Exec or Files call whose body knows its exact size no longer panics. The gate's own size hint set the lower bound past the upper one.
+
 ## 0.0.12
 
 The gate: one endpoint for a cluster of combs, with scout feeding it the nodes and waggle placing its batches.

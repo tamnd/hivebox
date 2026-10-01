@@ -30,6 +30,7 @@ tonic-prost.workspace = true
 tonic-types.workspace = true
 
 [build-dependencies]
+prost.workspace = true
 protox.workspace = true
 tonic-prost-build.workspace = true
 

@@ -13,6 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     println!("cargo:rerun-if-changed=proto");
     let fds = protox::compile(FILES, ["proto"])?;
+    // The gate reads messages as JSON for Connect callers, and needs the descriptors for that.
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    std::fs::write(out.join("hivebox.bin"), prost::Message::encode_to_vec(&fds))?;
     tonic_prost_build::configure()
         // Output and file contents pass through without a copy.
         .bytes(".hivebox.v1")

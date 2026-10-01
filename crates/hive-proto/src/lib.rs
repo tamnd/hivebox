@@ -8,3 +8,7 @@ pub mod convert;
 pub mod drone;
 pub mod internal;
 pub mod v1;
+
+/// The encoded `FileDescriptorSet` of every proto here and the ones they import, for tools that
+/// work with messages they were not compiled with, like the gate turning JSON into protobuf.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hivebox.bin"));
