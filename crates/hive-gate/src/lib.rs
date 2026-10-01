@@ -1,6 +1,7 @@
 //! The only component with a foot on both the trusted and the untrusted network. It checks the
 //! caller's key, places batches of cells with waggle, and sends every call about one cell to the
-//! comb that owns it, which it knows from the node in the cell id.
+//! comb that owns it, which it knows from the node in the cell id. It takes gRPC and Connect, the
+//! second over HTTP/1.1 as well, so `curl` can call it.
 //!
 //! The gate keeps no state of its own. It follows scout for the nodes and their addresses, so
 //! any number of gates can run side by side, and one that restarts is serving again as soon as
@@ -10,6 +11,7 @@
 
 pub mod cells;
 pub mod config;
+mod connect;
 pub mod nodes;
 pub mod proxy;
 
@@ -19,7 +21,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::stream;
+use futures::{FutureExt, stream};
 use hive_proto::v1::cells_server::CellsServer;
 use hive_telemetry::{CounterVec, Registry};
 use tokio::net::TcpListener;
@@ -86,6 +88,9 @@ impl Service<http::Request<Body>> for Gate {
     }
 
     fn call(&mut self, mut req: http::Request<Body>) -> Self::Future {
+        if let Some(codec) = connect::Codec::of(req.headers()) {
+            return Box::pin(connect::call(self.clone(), codec, req).map(Ok));
+        }
         let (to, op) = match req.uri().path().strip_prefix('/').and_then(|p| p.split_once('/')) {
             Some(("hivebox.v1.Cells", m)) => (To::Cells, m),
             Some(("hivebox.v1.Exec" | "hivebox.v1.Files", m)) => (To::Comb, m),
@@ -140,6 +145,8 @@ pub async fn serve(gate: Gate, listener: TcpListener, stop: CancellationToken) -
         Some((conn, l))
     });
     tonic::transport::Server::builder()
+        // Connect callers may come over HTTP/1.1.
+        .accept_http1(true)
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .serve_with_incoming_shutdown(gate, incoming, stop.cancelled_owned())
         .await

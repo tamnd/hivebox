@@ -47,7 +47,8 @@ async fn main() {
     let start = Instant::now();
     let calls = (0..cells.div_ceil(batch)).map(|i| {
         let count = batch.min(cells - i * batch);
-        let (mut client, key, spec) = (CellsClient::new(channel.clone()), key.clone(), spec.clone());
+        let (mut client, key, spec) =
+            (CellsClient::new(channel.clone()), key.clone(), spec.clone());
         async move {
             let req = v1::CreateRequest { spec: Some(spec), count, ..Default::default() };
             let mut events = client.create(call(&key, req)).await.expect("create").into_inner();
@@ -91,7 +92,8 @@ async fn main() {
         let (mut client, key, id) = (ExecClient::new(channel.clone()), key.clone(), c.id.clone());
         async move {
             let t = Instant::now();
-            let req = v1::RunRequest { cell_id: id, argv: vec!["true".into()], ..Default::default() };
+            let req =
+                v1::RunRequest { cell_id: id, argv: vec!["true".into()], ..Default::default() };
             let r = client.run(call(&key, req)).await.expect("run").into_inner();
             assert_eq!(r.exit_code, 0);
             t.elapsed()

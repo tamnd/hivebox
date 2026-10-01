@@ -156,10 +156,11 @@ impl http_body::Body for Prepend {
     fn size_hint(&self) -> SizeHint {
         let mut hint = self.rest.size_hint();
         let n = self.first.as_ref().map_or(0, |b| b.remaining() as u64);
-        hint.set_lower(hint.lower() + n);
+        // Upper first: a lower bound past the upper one panics, and an exact size has them equal.
         if let Some(upper) = hint.upper() {
             hint.set_upper(upper + n);
         }
+        hint.set_lower(hint.lower() + n);
         hint
     }
 }
@@ -229,5 +230,12 @@ mod tests {
         assert_eq!(cell_of(&zipped).unwrap_err().code(), tonic::Code::Unimplemented);
         assert!(cell_of(&[0, 0]).is_err());
         assert!(field_one(&[0x0a, 0xff]).is_none(), "a length past the end");
+    }
+
+    #[test]
+    fn the_size_counts_the_bytes_put_back() {
+        let rest = Body::new(http_body_util::Full::new(Bytes::from_static(b"world")));
+        let body = Prepend { first: Some(Bytes::from_static(b"hello ")), rest };
+        assert_eq!(body.size_hint().exact(), Some(11));
     }
 }
