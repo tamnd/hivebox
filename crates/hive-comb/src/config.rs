@@ -58,6 +58,9 @@ pub struct Config {
     pub network: Network,
     /// The scout this comb reports to. `None` is standalone, reporting to no one.
     pub scout: Option<ScoutLink>,
+    /// The keeper group this comb registers with and holds a lease from. With one, the node
+    /// index and the epoch come from the keeper and not from `node.node` and `node.epoch`.
+    pub keeper: Option<KeeperLink>,
 }
 
 /// Where the comb sends its reports, and how it says it can be reached.
@@ -68,6 +71,17 @@ pub struct ScoutLink {
     /// Where the gate reaches this comb, which goes in every report. By default `node.listen`,
     /// or without one the API socket as `unix:PATH`, which only a gate on the same machine can
     /// use. A `node.listen` on every address needs this said.
+    pub advertise: String,
+}
+
+/// The keeper group a comb registers with, and what it registers as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeeperLink {
+    /// The members of the group, as `host:port`. Any of them takes the calls.
+    pub members: Vec<String>,
+    /// The name the node keeps across restarts, the host name unless `keeper.name` says.
+    pub name: String,
+    /// Where gates reach this comb, worked out the way `scout.advertise` is.
     pub advertise: String,
 }
 
@@ -187,6 +201,7 @@ impl Default for Config {
             images: Images::default(),
             network: Network::default(),
             scout: None,
+            keeper: None,
         }
     }
 }
@@ -235,6 +250,10 @@ impl Config {
     /// [scout]
     /// endpoint = "http://10.0.0.5:7410"
     /// advertise = "http://10.0.0.7:7400"
+    ///
+    /// [keeper]
+    /// members = ["10.0.0.1:7430", "10.0.0.2:7430", "10.0.0.3:7430"]
+    /// name = "node-7"
     /// ```
     ///
     /// An empty `cgroup_root` or `netns_dir` turns that pool off.
@@ -339,25 +358,43 @@ impl Config {
             c.network.profiles.insert(name, p.domains);
         }
         let s = file.scout;
+        let advertise = match (s.advertise.clone(), c.listen) {
+            (Some(a), _) => Ok(a),
+            (None, Some(l)) if l.ip().is_unspecified() => Err(format!(
+                "node.listen = \"{l}\" is every address, so scout.advertise has to say which one gates use"
+            )),
+            (None, Some(l)) => Ok(format!("http://{l}")),
+            (None, None) => Ok(format!("unix:{}", c.api_socket.display())),
+        };
         if let Some(endpoint) = s.endpoint.filter(|e| !e.is_empty()) {
             if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
                 return Err(format!(
                     "scout.endpoint = {endpoint:?} is not a URL like http://10.0.0.5:7410"
                 ));
             }
-            let advertise = match (s.advertise, c.listen) {
-                (Some(a), _) => a,
-                (None, Some(l)) if l.ip().is_unspecified() => {
-                    return Err(format!(
-                        "node.listen = \"{l}\" is every address, so scout.advertise has to say which one gates use"
-                    ));
-                }
-                (None, Some(l)) => format!("http://{l}"),
-                (None, None) => format!("unix:{}", c.api_socket.display()),
-            };
-            c.scout = Some(ScoutLink { endpoint, advertise });
+            c.scout = Some(ScoutLink { endpoint, advertise: advertise.clone()? });
         } else if s.advertise.is_some() {
             return Err("scout.advertise needs scout.endpoint".into());
+        }
+        let k = file.keeper;
+        if !k.members.is_empty() {
+            for m in &k.members {
+                if m.contains("://") || !m.contains(':') {
+                    return Err(format!("keeper.members has {m:?}, which is not host:port"));
+                }
+            }
+            let name = match k.name {
+                Some(n) => n,
+                None => std::fs::read_to_string("/proc/sys/kernel/hostname")
+                    .map(|h| h.trim().to_owned())
+                    .map_err(|e| format!("keeper.name is not set and the host name: {e}"))?,
+            };
+            if !hive_types::is_name(&name) {
+                return Err(format!("keeper.name = {name:?} is not a name like node-7"));
+            }
+            c.keeper = Some(KeeperLink { members: k.members, name, advertise: advertise? });
+        } else if k.name.is_some() {
+            return Err("keeper.name needs keeper.members".into());
         }
         if c.node == 0 {
             return Err("node.node must not be 0".into());
@@ -397,6 +434,14 @@ struct File {
     images: ImagesFile,
     network: NetworkFile,
     scout: ScoutFile,
+    keeper: KeeperFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KeeperFile {
+    members: Vec<String>,
+    name: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -580,6 +625,27 @@ mod tests {
         assert!(e.contains("not a URL"), "{e}");
         let e = Config::from_toml("[scout]\nadvertise = \"http://a:1\"").unwrap_err();
         assert!(e.contains("needs scout.endpoint"), "{e}");
+    }
+
+    #[test]
+    fn a_keeper_section_registers_the_node() {
+        let keeper =
+            "[keeper]\nmembers = [\"10.0.0.1:7430\", \"10.0.0.2:7430\"]\nname = \"node-7\"";
+        let c =
+            Config::from_toml(&format!("[node]\nlisten = \"10.0.0.7:7400\"\n{keeper}")).unwrap();
+        let k = c.keeper.unwrap();
+        assert_eq!(k.members, ["10.0.0.1:7430", "10.0.0.2:7430"]);
+        assert_eq!(k.name, "node-7");
+        assert_eq!(k.advertise, "http://10.0.0.7:7400");
+        for (text, says) in [
+            ("[keeper]\nmembers = [\"http://10.0.0.1:7430\"]", "not host:port"),
+            ("[keeper]\nmembers = [\"a:1\"]\nname = \"two words\"", "not a name"),
+            ("[keeper]\nname = \"node-7\"", "needs keeper.members"),
+            ("[node]\nlisten = \"0.0.0.0:7400\"\n[keeper]\nmembers = [\"a:1\"]", "scout.advertise"),
+        ] {
+            let e = Config::from_toml(text).unwrap_err();
+            assert!(e.contains(says), "{text}: {e}");
+        }
     }
 
     #[test]

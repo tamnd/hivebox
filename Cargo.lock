@@ -986,6 +986,7 @@ dependencies = [
  "hive-cell-oci",
  "hive-drone",
  "hive-guard",
+ "hive-keeper",
  "hive-nectar",
  "hive-proto",
  "hive-rt",

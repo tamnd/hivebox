@@ -43,6 +43,7 @@ hive-cell-oci.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
+hive-keeper.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
 tonic = { workspace = true, features = ["channel"] }
 tar.workspace = true

@@ -91,10 +91,35 @@ fn raise_open_files() {
 }
 
 #[cfg(target_os = "linux")]
-async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
+async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
+    use hive_comb::lease;
     use tokio::signal::unix::{SignalKind, signal};
     use tokio_util::sync::CancellationToken;
 
+    // Registering comes before the signal handlers, so a comb waiting on a keeper that is down
+    // still goes at once on SIGTERM.
+    let keeper = match cfg.keeper.clone() {
+        Some(link) => {
+            std::fs::create_dir_all(&cfg.data_dir)?;
+            let mut k = lease::Keeper::new(&link.members).map_err(std::io::Error::other)?;
+            let l = lease::register(&mut k, &link, &cfg.data_dir)
+                .await
+                .map_err(std::io::Error::other)?;
+            eprintln!(
+                "hive-comb: registered as {} with the keeper: node {}, epoch {}, lease {:?}",
+                link.name, l.node, l.epoch, l.ttl
+            );
+            (cfg.node, cfg.epoch) = (l.node, l.epoch);
+            Some((k, l))
+        }
+        None => None,
+    };
+    // Renewing starts now, since opening the comb over many cells can take longer than a lease.
+    let stop = CancellationToken::new();
+    let mut held = match keeper {
+        Some((k, l)) => tokio::spawn(lease::keep(k, l, stop.clone())),
+        None => tokio::spawn(std::future::pending()),
+    };
     let (socket, listen, metrics, scout) =
         (cfg.api_socket.clone(), cfg.listen, cfg.metrics, cfg.scout.clone());
     let mut term = signal(SignalKind::terminate())?;
@@ -129,16 +154,22 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
         socket.display(),
         listen.map_or(String::new(), |a| format!(" and {a}")),
     );
-    let stop = CancellationToken::new();
     if let Some(link) = scout {
         eprintln!("hive-comb: reporting to scout at {}", link.endpoint);
         tokio::spawn(hive_comb::report::run(comb.clone(), link, stop.clone()));
     }
     let mut server = tokio::spawn(hive_comb::api::serve(comb.clone(), listener, tcp, stop.clone()));
+    let mut lost = None;
     let served = tokio::select! {
         _ = term.recv() => None,
         _ = int.recv() => None,
         r = &mut server => Some(r),
+        // A comb that lost its lease has lost its node, and stops. Its cells keep running, and
+        // the next start registers again and fails them as lost.
+        Ok(Err(e)) = &mut held => {
+            lost = Some(e);
+            None
+        }
     };
     stop.cancel();
     let result = match served {
@@ -151,7 +182,10 @@ async fn run(cfg: hive_comb::Config) -> std::io::Result<()> {
     };
     let _ = std::fs::remove_file(&socket);
     comb.shutdown().await;
-    result
+    match lost {
+        Some(e) => Err(std::io::Error::other(e)),
+        None => result,
+    }
 }
 
 /// Every backend this node can run. One that cannot is left out, and the log says why.
