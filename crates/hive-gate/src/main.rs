@@ -103,7 +103,12 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(e.kind(), format!("listening on {}: {e}", cfg.listen)))?;
     let stop = CancellationToken::new();
     let nodes = Nodes::new(hive_scout::follow(cfg.scout.clone(), stop.clone()));
-    let gate = Gate::new(cfg.keys, nodes, &registry);
+    let keys = hive_gate::Keys::new(cfg.keys);
+    if !cfg.keeper.is_empty() {
+        hive_gate::keys::follow(keys.clone(), &cfg.keeper, stop.clone())
+            .map_err(std::io::Error::other)?;
+    }
+    let gate = Gate::new(keys, nodes, &registry);
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     tokio::spawn({

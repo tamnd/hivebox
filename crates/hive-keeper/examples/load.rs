@@ -4,6 +4,8 @@
 //! cargo run --release -p hive-keeper --example load -- ADDR NODES SECONDS
 //! cargo run --release -p hive-keeper --example load -- leader ADDR
 //! cargo run --release -p hive-keeper --example load -- nodes ADDR
+//! cargo run --release -p hive-keeper --example load -- key ADDR PROJECT
+//! cargo run --release -p hive-keeper --example load -- revoke ADDR PREFIX
 //! ```
 //!
 //! It registers `NODES` combs through the member at `ADDR`, then renews each lease once a second
@@ -37,6 +39,29 @@ async fn main() {
         for n in c.list_nodes(pb::ListNodesRequest {}).await.unwrap().into_inner().nodes {
             println!("node {} {} epoch {} lost {} at {}", n.node, n.name, n.epoch, n.lost, n.addr);
         }
+        return;
+    }
+    if let [key, addr, project] = &args[..]
+        && key == "key"
+    {
+        let channel =
+            Channel::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap();
+        let mut c = KeeperClient::new(channel);
+        // The project may be there from an earlier run.
+        let _ =
+            c.create_project(pb::CreateProjectRequest { name: project.clone(), quota: None }).await;
+        let made = c.create_key(pb::CreateKeyRequest { project: project.clone() }).await.unwrap();
+        println!("{}", made.into_inner().key);
+        return;
+    }
+    if let [revoke, addr, prefix] = &args[..]
+        && revoke == "revoke"
+    {
+        let channel =
+            Channel::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap();
+        let mut c = KeeperClient::new(channel);
+        let req = pb::RevokeKeyRequest { hash: Vec::new(), prefix: prefix.clone() };
+        println!("{}", c.revoke_key(req).await.unwrap().into_inner().revoked_ms);
         return;
     }
     let [addr, nodes, secs] = &args[..] else {

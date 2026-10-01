@@ -1036,6 +1036,7 @@ dependencies = [
  "bytes",
  "futures",
  "getrandom 0.4.3",
+ "hive-keeper",
  "hive-proto",
  "hive-scout",
  "hive-telemetry",
