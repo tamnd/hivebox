@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- A comb with a `[keeper]` section registers with the keeper before it opens and takes its node index and epoch from it, then renews its lease a third of the way through each lease. It keeps the last lease in `lease` in its data directory and asks for that epoch back, so a restart within the lease keeps its cells, and a restart after it ran out comes back in a new epoch and stops the cells from the old one. A comb whose lease is gone, or that could not reach the keeper before its lease ran out, stops and leaves its cells for the next start to fence. The keeper never hands a comb an epoch at or below the one it asks for, so a keeper that lost its data still fences old cells. On server3 against three keepers, a comb kept its epoch and its 5 running cells through a leader stop and a restart, came back in the next epoch and stopped all 5 after a restart 13 s later, and exited 8.8 s after every keeper stopped with a 10 s lease.
+
 ## 0.0.13
 
 The keeper, Connect on the gate, and cell ids fenced by epoch.

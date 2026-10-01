@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run --release -p hive-keeper --example load -- ADDR NODES SECONDS
 //! cargo run --release -p hive-keeper --example load -- leader ADDR
+//! cargo run --release -p hive-keeper --example load -- nodes ADDR
 //! ```
 //!
 //! It registers `NODES` combs through the member at `ADDR`, then renews each lease once a second
@@ -25,6 +26,17 @@ async fn main() {
             Channel::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap();
         let mut c = KeeperClient::new(channel);
         println!("{}", c.status(pb::StatusRequest {}).await.unwrap().into_inner().leader);
+        return;
+    }
+    if let [nodes, addr] = &args[..]
+        && nodes == "nodes"
+    {
+        let channel =
+            Channel::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap();
+        let mut c = KeeperClient::new(channel);
+        for n in c.list_nodes(pb::ListNodesRequest {}).await.unwrap().into_inner().nodes {
+            println!("node {} {} epoch {} lost {} at {}", n.node, n.name, n.epoch, n.lost, n.addr);
+        }
         return;
     }
     let [addr, nodes, secs] = &args[..] else {

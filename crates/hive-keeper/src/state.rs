@@ -235,7 +235,7 @@ impl State {
                 if let Some(n) = self.nodes.values_mut().find(|n| n.name == name) {
                     // A comb back within its lease keeps its epoch, and with it its cells.
                     if !(epoch == n.epoch && n.expires_ms > now_ms) {
-                        let Some(next) = n.epoch.checked_add(1) else {
+                        let Some(next) = n.epoch.max(epoch).checked_add(1) else {
                             return refused(Refusal::Exhausted(format!(
                                 "node {} used up its epochs",
                                 n.node
@@ -250,7 +250,12 @@ impl State {
                 let Some(node) = self.free_node() else {
                     return refused(Refusal::Exhausted("every node index is taken".into()));
                 };
-                let n = Node { node, name, addr, epoch: 1, expires_ms };
+                // A comb that ran in an epoch this keeper never gave, as when its data was
+                // lost, starts past it, so the cells it has from then are fenced off.
+                let Some(epoch) = epoch.checked_add(1) else {
+                    return refused(Refusal::Exhausted(format!("node {name} used up its epochs")));
+                };
+                let n = Node { node, name, addr, epoch, expires_ms };
                 self.nodes.insert(node, n.clone());
                 (Reply::Node(n), Some(Changed::Node(node)))
             }
@@ -424,5 +429,13 @@ mod tests {
         assert!(matches!(r[1], Reply::Refused(Refusal::Exists(_))));
         assert!(matches!(r[2], Reply::Project(_)));
         assert_eq!(changed, [Changed::Project("a".into()), Changed::Project("b".into())]);
+    }
+
+    #[test]
+    fn a_comb_asking_for_an_epoch_the_keeper_never_gave_starts_past_it() {
+        let mut s = State::default();
+        assert_eq!(node(register(&mut s, "a", 3, 0)).epoch, 4);
+        assert_eq!(node(register(&mut s, "a", 9, 1)).epoch, 10);
+        assert_eq!(node(register(&mut s, "a", 10, 2)).epoch, 10);
     }
 }

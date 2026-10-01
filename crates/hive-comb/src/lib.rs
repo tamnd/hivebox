@@ -12,6 +12,7 @@ mod cell;
 mod cgroups;
 mod comb;
 mod config;
+pub mod lease;
 mod metrics;
 mod net;
 mod netns;
@@ -22,5 +23,5 @@ mod wal;
 
 pub use cell::{CellInfo, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, WalStats};
-pub use config::{Config, ContainerBackend, Images, Network, ScoutLink};
+pub use config::{Config, ContainerBackend, Images, KeeperLink, Network, ScoutLink};
 pub use metrics::Metrics;
