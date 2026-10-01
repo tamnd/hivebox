@@ -54,12 +54,25 @@ impl Nodes {
     }
 
     /// The channel to the node that owns `id`. A cell whose node scout does not know is not
-    /// found, since as far as anyone can tell it is gone.
+    /// found, since as far as anyone can tell it is gone, and one made in an older epoch of its
+    /// node is lost: the comb registered again since and no longer has it.
     ///
     /// # Errors
     ///
-    /// As [`Nodes::channel`], with the node unknown reported as the cell not found.
+    /// As [`Nodes::channel`], with the node unknown reported as the cell not found, and
+    /// `CELL_LOST` for a stale epoch.
     pub fn owner(&self, id: CellId) -> Result<Channel, Error> {
+        let epoch = self.snapshot().epoch(id.node());
+        if epoch.is_some_and(|e| id.epoch() < e) {
+            return Err(Error::new(
+                Reason::CellLost,
+                format!(
+                    "cell {id} is from epoch {} of node {}, which is gone",
+                    id.epoch(),
+                    id.node()
+                ),
+            ));
+        }
         self.find(id.node()).unwrap_or_else(|| {
             Err(Error::new(Reason::CellNotFound, format!("cell {id} not found")))
         })

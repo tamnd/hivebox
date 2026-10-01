@@ -14,7 +14,7 @@ use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::exec_server::{Exec, ExecServer};
 use hive_scout::NodeReport;
-use hive_types::{Backend, CellId};
+use hive_types::{Backend, CellId, Reason};
 use hive_waggle::{BackendSet, LayerBloom};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -303,6 +303,8 @@ fn incoming(l: TcpListener) -> impl futures::Stream<Item = std::io::Result<tokio
 
 struct Cluster {
     combs: Vec<FakeComb>,
+    scout: hive_scout::Service,
+    comb_addrs: Vec<SocketAddr>,
     addr: SocketAddr,
     channel: Channel,
     stop: CancellationToken,
@@ -320,7 +322,7 @@ impl Cluster {
                 .add_service(scout.server())
                 .serve_with_incoming_shutdown(incoming(sl), stop.clone().cancelled_owned()),
         );
-        let mut combs = Vec::new();
+        let (mut combs, mut comb_addrs) = (Vec::new(), Vec::new());
         for node in 1..=2u16 {
             let comb = FakeComb { node, room: Arc::new(Mutex::new(room)), ..Default::default() };
             let (l, addr) = listen().await;
@@ -342,6 +344,7 @@ impl Cluster {
                 }
             });
             combs.push(comb);
+            comb_addrs.push(addr);
         }
         let nodes = Nodes::new(hive_scout::follow(format!("http://{saddr}"), stop.clone()));
         for _ in 0..100 {
@@ -360,7 +363,7 @@ impl Cluster {
             .connect()
             .await
             .unwrap();
-        Self { combs, addr: gaddr, channel, stop }
+        Self { combs, scout, comb_addrs, addr: gaddr, channel, stop }
     }
 
     fn cells(&self) -> CellsClient<Channel> {
@@ -503,6 +506,45 @@ async fn cells_a_full_node_turns_away_go_to_the_other() {
         let Some(v1::create_event::Result::Error(err)) = &e.result else { panic!("{e:?}") };
         assert_eq!(err.reason, "CAPACITY_UNAVAILABLE");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cells_from_an_older_epoch_of_their_node_are_lost() {
+    let c = Cluster::new(1000).await;
+    let events = create(&c, 20, "a").await;
+    let cells: Vec<&v1::Cell> = events.iter().map(|e| cell(e).expect("a cell")).collect();
+    let old = cells.iter().find(|c| c.node == "1").expect("a cell on node 1");
+    let kept = cells.iter().find(|c| c.node == "2").expect("a cell on node 2");
+
+    // Node 1 registers again. Its epoch 1 reports that keep coming are now stale to scout.
+    c.scout.apply(NodeReport { epoch: 2, ..report(1, c.comb_addrs[0], 1) });
+    let get = |id: &str| {
+        let mut cells = c.cells();
+        let req = authed(v1::GetCellRequest { id: id.to_owned() });
+        async move { cells.get(req).await }
+    };
+    let mut e = None;
+    for _ in 0..100 {
+        match get(&old.id).await {
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(s) => {
+                e = Some(s);
+                break;
+            }
+        }
+    }
+    let e = e.expect("the gate sees the new epoch");
+    assert_eq!(e.code(), tonic::Code::NotFound, "{e:?}");
+    assert_eq!(hive_proto::convert::error_from_status(&e).reason, Reason::CellLost);
+    let run = v1::RunRequest { cell_id: old.id.clone(), ..Default::default() };
+    let e = c.exec().run(authed(run)).await.unwrap_err();
+    assert_eq!(hive_proto::convert::error_from_status(&e).reason, Reason::CellLost);
+
+    // The other node is as it was, and node 1 still takes cells from its new epoch.
+    assert_eq!(get(&kept.id).await.unwrap().get_ref().id, kept.id);
+    let new = CellId::new(1, 1, 2, 1, 5).unwrap().to_string();
+    let e = get(&new).await.unwrap_err();
+    assert!(e.message().contains("no such cell"), "the comb answered: {e:?}");
 }
 
 /// A Connect call over HTTP/1.1: the status, the content type and the body that came back.

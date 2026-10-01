@@ -115,6 +115,7 @@ fn node_state(v: &NodeView, addr: &str, layers: bool) -> pb::NodeState {
     pb::NodeState {
         node: u32::from(v.node),
         report: v.report,
+        epoch: u32::from(v.epoch),
         addr: addr.to_owned(),
         healthy: v.healthy,
         backends: u32::from(v.backends.bits()),
@@ -142,6 +143,8 @@ pub(crate) fn from_node_state(
 ) -> Result<(NodeView, Arc<str>, Option<LayerBloom>), BadReport> {
     let node =
         u16::try_from(s.node).map_err(|_| BadReport(format!("node {} is past 65535", s.node)))?;
+    let epoch = u16::try_from(s.epoch)
+        .map_err(|_| BadReport(format!("epoch {} is past 65535", s.epoch)))?;
     let layers = if s.layers.is_empty() {
         None
     } else {
@@ -151,6 +154,7 @@ pub(crate) fn from_node_state(
     };
     let view = NodeView {
         node,
+        epoch,
         report: s.report,
         healthy: s.healthy,
         backends: BackendSet::from_bits(u8::try_from(s.backends & 0xff).unwrap_or(0)),

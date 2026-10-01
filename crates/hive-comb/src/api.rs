@@ -192,7 +192,9 @@ impl Api {
     /// The cell `id` if it belongs to `project`. Someone else's cell is not found, the same as
     /// one that does not exist.
     fn owned(&self, project: &str, id: CellId) -> Result<CellInfo, Error> {
-        self.comb.get(id).ok().filter(|c| c.project == project).ok_or_else(|| not_found(id))
+        self.comb
+            .get(id)
+            .and_then(|c| if c.project == project { Ok(c) } else { Err(not_found(id)) })
     }
 
     async fn drone(&self, project: &str, id: &str) -> Result<(CellId, hive_drone::Client), Status> {

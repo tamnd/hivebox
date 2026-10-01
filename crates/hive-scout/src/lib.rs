@@ -157,6 +157,13 @@ impl Snapshot {
         let at = self.addrs.binary_search_by_key(&node, |(n, _)| *n).ok()?;
         Some(&self.addrs[at].1)
     }
+
+    /// The registration epoch `node` last reported.
+    #[must_use]
+    pub fn epoch(&self, node: u16) -> Option<u16> {
+        let at = self.addrs.binary_search_by_key(&node, |(n, _)| *n).ok()?;
+        Some(self.view.nodes[at].epoch)
+    }
 }
 
 /// Sums over the healthy nodes.
@@ -253,6 +260,7 @@ impl Scout {
         self.taken += 1;
         let view = NodeView {
             node: report.node,
+            epoch: report.epoch,
             report: self.taken,
             healthy: report.healthy,
             backends: report.backends,
