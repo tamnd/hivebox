@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/hivebox/v1/images.proto",
         "proto/hivebox/v1/verify.proto",
         "proto/hivebox/internal/v1/scout.proto",
+        "proto/hivebox/internal/v1/keeper.proto",
     ];
     println!("cargo:rerun-if-changed=proto");
     let fds = protox::compile(FILES, ["proto"])?;

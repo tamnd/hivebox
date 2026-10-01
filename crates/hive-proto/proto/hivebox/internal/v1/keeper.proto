@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package hivebox.internal.v1;
+
+// The keeper holds the state that has to agree across the cluster: projects, API keys and the
+// nodes with their leases. It is a Raft group of three or five, and any member takes any call.
+// A write on a follower is passed to the leader, and a read is answered from the member's own
+// copy, which may trail the leader by a heartbeat.
+service Keeper {
+  rpc CreateProject(CreateProjectRequest) returns (Project);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+  // Makes a key for a project. The key is in the answer and nowhere else, since the keeper
+  // keeps only its hash.
+  rpc CreateKey(CreateKeyRequest) returns (CreateKeyResponse);
+  rpc RevokeKey(RevokeKeyRequest) returns (KeyInfo);
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+  // A comb asks for its node index and epoch when it starts, and again once its lease is lost.
+  rpc Register(RegisterRequest) returns (Lease);
+  // A comb renews its lease well before it runs out. A lease that ran out cannot be renewed,
+  // and the comb has to register again and gets a new epoch.
+  rpc Renew(RenewRequest) returns (Lease);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  // Where this member stands in the Raft group.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message Quota {
+  // Most live cells the project may have. 0 is no limit.
+  uint64 cells = 1;
+  // Most creates a second. 0 is no limit.
+  uint32 creates_per_s = 2;
+}
+
+message Project {
+  string name = 1;
+  Quota quota = 2;
+  uint64 created_ms = 3;
+}
+
+message CreateProjectRequest {
+  string name = 1;
+  Quota quota = 2;
+}
+
+message ListProjectsRequest {}
+
+message ListProjectsResponse {
+  repeated Project projects = 1;
+}
+
+message KeyInfo {
+  // The first 8 characters of the key, to tell keys apart without the key.
+  string prefix = 1;
+  string project = 2;
+  // The BLAKE3 hash of the key, 32 bytes.
+  bytes hash = 3;
+  uint64 created_ms = 4;
+  // 0 while the key works.
+  uint64 revoked_ms = 5;
+}
+
+message CreateKeyRequest {
+  string project = 1;
+}
+
+message CreateKeyResponse {
+  string key = 1;
+  KeyInfo info = 2;
+}
+
+message RevokeKeyRequest {
+  // The key's hash. Either it or the prefix names the key.
+  bytes hash = 1;
+  string prefix = 2;
+}
+
+message ListKeysRequest {
+  // Only this project's keys, or every key when empty.
+  string project = 1;
+}
+
+message ListKeysResponse {
+  repeated KeyInfo keys = 1;
+}
+
+message RegisterRequest {
+  // A name for the machine that stays the same across restarts, like its hostname. A comb that
+  // registers under a name it had before gets its old node index back.
+  string name = 1;
+  // Where gates reach the comb, like http://10.0.0.7:7420.
+  string addr = 2;
+  // The epoch the comb last ran in, or 0. Within its lease, a comb that restarts keeps its epoch
+  // and its cells.
+  uint32 epoch = 3;
+}
+
+message RenewRequest {
+  uint32 node = 1;
+  uint32 epoch = 2;
+}
+
+message Lease {
+  uint32 node = 1;
+  uint32 epoch = 2;
+  // When the lease runs out, in milliseconds since the Unix epoch, by the keeper's clock.
+  uint64 expires_ms = 3;
+  // How long a lease lasts, so the comb can renew without trusting the clocks to agree.
+  uint64 ttl_ms = 4;
+}
+
+message ListNodesRequest {}
+
+message NodeRecord {
+  uint32 node = 1;
+  string name = 2;
+  string addr = 3;
+  uint32 epoch = 4;
+  uint64 expires_ms = 5;
+  // Whether the lease had run out when the member answered.
+  bool lost = 6;
+}
+
+message ListNodesResponse {
+  repeated NodeRecord nodes = 1;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 id = 1;
+  // The leader this member knows of, or 0.
+  uint64 leader = 2;
+  uint64 term = 3;
+  // The index of the last log entry this member applied.
+  uint64 applied = 4;
+  // The voters, by Raft id.
+  repeated uint64 voters = 5;
+}
+
+// The Raft messages between keeper members. Each carries one openraft request or answer as
+// JSON, since the group does hundreds of writes a second at most and JSON keeps them readable.
+service Raft {
+  rpc AppendEntries(RaftMessage) returns (RaftMessage);
+  rpc Vote(RaftMessage) returns (RaftMessage);
+  rpc InstallSnapshot(RaftMessage) returns (RaftMessage);
+  // A write a follower took, passed to the leader to put in the log.
+  rpc Propose(RaftMessage) returns (RaftMessage);
+}
+
+message RaftMessage {
+  bytes json = 1;
+}
