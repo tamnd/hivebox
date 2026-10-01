@@ -115,7 +115,11 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             .map_err(std::io::Error::other)?;
         Some(q)
     };
-    let gate = Gate::new(keys, nodes, quotas.clone(), &registry);
+    let mut gate = Gate::new(keys, nodes, quotas.clone(), &registry);
+    if !cfg.keeper.is_empty() {
+        let api = hive_gate::tokens::Api::new(&cfg.keeper).map_err(std::io::Error::other)?;
+        gate = gate.with_tokens(api);
+    }
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     tokio::spawn({

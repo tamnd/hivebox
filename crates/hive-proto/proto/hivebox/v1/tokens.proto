@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// Tokens are biscuits signed by the keeper. A token opens the same project as the API key it was
+// made with, for at most an hour, and its holder can narrow it down further without asking
+// anyone, to some cells, some calls or a sooner end. Give a token, not the key, to code that
+// should only reach part of a project, like an agent working in one cell.
+service Tokens {
+  // Makes a token from the API key the call carries. A token can not make another token.
+  rpc Mint(MintTokenRequest) returns (Token);
+}
+
+message MintTokenRequest {
+  // How long the token lasts, at most an hour, and an hour when not set.
+  google.protobuf.Duration ttl = 1;
+  // Only these cells, or any when empty. A token held to some cells can not create or list.
+  repeated string cell_ids = 2;
+  // Only these calls, or any when empty: create, get, list, watch, pause, resume, stop,
+  // extend_ttl, update_policy, expose_port, exec and files.
+  repeated string ops = 3;
+}
+
+message Token {
+  // The token, to send as `authorization: Bearer TOKEN` like a key.
+  string token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
