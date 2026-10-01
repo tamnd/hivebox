@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/hivebox/v1/snapshots.proto",
         "proto/hivebox/v1/images.proto",
         "proto/hivebox/v1/verify.proto",
+        "proto/hivebox/v1/tokens.proto",
         "proto/hivebox/internal/v1/scout.proto",
         "proto/hivebox/internal/v1/keeper.proto",
     ];

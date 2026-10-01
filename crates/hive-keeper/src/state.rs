@@ -149,6 +149,12 @@ pub enum Command {
         /// How long the share lasts.
         ttl_ms: u64,
     },
+    /// Sets the key the keeper signs tokens with, if it has none. The first one wins, so two
+    /// members that each made a key on their first token end up with the same one.
+    SetRoot {
+        /// The Ed25519 private key.
+        private: [u8; 32],
+    },
     /// Several commands in one log entry, applied in order. Calls that arrive together are
     /// sent this way so they cost one round of disk writes instead of one each.
     Batch(Vec<Command>),
@@ -165,6 +171,8 @@ pub enum Reply {
     Key([u8; 32], Key),
     /// The node registered or renewed.
     Node(Node),
+    /// The key the keeper signs tokens with.
+    Root([u8; 32]),
     /// The share a gate got, with the project's whole quota and whether any gate got less than
     /// it asked for.
     Slice(Quota, Slice, bool),
@@ -198,6 +206,9 @@ pub struct State {
     pub keys: BTreeMap<[u8; 32], Key>,
     /// Nodes by index.
     pub nodes: BTreeMap<u16, Node>,
+    /// The Ed25519 private key tokens are signed with, made on the first token.
+    #[serde(default)]
+    pub root: Option<[u8; 32]>,
 }
 
 impl State {
@@ -269,6 +280,13 @@ impl State {
                     k.revoked_ms = now_ms;
                 }
                 (Reply::Key(h, k.clone()), Some(Changed::Key(h)))
+            }
+            Command::SetRoot { private } => {
+                if let Some(root) = self.root {
+                    return (Reply::Root(root), None);
+                }
+                self.root = Some(private);
+                (Reply::Root(private), Some(Changed::Root))
             }
             Command::Register { name, addr, epoch, now_ms, ttl_ms } => {
                 if !hive_types::is_name(&name) {
@@ -396,6 +414,8 @@ pub enum Changed {
     Key([u8; 32]),
     /// The node with this index.
     Node(u16),
+    /// The signing key.
+    Root,
 }
 
 fn refused(r: Refusal) -> (Reply, Option<Changed>) {
@@ -578,5 +598,15 @@ mod tests {
             s.apply(cmd).0,
             Reply::Slice(_, Slice { cells: 7, creates_per_s: 9, .. }, false)
         ));
+    }
+
+    #[test]
+    fn the_first_signing_key_set_is_the_one_kept() {
+        let mut s = State::default();
+        let (r, row) = s.apply(Command::SetRoot { private: [1; 32] });
+        assert_eq!((r, row), (Reply::Root([1; 32]), Some(Changed::Root)));
+        let (r, row) = s.apply(Command::SetRoot { private: [2; 32] });
+        assert_eq!((r, row), (Reply::Root([1; 32]), None));
+        assert_eq!(s.root, Some([1; 32]));
     }
 }

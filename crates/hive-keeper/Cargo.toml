@@ -17,6 +17,7 @@ publish.workspace = true
 blake3.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+hive-auth.workspace = true
 hive-proto.workspace = true
 hive-types.workspace = true
 openraft.workspace = true

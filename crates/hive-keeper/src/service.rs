@@ -1,7 +1,7 @@
 //! The keeper's gRPC service: writes go through the Raft log, reads come from this member's copy.
 
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hive_proto::internal as pb;
@@ -35,6 +35,7 @@ pub struct Keeper {
     store: Store,
     writes: mpsc::Sender<Waiting>,
     lease_ms: u64,
+    issuer: Arc<OnceLock<hive_auth::Issuer>>,
 }
 
 /// A write waiting for its batch, and where its answer goes.
@@ -62,7 +63,7 @@ impl Keeper {
         let lease_ms = u64::try_from(lease.as_millis()).unwrap_or(u64::MAX);
         let (writes, rx) = mpsc::channel(MAX_BATCH * IN_FLIGHT);
         tokio::spawn(batch(Writer { raft: raft.clone(), peers }, rx));
-        Self { id, raft, store, writes, lease_ms }
+        Self { id, raft, store, writes, lease_ms, issuer: Arc::default() }
     }
 
     /// Puts `cmd` in the log, with the other writes that came in at the same time, and returns
@@ -225,7 +226,14 @@ impl keeper_server::Keeper for Keeper {
                 .map(|(h, k)| key_info(h, k))
                 .collect()
         });
-        Ok(Response::new(pb::ListKeysResponse { keys }))
+        let root_public_key = match self.issuer.get() {
+            Some(i) => i.public(),
+            None => match self.store.read(|s| s.root) {
+                Some(root) => self.issuer_from(&root)?.public(),
+                None => Vec::new(),
+            },
+        };
+        Ok(Response::new(pb::ListKeysResponse { keys, root_public_key }))
     }
 
     async fn register(
@@ -310,6 +318,48 @@ impl keeper_server::Keeper for Keeper {
         }
     }
 
+    async fn mint_token(
+        &self,
+        req: Request<pb::MintTokenRequest>,
+    ) -> Result<Response<pb::MintTokenResponse>, Status> {
+        let req = req.into_inner();
+        let hash = <[u8; 32]>::try_from(req.key_hash.as_slice())
+            .map_err(|_| Status::invalid_argument("a key hash is 32 bytes"))?;
+        let max = u64::try_from(hive_auth::MAX_TTL.as_millis()).unwrap_or(u64::MAX);
+        let ttl_ms = match req.ttl_ms {
+            0 => max,
+            t => t.min(max),
+        };
+        let project = self
+            .store
+            .read(|s| s.keys.get(&hash).filter(|k| k.revoked_ms == 0).map(|k| k.project.clone()));
+        let project = project.ok_or_else(|| Status::permission_denied("no such key"))?;
+        let issuer = match self.issuer.get() {
+            Some(i) => i,
+            None => {
+                let root = match self.store.read(|s| s.root) {
+                    Some(r) => r,
+                    None => {
+                        let mut fresh = [0u8; 32];
+                        getrandom::fill(&mut fresh).map_err(|e| Status::internal(e.to_string()))?;
+                        match self.write(Command::SetRoot { private: fresh }).await? {
+                            Reply::Root(r) => r,
+                            r => return Err(unexpected(&r)),
+                        }
+                    }
+                };
+                self.issuer_from(&root)?
+            }
+        };
+        let expires_ms = now_ms().saturating_add(ttl_ms);
+        let until = UNIX_EPOCH + Duration::from_millis(expires_ms);
+        let narrow = hive_auth::Narrow { cells: req.cells, ops: req.ops, until: None };
+        let token = issuer
+            .mint(&project, &hash, until, &narrow)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        Ok(Response::new(pb::MintTokenResponse { token, expires_ms, project }))
+    }
+
     async fn status(
         &self,
         _: Request<pb::StatusRequest>,
@@ -326,6 +376,16 @@ impl keeper_server::Keeper for Keeper {
 }
 
 impl Keeper {
+    /// The issuer for the signing key `root`, kept for the next call. The key never changes
+    /// once it is set, so the first one kept is the one.
+    fn issuer_from(&self, root: &[u8; 32]) -> Result<&hive_auth::Issuer, Status> {
+        if self.issuer.get().is_none() {
+            let i = hive_auth::Issuer::new(root).map_err(|e| Status::internal(e.to_string()))?;
+            let _ = self.issuer.set(i);
+        }
+        self.issuer.get().ok_or_else(|| Status::internal("no signing key"))
+    }
+
     fn lease(&self, n: &Node) -> pb::Lease {
         pb::Lease {
             node: u32::from(n.node),

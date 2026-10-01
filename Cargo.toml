@@ -56,6 +56,8 @@ hivectl = { version = "=0.0.13", path = "crates/hivectl" }
 # in the pull request saying why the standard library or an existing one is not enough.
 aya = { version = "0.14", default-features = false }
 base64 = "0.22"
+# Capability tokens that holders can narrow down offline and the gate checks with a public key.
+biscuit-auth = { version = "6", default-features = false, features = ["datalog-macro"] }
 blake3 = "1.8"
 bytes = "1.12"
 flate2 = "1.1"

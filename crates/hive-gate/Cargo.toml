@@ -19,6 +19,7 @@ blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+hive-auth.workspace = true
 hive-proto.workspace = true
 hive-scout.workspace = true
 hive-telemetry.workspace = true

@@ -21,9 +21,9 @@ use tokio::task::JoinSet;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
-use crate::PROJECT_HEADER;
 use crate::nodes::Nodes;
 use crate::quota::Quotas;
+use crate::{Grant, PROJECT_HEADER};
 
 /// The most cells one create call may ask for.
 pub const MAX_COUNT: u32 = 32_768;
@@ -147,7 +147,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::CreateRequest>,
     ) -> Result<Response<Self::CreateStream>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "create", None)?;
         let req = req.into_inner();
         let count = req.count.max(1);
         if count > MAX_COUNT {
@@ -187,7 +187,7 @@ impl Cells for Api {
     }
 
     async fn get(&self, req: Request<v1::GetCellRequest>) -> Result<Response<v1::Cell>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "get", Some(&req.get_ref().id))?;
         let req = req.into_inner();
         self.owner(&req.id)?.get(out(&project, req)).await
     }
@@ -196,7 +196,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::ListCellsRequest>,
     ) -> Result<Response<v1::ListCellsResponse>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "list", None)?;
         let req = req.into_inner();
         let size = match req.page_size {
             0 => PAGE,
@@ -265,7 +265,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::WatchCellsRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "watch", selected(req.get_ref().selector.as_ref()))?;
         let req = req.into_inner();
         let labels = match req.selector.as_ref().and_then(|s| s.by.as_ref()) {
             Some(v1::cell_selector::By::Id(id)) => {
@@ -287,7 +287,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::CellSelector>,
     ) -> Result<Response<v1::BulkResult>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "pause", selected(Some(req.get_ref())))?;
         let sel = req.into_inner();
         if let Some(v1::cell_selector::By::Id(id)) = &sel.by {
             return self.owner(id)?.pause(out(&project, sel)).await;
@@ -300,7 +300,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::CellSelector>,
     ) -> Result<Response<v1::BulkResult>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "resume", selected(Some(req.get_ref())))?;
         let sel = req.into_inner();
         if let Some(v1::cell_selector::By::Id(id)) = &sel.by {
             return self.owner(id)?.resume(out(&project, sel)).await;
@@ -313,7 +313,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::StopRequest>,
     ) -> Result<Response<v1::BulkResult>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "stop", selected(req.get_ref().selector.as_ref()))?;
         let req = req.into_inner();
         if let Some(v1::cell_selector::By::Id(id)) =
             req.selector.as_ref().and_then(|s| s.by.as_ref())
@@ -328,7 +328,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::ExtendTtlRequest>,
     ) -> Result<Response<v1::Cell>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "extend_ttl", Some(&req.get_ref().id))?;
         let req = req.into_inner();
         self.owner(&req.id)?.extend_ttl(out(&project, req)).await
     }
@@ -337,7 +337,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::UpdatePolicyRequest>,
     ) -> Result<Response<v1::Cell>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "update_policy", Some(&req.get_ref().id))?;
         let req = req.into_inner();
         self.owner(&req.id)?.update_policy(out(&project, req)).await
     }
@@ -346,7 +346,7 @@ impl Cells for Api {
         &self,
         req: Request<v1::ExposePortRequest>,
     ) -> Result<Response<v1::PortEndpoint>, Status> {
-        let project = project(&req)?;
+        let project = allowed(&req, "expose_port", Some(&req.get_ref().id))?;
         let req = req.into_inner();
         self.owner(&req.id)?.expose_port(out(&project, req)).await
     }
@@ -597,6 +597,23 @@ fn parse_token(t: &str) -> Result<(u16, Option<CellId>), Status> {
     }
     let id: CellId = t.parse().map_err(|_| bad())?;
     Ok((id.node(), Some(id)))
+}
+
+/// The project the gate stamped on the call, once the call's token, if it came with one, allows
+/// `op` on `cell`. A token held to some cells allows no call that is not about one cell.
+fn allowed<T>(req: &Request<T>, op: &str, cell: Option<&str>) -> Result<String, Status> {
+    // The id as the comb reads it, so two ways of writing one id can not get past a check.
+    let cell = cell.map(|c| c.parse::<CellId>().map_or_else(|_| c.to_owned(), |id| id.to_string()));
+    Grant::check(req.extensions().get::<Grant>(), op, cell.as_deref())?;
+    project(req)
+}
+
+/// The cell a selector names, when it names one by id.
+fn selected(sel: Option<&v1::CellSelector>) -> Option<&str> {
+    match sel?.by.as_ref()? {
+        v1::cell_selector::By::Id(id) => Some(id),
+        v1::cell_selector::By::Labels(_) => None,
+    }
 }
 
 /// The project the gate stamped on the call when it checked the key.

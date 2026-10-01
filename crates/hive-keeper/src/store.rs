@@ -52,6 +52,7 @@ const PURGED: &str = "purged";
 const APPLIED: &str = "applied";
 const MEMBERSHIP: &str = "membership";
 const SNAPSHOT: &str = "snapshot";
+const ROOT: &str = "root";
 
 /// The state machine as one value, for snapshots.
 #[derive(Serialize, Deserialize)]
@@ -61,6 +62,8 @@ struct Image {
     projects: Vec<Project>,
     keys: Vec<([u8; 32], Key)>,
     nodes: Vec<Node>,
+    #[serde(default)]
+    root: Option<[u8; 32]>,
 }
 
 /// A snapshot as it is kept, the meta and the bytes.
@@ -149,6 +152,7 @@ impl Store {
             membership: get(&meta, MEMBERSHIP)?.unwrap_or_default(),
             ..Applied::default()
         };
+        a.state.root = get(&meta, ROOT)?;
         for row in tx.open_table(PROJECTS).map_err(read)?.iter().map_err(read)? {
             let (k, v) = row.map_err(read)?;
             a.state.projects.insert(k.value().to_owned(), decode(v.value())?);
@@ -188,6 +192,7 @@ impl Store {
             projects: a.state.projects.values().cloned().collect(),
             keys: a.state.keys.iter().map(|(h, k)| (*h, k.clone())).collect(),
             nodes: a.state.nodes.values().cloned().collect(),
+            root: a.state.root,
         };
         encode(&image)
     }
@@ -353,6 +358,10 @@ impl RaftStorage<TypeConfig> for Store {
             let mut m = tx.open_table(META).map_err(write_sm)?;
             m.insert(APPLIED, encode(&meta.last_log_id)?.as_slice()).map_err(write_sm)?;
             m.insert(MEMBERSHIP, encode(&meta.last_membership)?.as_slice()).map_err(write_sm)?;
+            match &image.root {
+                Some(r) => m.insert(ROOT, encode(r)?.as_slice()).map(drop).map_err(write_sm)?,
+                None => m.remove(ROOT).map(drop).map_err(write_sm)?,
+            }
             let kept = Kept { meta: meta.clone(), data: data.clone() };
             m.insert(SNAPSHOT, encode(&kept)?.as_slice()).map_err(write_sm)?;
         }
@@ -363,6 +372,7 @@ impl RaftStorage<TypeConfig> for Store {
             projects: image.projects.into_iter().map(|p| (p.name.clone(), p)).collect(),
             keys: image.keys.into_iter().collect(),
             nodes: image.nodes.into_iter().map(|n| (n.node, n)).collect(),
+            root: image.root,
         };
         Ok(())
     }
@@ -412,6 +422,11 @@ impl Inner {
                     Changed::Key(hash) => {
                         let k = encode(&a.state.keys[&hash])?;
                         keys.insert(hash.as_slice(), k.as_slice()).map_err(write_sm)?;
+                    }
+                    Changed::Root => {
+                        if let Some(r) = &a.state.root {
+                            meta.insert(ROOT, encode(r)?.as_slice()).map_err(write_sm)?;
+                        }
                     }
                     Changed::Node(n) => {
                         nodes

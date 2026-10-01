@@ -24,6 +24,9 @@ service Keeper {
   // when half of it is spent or it is about to run out. Each call replaces the gate's last
   // share, and asking for nothing gives it back.
   rpc TakeQuota(TakeQuotaRequest) returns (QuotaSlice);
+  // Signs a token for the project of a key that is not revoked. The gate sends the hash of the
+  // key the caller showed, never the key. The first token makes the keeper's signing key.
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
   // Where this member stands in the Raft group.
   rpc Status(StatusRequest) returns (StatusResponse);
 }
@@ -85,6 +88,25 @@ message ListKeysRequest {
 
 message ListKeysResponse {
   repeated KeyInfo keys = 1;
+  // The Ed25519 key tokens are checked with, or empty before the first token.
+  bytes root_public_key = 2;
+}
+
+message MintTokenRequest {
+  // The BLAKE3 hash of the API key.
+  bytes key_hash = 1;
+  // How long the token lasts, at most an hour, and an hour when 0.
+  uint64 ttl_ms = 2;
+  // Only these cells, or any when empty.
+  repeated string cells = 3;
+  // Only these calls, or any when empty.
+  repeated string ops = 4;
+}
+
+message MintTokenResponse {
+  string token = 1;
+  uint64 expires_ms = 2;
+  string project = 3;
 }
 
 message RegisterRequest {

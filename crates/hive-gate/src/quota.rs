@@ -21,7 +21,7 @@ use hive_scout::project_id;
 use hive_telemetry::CounterVec;
 use hive_types::{Error, Reason};
 use tonic::Code;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 use crate::nodes::Nodes;
 
@@ -66,20 +66,7 @@ impl Quotas {
         nodes: Nodes,
         registry: &hive_telemetry::Registry,
     ) -> Result<Self, String> {
-        let members = members
-            .iter()
-            .map(|m| {
-                let channel = Endpoint::from_shared(format!("http://{m}"))
-                    .map_err(|e| format!("keeper member {m}: {e}"))?
-                    .connect_timeout(Duration::from_secs(1))
-                    .timeout(Duration::from_secs(5))
-                    .connect_lazy();
-                Ok((m.clone(), KeeperClient::new(channel)))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        if members.is_empty() {
-            return Err("the keeper has no members".into());
-        }
+        let members = crate::keys::clients(members)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 gate,

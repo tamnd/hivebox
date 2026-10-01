@@ -16,6 +16,7 @@ pub mod keys;
 pub mod nodes;
 pub mod proxy;
 pub mod quota;
+pub mod tokens;
 
 use std::convert::Infallible;
 use std::io;
@@ -24,6 +25,7 @@ use std::time::Duration;
 
 use futures::{FutureExt, stream};
 use hive_proto::v1::cells_server::CellsServer;
+use hive_proto::v1::tokens_server::TokensServer;
 use hive_telemetry::{CounterVec, Registry};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +42,24 @@ pub use quota::Quotas;
 /// drops whatever the caller put there.
 pub const PROJECT_HEADER: &str = "x-hive-project";
 
+/// A token the call came with, which the services ask what it allows once they know the call's
+/// cell. A call with an API key has none.
+#[derive(Clone, Debug)]
+pub struct Grant(pub Arc<hive_auth::Token>);
+
+impl Grant {
+    /// Whether the call's token, if it came with one, allows `op` on `cell`.
+    ///
+    /// # Errors
+    ///
+    /// `permission_denied`, saying why.
+    pub fn check(grant: Option<&Self>, op: &str, cell: Option<&str>) -> Result<(), Status> {
+        let Some(Self(t)) = grant else { return Ok(()) };
+        t.allows(op, cell, std::time::SystemTime::now())
+            .map_err(|e| Status::permission_denied(e.to_string()))
+    }
+}
+
 /// The biggest request message, which is mostly stdin for a run. The same as a comb takes.
 const MAX_REQUEST: usize = 64 << 20;
 
@@ -49,6 +69,7 @@ pub struct Gate {
     keys: Keys,
     nodes: Nodes,
     cells: CellsServer<cells::Api>,
+    tokens: Option<TokensServer<tokens::Api>>,
     calls: CounterVec,
 }
 
@@ -67,6 +88,7 @@ impl Gate {
             keys: keys.into(),
             nodes,
             cells: CellsServer::new(api).max_decoding_message_size(MAX_REQUEST),
+            tokens: None,
             calls: registry.counter(
                 "hive_gate_calls_total",
                 "Calls the gate took, by method and whether the key was good.",
@@ -75,12 +97,34 @@ impl Gate {
         }
     }
 
-    /// The project the `authorization: Bearer KEY` header opens.
-    fn project(&self, req: &http::Request<Body>) -> Option<Arc<str>> {
-        let value = req.headers().get(http::header::AUTHORIZATION)?.to_str().ok()?;
-        let key = value.strip_prefix("Bearer ")?;
-        self.keys.project(blake3::hash(key.as_bytes()).as_bytes())
+    /// The gate with the Tokens service, which asks the keeper to sign tokens.
+    #[must_use]
+    pub fn with_tokens(mut self, api: tokens::Api) -> Self {
+        self.tokens = Some(TokensServer::new(api));
+        self
     }
+
+    /// Who the `authorization: Bearer KEY` header says the caller is: the project, and the
+    /// token or the hash of the key it was.
+    fn caller(&self, req: &http::Request<Body>) -> Result<(Arc<str>, Credential), String> {
+        let missing = || "the key or token is missing".to_string();
+        let value = req.headers().get(http::header::AUTHORIZATION).ok_or_else(missing)?;
+        let bearer =
+            value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")).ok_or_else(missing)?;
+        if hive_auth::is_token(bearer) {
+            let t = self.keys.token(bearer)?;
+            return Ok((Arc::from(t.project.as_str()), Credential::Token(Grant(t))));
+        }
+        let hash = *blake3::hash(bearer.as_bytes()).as_bytes();
+        let project = self.keys.project(&hash).ok_or("the key is not one the gate knows")?;
+        Ok((project, Credential::Key(tokens::KeyHash(hash))))
+    }
+}
+
+/// What a caller showed to get in.
+enum Credential {
+    Key(tokens::KeyHash),
+    Token(Grant),
 }
 
 impl Service<http::Request<Body>> for Gate {
@@ -102,14 +146,22 @@ impl Service<http::Request<Body>> for Gate {
         let (to, op) = match req.uri().path().strip_prefix('/').and_then(|p| p.split_once('/')) {
             Some(("hivebox.v1.Cells", m)) => (To::Cells, m),
             Some(("hivebox.v1.Exec" | "hivebox.v1.Files", m)) => (To::Comb, m),
+            Some(("hivebox.v1.Tokens", m)) => (To::Tokens, m),
             _ => (To::Nowhere, "unknown"),
         };
-        let Some(project) = self.project(&req) else {
-            self.calls.with(&[op, "denied"]).inc();
-            let status = Status::unauthenticated("the key is missing or not one the gate knows");
-            return Box::pin(async move { Ok(status.into_http()) });
+        let (project, credential) = match self.caller(&req) {
+            Ok(c) => c,
+            Err(why) => {
+                self.calls.with(&[op, "denied"]).inc();
+                let status = Status::unauthenticated(why);
+                return Box::pin(async move { Ok(status.into_http()) });
+            }
         };
         self.calls.with(&[op, "ok"]).inc();
+        match credential {
+            Credential::Key(hash) => req.extensions_mut().insert(hash).map(drop),
+            Credential::Token(grant) => req.extensions_mut().insert(grant).map(drop),
+        };
         let headers = req.headers_mut();
         headers.remove(http::header::AUTHORIZATION);
         if let Ok(v) = http::HeaderValue::from_str(&project) {
@@ -121,6 +173,13 @@ impl Service<http::Request<Body>> for Gate {
                 let nodes = self.nodes.clone();
                 Box::pin(async move { Ok(proxy::forward(&nodes, req).await) })
             }
+            To::Tokens => match &mut self.tokens {
+                Some(t) => Box::pin(t.call(req)),
+                None => {
+                    let status = Status::unimplemented("this gate has no keeper to sign tokens");
+                    Box::pin(async move { Ok(status.into_http()) })
+                }
+            },
             To::Nowhere => {
                 let status = Status::unimplemented(format!("no service at {}", req.uri().path()));
                 Box::pin(async move { Ok(status.into_http()) })
@@ -135,6 +194,8 @@ enum To {
     Cells,
     /// Straight to the comb that owns the cell.
     Comb,
+    /// The gate's Tokens service.
+    Tokens,
     Nowhere,
 }
 
