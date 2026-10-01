@@ -42,4 +42,5 @@ tower = { workspace = true, features = ["util"] }
 workspace = true
 
 [dev-dependencies]
+hive-keeper.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }

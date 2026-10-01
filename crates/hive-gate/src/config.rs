@@ -17,6 +17,9 @@ pub struct Config {
     pub scout: String,
     /// The project each API key opens, by the BLAKE3 hash of the key.
     pub keys: HashMap<[u8; 32], Arc<str>>,
+    /// The keeper members to read the rest of the keys from, as `host:port`. Empty means only
+    /// the keys here.
+    pub keeper: Vec<String>,
 }
 
 impl Config {
@@ -28,14 +31,16 @@ impl Config {
     /// listen = "0.0.0.0:7400"
     /// metrics = "127.0.0.1:9467"
     /// scout = "http://10.0.0.5:7410"
+    /// keeper = ["10.0.0.1:7430", "10.0.0.2:7430", "10.0.0.3:7430"]
     ///
     /// [[key]]
     /// project = "swe"
     /// blake3 = "5c1f...64 hex digits"
     /// ```
     ///
-    /// Keys stand in for the keeper until it exists. `hive-gate key PROJECT` makes one and
-    /// prints the lines to add here.
+    /// With `keeper`, the gate takes the keys the keeper holds, and `[[key]]` is for keys that
+    /// have to work when the keeper is down. Without it, only the keys here work.
+    /// `hive-gate key PROJECT` makes one and prints the lines to add here.
     ///
     /// # Errors
     ///
@@ -63,10 +68,15 @@ impl Config {
                 return Err(format!("the key for {} is there twice", k.project));
             }
         }
-        if keys.is_empty() {
-            return Err("no [[key]], so nobody could call the gate".into());
+        for m in &g.keeper {
+            if m.contains("://") || !m.contains(':') {
+                return Err(format!("gate.keeper has {m:?}, which is not host:port"));
+            }
         }
-        Ok(Self { listen, metrics, scout, keys })
+        if keys.is_empty() && g.keeper.is_empty() {
+            return Err("no [[key]] and no gate.keeper, so nobody could call the gate".into());
+        }
+        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper })
     }
 }
 
@@ -125,6 +135,8 @@ struct Gate {
     listen: Option<String>,
     metrics: Option<String>,
     scout: Option<String>,
+    #[serde(default)]
+    keeper: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +163,16 @@ mod tests {
     }
 
     #[test]
+    fn a_keeper_is_enough_without_keys() {
+        let c = Config::from_toml(
+            "[gate]\nscout = \"http://s:7410\"\nkeeper = [\"k1:7430\", \"k2:7430\"]\n",
+        )
+        .unwrap();
+        assert!(c.keys.is_empty());
+        assert_eq!(c.keeper, ["k1:7430", "k2:7430"]);
+    }
+
+    #[test]
     fn mistakes_are_errors() {
         let key = "[[key]]\nproject = \"swe\"\nblake3 = \"".to_string() + &"ab".repeat(32) + "\"\n";
         let scout = "[gate]\nscout = \"http://s:7410\"\n";
@@ -163,6 +185,7 @@ mod tests {
             (format!("{scout}{}", key.replace("ab", "zz")), "not 64 hex digits"),
             (format!("{scout}{key}{key}"), "there twice"),
             (format!("{scout}{}", key.replace("swe", "a b")), "not a name"),
+            (format!("{scout}keeper = [\"http://k:7430\"]\n"), "not host:port"),
         ];
         for (text, want) in cases {
             let e = Config::from_toml(&text).unwrap_err();

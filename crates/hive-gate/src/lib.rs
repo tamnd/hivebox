@@ -12,10 +12,10 @@
 pub mod cells;
 pub mod config;
 mod connect;
+pub mod keys;
 pub mod nodes;
 pub mod proxy;
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ use tonic::body::Body;
 use tonic::codegen::{BoxFuture, Service, http};
 
 pub use config::Config;
+pub use keys::Keys;
 pub use nodes::Nodes;
 
 /// The header that tells a comb which project a call is for. The gate sets it from the key and
@@ -43,7 +44,7 @@ const MAX_REQUEST: usize = 64 << 20;
 /// The gate's services, cheap to clone, one per connection.
 #[derive(Clone, Debug)]
 pub struct Gate {
-    keys: Arc<HashMap<[u8; 32], Arc<str>>>,
+    keys: Keys,
     nodes: Nodes,
     cells: CellsServer<cells::Api>,
     calls: CounterVec,
@@ -53,10 +54,10 @@ impl Gate {
     /// A gate that lets in `keys` and reaches the combs in `nodes`, with its metrics in
     /// `registry`.
     #[must_use]
-    pub fn new(keys: HashMap<[u8; 32], Arc<str>>, nodes: Nodes, registry: &Registry) -> Self {
+    pub fn new(keys: impl Into<Keys>, nodes: Nodes, registry: &Registry) -> Self {
         let api = cells::Api::new(nodes.clone(), registry);
         Self {
-            keys: Arc::new(keys),
+            keys: keys.into(),
             nodes,
             cells: CellsServer::new(api).max_decoding_message_size(MAX_REQUEST),
             calls: registry.counter(
@@ -71,7 +72,7 @@ impl Gate {
     fn project(&self, req: &http::Request<Body>) -> Option<Arc<str>> {
         let value = req.headers().get(http::header::AUTHORIZATION)?.to_str().ok()?;
         let key = value.strip_prefix("Bearer ")?;
-        self.keys.get(blake3::hash(key.as_bytes()).as_bytes()).cloned()
+        self.keys.project(blake3::hash(key.as_bytes()).as_bytes())
     }
 }
 
