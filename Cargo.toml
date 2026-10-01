@@ -70,10 +70,15 @@ landlock = "0.4"
 libc = "0.2"
 libcontainer = { version = "0.7", default-features = false }
 nix = { version = "0.29", default-features = false }
+# The keeper's Raft. 0.9 is the release line on crates.io, and its v1 storage trait keeps the
+# log and the state machine in one store.
+openraft = { version = "0.9", features = ["serde"] }
 prost = "0.14"
 prost-types = "0.14"
 protox = "0.9"
 prost-reflect = { version = "0.16", default-features = false }
+# One file, transactions that are durable on commit, and no C code to build.
+redb = "2.6"
 rustix = { version = "1.1", default-features = false, features = ["std"] }
 seccompiler = "0.5"
 serde = { version = "1", features = ["derive"] }
