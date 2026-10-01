@@ -31,6 +31,9 @@ impl ClusterView {
 pub struct NodeView {
     /// The comb's registered index, the `node` in every cell id it makes.
     pub node: u16,
+    /// The comb's registration epoch, or 0 when it is not known. A cell id from an older epoch
+    /// names a cell the comb no longer has.
+    pub epoch: u16,
     /// Counts the comb's reports. An in-flight entry for this node is dropped once a report newer
     /// than the one it was placed against arrives, since that report counts the cells.
     pub report: u64,
@@ -69,6 +72,7 @@ impl NodeView {
     pub fn empty(node: u16, cpu_milli: u64, mem_mib: u64) -> Self {
         Self {
             node,
+            epoch: 0,
             report: 0,
             healthy: true,
             backends: BackendSet::of(&[Backend::Container, Backend::Microvm]),

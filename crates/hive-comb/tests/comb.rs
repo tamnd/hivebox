@@ -131,8 +131,9 @@ async fn a_create_that_waits_its_turn_still_gets_the_whole_deadline() {
         .map(|i| {
             let comb = comb.clone();
             tokio::spawn(async move {
-                // Staggered so they queue in this order.
-                tokio::time::sleep(Duration::from_millis(100 * i)).await;
+                // Staggered so they queue in this order, far enough apart for a loaded machine.
+                // The third still waits past the deadline: it queues at 0.4 s and starts at 2 s.
+                tokio::time::sleep(Duration::from_millis(200 * i)).await;
                 comb.create(request(spec("python"))).await.map(|_| ()).map_err(|e| e.reason)
             })
         })
@@ -311,6 +312,42 @@ async fn a_restarted_comb_picks_up_every_cell() {
     let comb = open(config(&s.0), &fake).await;
     assert_eq!(comb.list().len(), 7);
     assert_eq!(echo(&comb, new, "third").await, "third\n");
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comb_back_in_a_new_epoch_stops_the_old_cells() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let comb = open(config(&s.0), &fake).await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(comb.create(request(spec("python"))).await.unwrap().id);
+    }
+    comb.pause(ids[1]).await.unwrap();
+    comb.shutdown().await;
+    drop(comb);
+
+    // The node lost its lease and registered again, so its old cells are fenced.
+    let cfg = Config { epoch: config(&s.0).epoch + 1, ..config(&s.0) };
+    let comb = open(cfg, &fake).await;
+    for &id in &ids {
+        let c = comb.get(id).unwrap();
+        // Losing the node is an infrastructure cause, so the cell failed rather than stopped.
+        assert_eq!(c.status.state, CellState::Failed, "{id}");
+        assert_eq!(c.status.cause, Some(Cause::NodeLost), "{id}");
+    }
+    assert_eq!(fake.live(), 0);
+    assert_eq!(comb.committed(), (0, 0));
+    let new = comb.create(request(spec("python"))).await.unwrap().id;
+    assert_eq!(new.epoch(), ids[0].epoch() + 1);
+    assert_eq!(echo(&comb, new, "fresh").await, "fresh\n");
+
+    // An old id the comb has forgotten is lost, and a made up one in this epoch is not found.
+    let forgotten = CellId::new(ids[0].unit(), ids[0].node(), ids[0].epoch(), 999, 1).unwrap();
+    assert_eq!(comb.get(forgotten).unwrap_err().reason, Reason::CellLost);
+    let unknown = CellId::new(new.unit(), new.node(), new.epoch(), 999, 1).unwrap();
+    assert_eq!(comb.get(unknown).unwrap_err().reason, Reason::CellNotFound);
     comb.shutdown().await;
 }
 

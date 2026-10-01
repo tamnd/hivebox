@@ -190,6 +190,7 @@ impl Comb {
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
         let comb = Self { inner };
         let (claimed, claimed_netns) = comb.recover(records).await;
+        comb.fence().await;
         if let Some(pool) = &comb.inner.netns {
             let swept = pool.sweep(&claimed_netns).await?;
             if swept > 0 {
@@ -293,6 +294,35 @@ impl Comb {
         (claimed, claimed_netns)
     }
 
+    /// Stops the cells left from an older epoch of this node. The node registered again since,
+    /// so callers were told those cells are lost, and they must not go on running.
+    async fn fence(&self) {
+        let epoch = self.inner.cfg.epoch;
+        let old: Vec<Arc<Cell>> = self
+            .inner
+            .shards
+            .iter()
+            .flat_map(|s| {
+                let s = s.read().unwrap_or_else(PoisonError::into_inner);
+                s.values().filter(|c| c.id.epoch() < epoch).cloned().collect::<Vec<_>>()
+            })
+            .filter(|c| !c.state().is_terminal())
+            .collect();
+        if old.is_empty() {
+            return;
+        }
+        eprintln!("hive-comb: stopping {} cells from before epoch {epoch}", old.len());
+        let stops = old.iter().map(|cell| async move {
+            let (done, wait) = oneshot::channel();
+            let cmd = Cmd::Stop { cause: Cause::NodeLost, grace: Duration::ZERO, done };
+            if cell.send(cmd).await {
+                let _ = wait.await;
+            }
+        });
+        let _ =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(stops)).await;
+    }
+
     /// Makes a cell and returns once it is running, or once it has failed.
     pub async fn create(&self, req: CreateRequest) -> Result<CellInfo, Error> {
         let inner = &self.inner;
@@ -364,7 +394,7 @@ impl Comb {
 
     /// The cell with `id`.
     pub fn get(&self, id: CellId) -> Result<CellInfo, Error> {
-        self.inner.cell(id).map(|c| c.info()).ok_or_else(|| not_found(id))
+        self.inner.find(id).map(|c| c.info())
     }
 
     /// Every cell this node knows about, live or recently ended.
@@ -381,7 +411,7 @@ impl Comb {
 
     /// Stops a cell and returns once it has ended. `grace` defaults to the configured one.
     pub async fn stop(&self, id: CellId, grace: Option<Duration>) -> Result<CellInfo, Error> {
-        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        let cell = self.inner.find(id)?;
         if cell.state().is_terminal() {
             return Ok(cell.info());
         }
@@ -397,7 +427,7 @@ impl Comb {
 
     /// Pauses a running cell.
     pub async fn pause(&self, id: CellId) -> Result<CellInfo, Error> {
-        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        let cell = self.inner.find(id)?;
         let (done, wait) = oneshot::channel();
         if !cell.send(Cmd::Pause { done }).await {
             return Err(Error::new(Reason::Internal, "the node is shutting down"));
@@ -408,7 +438,7 @@ impl Comb {
 
     /// Resumes a paused cell.
     pub async fn resume(&self, id: CellId) -> Result<CellInfo, Error> {
-        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        let cell = self.inner.find(id)?;
         let (done, wait) = oneshot::channel();
         if !cell.send(Cmd::Resume { done }).await {
             return Err(Error::new(Reason::Internal, "the node is shutting down"));
@@ -420,7 +450,7 @@ impl Comb {
     /// The guest agent client for a running cell, for exec and file calls. A paused cell is
     /// resumed first, since a request is what wakes it.
     pub async fn drone(&self, id: CellId) -> Result<Client, Error> {
-        let cell = self.inner.cell(id).ok_or_else(|| not_found(id))?;
+        let cell = self.inner.find(id)?;
         if cell.state() == CellState::Paused {
             self.resume(id).await?;
         }
@@ -514,6 +544,25 @@ impl Inner {
 
     fn cell(&self, id: CellId) -> Option<Arc<Cell>> {
         self.shard(id).read().unwrap_or_else(PoisonError::into_inner).get(&id).cloned()
+    }
+
+    /// The cell with `id`, or why there is none. An id from an older epoch of this node names a
+    /// cell that was fenced when the node registered again, so it is lost rather than not found.
+    fn find(&self, id: CellId) -> Result<Arc<Cell>, Error> {
+        if let Some(cell) = self.cell(id) {
+            return Ok(cell);
+        }
+        if id.node() == self.cfg.node && id.epoch() < self.cfg.epoch {
+            return Err(Error::new(
+                Reason::CellLost,
+                format!(
+                    "cell {id} is from epoch {}, and this node is in {}",
+                    id.epoch(),
+                    self.cfg.epoch
+                ),
+            ));
+        }
+        Err(not_found(id))
     }
 
     fn insert(&self, cell: &Arc<Cell>) {

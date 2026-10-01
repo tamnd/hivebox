@@ -96,4 +96,6 @@ message NodeState {
   // The 4096 byte layer filter, or empty when the reader already has it.
   bytes layers = 15;
   repeated ProjectCells top_projects = 16;
+  // The comb's registration epoch. The gate answers CELL_LOST for a cell id from an older one.
+  uint32 epoch = 17;
 }
