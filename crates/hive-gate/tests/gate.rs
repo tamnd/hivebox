@@ -355,7 +355,7 @@ impl Cluster {
         }
         assert_eq!(nodes.all(), vec![1, 2], "the gate sees both nodes");
         let keys = HashMap::from([(*blake3::hash(KEY.as_bytes()).as_bytes(), Arc::from("swe"))]);
-        let gate = Gate::new(keys, nodes, &hive_telemetry::Registry::new());
+        let gate = Gate::new(keys, nodes, None, &hive_telemetry::Registry::new());
         let (gl, gaddr) = listen().await;
         tokio::spawn(hive_gate::serve(gate, gl, stop.clone()));
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{gaddr}"))

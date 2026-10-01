@@ -20,6 +20,9 @@ pub struct Config {
     /// The keeper members to read the rest of the keys from, as `host:port`. Empty means only
     /// the keys here.
     pub keeper: Vec<String>,
+    /// The name the gate takes its share of each project's quota under, the same across
+    /// restarts. The hostname and the listen port by default.
+    pub name: String,
 }
 
 impl Config {
@@ -32,6 +35,7 @@ impl Config {
     /// metrics = "127.0.0.1:9467"
     /// scout = "http://10.0.0.5:7410"
     /// keeper = ["10.0.0.1:7430", "10.0.0.2:7430", "10.0.0.3:7430"]
+    /// name = "gate-1"
     ///
     /// [[key]]
     /// project = "swe"
@@ -39,7 +43,8 @@ impl Config {
     /// ```
     ///
     /// With `keeper`, the gate takes the keys the keeper holds, and `[[key]]` is for keys that
-    /// have to work when the keeper is down. Without it, only the keys here work.
+    /// have to work when the keeper is down, and creates are held to the projects' quotas.
+    /// Without it, only the keys here work and there are no quotas.
     /// `hive-gate key PROJECT` makes one and prints the lines to add here.
     ///
     /// # Errors
@@ -76,7 +81,17 @@ impl Config {
         if keys.is_empty() && g.keeper.is_empty() {
             return Err("no [[key]] and no gate.keeper, so nobody could call the gate".into());
         }
-        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper })
+        let name = match g.name {
+            Some(n) => n,
+            None => {
+                let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+                format!("{}/{}", host.trim(), listen.port())
+            }
+        };
+        if !hive_types::is_name(&name) {
+            return Err(format!("gate.name = {name:?} is not a name, so set one"));
+        }
+        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper, name })
     }
 }
 
@@ -137,6 +152,7 @@ struct Gate {
     scout: Option<String>,
     #[serde(default)]
     keeper: Vec<String>,
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +202,7 @@ mod tests {
             (format!("{scout}{key}{key}"), "there twice"),
             (format!("{scout}{}", key.replace("swe", "a b")), "not a name"),
             (format!("{scout}keeper = [\"http://k:7430\"]\n"), "not host:port"),
+            (format!("{scout}name = \"a b\"\n{key}"), "gate.name"),
         ];
         for (text, want) in cases {
             let e = Config::from_toml(&text).unwrap_err();

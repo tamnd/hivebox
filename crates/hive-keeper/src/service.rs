@@ -21,6 +21,9 @@ const NO_LEADER: Duration = Duration::from_secs(5);
 /// The most commands put in one log entry.
 const MAX_BATCH: usize = 1024;
 
+/// How long a gate's share of a project's quota lasts.
+const SLICE_MS: u64 = 30_000;
+
 /// How many batches can be on their way through the log at once.
 const IN_FLIGHT: usize = 4;
 
@@ -279,6 +282,32 @@ impl keeper_server::Keeper for Keeper {
                 .collect()
         });
         Ok(Response::new(pb::ListNodesResponse { nodes }))
+    }
+
+    async fn take_quota(
+        &self,
+        req: Request<pb::TakeQuotaRequest>,
+    ) -> Result<Response<pb::QuotaSlice>, Status> {
+        let req = req.into_inner();
+        let cmd = Command::TakeQuota {
+            project: req.project,
+            gate: req.gate,
+            cells: req.cells,
+            creates_per_s: req.creates_per_s,
+            live: req.live,
+            now_ms: now_ms(),
+            ttl_ms: SLICE_MS,
+        };
+        match self.write(cmd).await? {
+            Reply::Slice(q, s, contended) => Ok(Response::new(pb::QuotaSlice {
+                quota: Some(pb::Quota { cells: q.cells, creates_per_s: q.creates_per_s }),
+                cells: s.cells,
+                creates_per_s: s.creates_per_s,
+                ttl_ms: SLICE_MS,
+                contended,
+            })),
+            r => Err(unexpected(&r)),
+        }
     }
 
     async fn status(

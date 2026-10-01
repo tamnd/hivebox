@@ -23,6 +23,7 @@ use tonic::{Request, Response, Status};
 
 use crate::PROJECT_HEADER;
 use crate::nodes::Nodes;
+use crate::quota::Quotas;
 
 /// The most cells one create call may ask for.
 pub const MAX_COUNT: u32 = 32_768;
@@ -50,6 +51,7 @@ pub struct Api {
 #[derive(Debug)]
 struct Inner {
     nodes: Nodes,
+    quotas: Option<Quotas>,
     placer: Mutex<Placer>,
     start: Instant,
     creates: CounterVec,
@@ -57,9 +59,10 @@ struct Inner {
 }
 
 impl Api {
-    /// Cells over `nodes`, with its metrics in `registry`.
+    /// Cells over `nodes`, held to the projects' quotas by `quotas` if there are any, with its
+    /// metrics in `registry`.
     #[must_use]
-    pub fn new(nodes: Nodes, registry: &hive_telemetry::Registry) -> Self {
+    pub fn new(nodes: Nodes, quotas: Option<Quotas>, registry: &hive_telemetry::Registry) -> Self {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64)
@@ -67,6 +70,7 @@ impl Api {
         Self {
             inner: Arc::new(Inner {
                 nodes,
+                quotas,
                 placer: Mutex::new(Placer::new(seed)),
                 start: Instant::now(),
                 creates: registry.counter(
@@ -150,6 +154,9 @@ impl Cells for Api {
             return Err(invalid(format!(
                 "count is {count}, and one call makes at most {MAX_COUNT}"
             )));
+        }
+        if let Some(q) = &self.inner.quotas {
+            q.charge(&project, count).await.map_err(|e| convert::error_to_status(&e))?;
         }
         let wire = req.spec.unwrap_or_default();
         let spec = convert::spec_from_v1(wire.clone()).map_err(|e| convert::error_to_status(&e))?;
