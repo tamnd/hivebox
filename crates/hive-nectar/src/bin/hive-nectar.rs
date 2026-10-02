@@ -155,7 +155,12 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 .map_err(|e| e.to_string())?;
             let started = Instant::now();
             let m = load_manifest(&from, id).await.map_err(|e| format!("image {id}: {e}"))?;
-            let mut blobs: Vec<BlobId> = m.layers.iter().flat_map(|l| [l.meta, l.data]).collect();
+            let mut blobs: Vec<BlobId> = m
+                .layers
+                .iter()
+                .flat_map(|l| [Some(l.meta), Some(l.data), l.data_leaves])
+                .flatten()
+                .collect();
             // The manifest goes last, so an image in the bucket always has all its layers.
             blobs.push(id);
             let mut sent = 0;

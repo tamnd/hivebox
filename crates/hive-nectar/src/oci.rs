@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::BlobId;
 use crate::erofs::Mkfs;
 use crate::image::{ImageConfig, LayerRef, Manifest};
+use crate::leaves::Leaves;
 use crate::store::{BlobStore, blocking, hash_file, write_synced};
 
 const INDEX: &[&str] = &[
@@ -183,6 +184,8 @@ impl Importer {
             && let Ok(layer) = serde_json::from_slice::<LayerRef>(&bytes)
             && store.stat(layer.meta).await.is_ok()
             && store.stat(layer.data).await.is_ok()
+            && let Some(leaves) = layer.data_leaves
+            && store.stat(leaves).await.is_ok()
         {
             return Ok((layer, false));
         }
@@ -194,27 +197,37 @@ impl Importer {
         let mkfs = self.mkfs.clone();
         let result = async {
             let (dir2, chunk) = (dir.clone(), mkfs.chunk_size());
-            let (built, meta, data, meta_size, data_size) = blocking(move || {
-                std::fs::create_dir_all(&dir2)?;
-                // One read of the layer both checks it and feeds mkfs.erofs, and a layer that
-                // turns out not to match is thrown away with the build directory.
-                let mut hashed = Hashed { inner: File::open(&src.tar)?, sha: Sha256::new() };
-                let built = mkfs.build(&mut hashed, &dir2)?;
-                if let Some(digest) = &src.digest {
-                    let got = format!("sha256:{:x}", hashed.sha.finalize());
-                    if got != *digest {
-                        return Err(bad(format!("layer {digest} hashes to {got}")));
+            let (built, meta, data, (leaves, leaves_path), meta_size, data_size) =
+                blocking(move || {
+                    std::fs::create_dir_all(&dir2)?;
+                    // One read of the layer both checks it and feeds mkfs.erofs, and a layer that
+                    // turns out not to match is thrown away with the build directory.
+                    let mut hashed = Hashed { inner: File::open(&src.tar)?, sha: Sha256::new() };
+                    let built = mkfs.build(&mut hashed, &dir2)?;
+                    if let Some(digest) = &src.digest {
+                        let got = format!("sha256:{:x}", hashed.sha.finalize());
+                        if got != *digest {
+                            return Err(bad(format!("layer {digest} hashes to {got}")));
+                        }
                     }
-                }
-                let meta = hash_file(&built.meta)?;
-                let data = hash_file(&built.data)?;
-                let sizes =
-                    (std::fs::metadata(&built.meta)?.len(), std::fs::metadata(&built.data)?.len());
-                Ok((built, meta, data, sizes.0, sizes.1))
-            })
-            .await?;
+                    let meta = hash_file(&built.meta)?;
+                    // One read of the data blob gives both its name and its leaves.
+                    let leaves = Leaves::of_file(&built.data)?;
+                    let data = leaves.blob();
+                    let leaves_path = dir2.join("data.leaves");
+                    let bytes = leaves.to_bytes();
+                    std::fs::write(&leaves_path, &bytes)?;
+                    let leaves = (BlobId::of(&bytes), leaves_path);
+                    let sizes = (
+                        std::fs::metadata(&built.meta)?.len(),
+                        std::fs::metadata(&built.data)?.len(),
+                    );
+                    Ok((built, meta, data, leaves, sizes.0, sizes.1))
+                })
+                .await?;
             store.put(meta, &built.meta).await?;
             store.put(data, &built.data).await?;
+            store.put(leaves, &leaves_path).await?;
             let layer = LayerRef {
                 digest: LayerRef::digest_of(meta, data),
                 meta,
@@ -222,6 +235,7 @@ impl Importer {
                 meta_size,
                 data_size,
                 chunk_size: chunk,
+                data_leaves: Some(leaves),
                 diff_id: src.diff_id,
             };
             if let Some(memo) = &memo {

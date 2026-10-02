@@ -5,8 +5,8 @@
 //! it has. Chunks are written, the file is synced, and only then are their bits set and the map
 //! synced, so after a crash every set bit is backed by data on disk and the fetch goes on where it
 //! stopped. When every chunk is in, the whole file is checked against its name and renamed to
-//! `<name>`. This version fetches whole blobs as soon as they are asked for. Lazy filling, where
-//! the kernel asks for chunks as it reads them, comes later and keeps the same files.
+//! `<name>`. [`Cache::get`] fetches a whole blob before it returns, and [`Cache::lazy`] in
+//! [`crate::lazy`] fetches chunks as they are read, with the same files.
 //!
 //! Blobs in use are pinned and never evicted. The rest go least recently used first when room is
 //! needed, and on a restart the order is taken from the files' mtimes.
@@ -34,22 +34,24 @@ const IN_FLIGHT: usize = 4;
 /// Blobs on local disk, up to a capacity.
 #[derive(Debug)]
 pub struct Cache {
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     capacity: u64,
-    state: Mutex<State>,
+    pub(crate) state: Mutex<State>,
+    /// Lazy fills under way, so callers share one per blob.
+    pub(crate) lazies: Mutex<HashMap<BlobId, std::sync::Weak<crate::lazy::Inner>>>,
 }
 
 #[derive(Debug, Default)]
-struct State {
-    blobs: HashMap<BlobId, Entry>,
+pub(crate) struct State {
+    pub(crate) blobs: HashMap<BlobId, Entry>,
     used: u64,
     clock: u64,
 }
 
 #[derive(Debug)]
-struct Entry {
+pub(crate) struct Entry {
     size: u64,
-    ready: bool,
+    pub(crate) ready: bool,
     pins: usize,
     last: u64,
     fill: Arc<tokio::sync::Mutex<()>>,
@@ -64,10 +66,10 @@ impl Entry {
 /// A blob in the cache, pinned there until this is dropped.
 #[derive(Debug)]
 pub struct Held {
-    cache: Arc<Cache>,
-    blob: BlobId,
-    path: PathBuf,
-    size: u64,
+    pub(crate) cache: Arc<Cache>,
+    pub(crate) blob: BlobId,
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
 }
 
 impl Held {
@@ -157,7 +159,7 @@ impl Cache {
                 let _ = std::fs::remove_file(f.path());
             }
         }
-        Ok(Arc::new(Self { dir, capacity, state: Mutex::new(st) }))
+        Ok(Arc::new(Self { dir, capacity, state: Mutex::new(st), lazies: Mutex::default() }))
     }
 
     /// How full it is.
@@ -211,8 +213,14 @@ impl Cache {
             touch(held.path.clone());
             return Ok(held);
         }
-        let _one = fill.lock().await;
+        let one = fill.lock().await;
         if self.has(blob) {
+            return Ok(held);
+        }
+        // A lazy fill owns the part file, so it finishes the job.
+        if let Some(lazy) = self.filling(blob) {
+            drop(one);
+            lazy.fill_rest(&[]).await?;
             return Ok(held);
         }
         match self.fetch(store, blob, size).await {
@@ -232,7 +240,7 @@ impl Cache {
     }
 
     /// Pins a blob the cache knows, and says how big it is.
-    fn pin(&self, blob: BlobId) -> Option<(u64, Arc<tokio::sync::Mutex<()>>)> {
+    pub(crate) fn pin(&self, blob: BlobId) -> Option<(u64, Arc<tokio::sync::Mutex<()>>)> {
         let mut st = self.state.lock().expect("cache lock");
         st.clock += 1;
         let now = st.clock;
@@ -243,7 +251,11 @@ impl Cache {
     }
 
     /// Makes room for a new blob, evicting what it must, and pins it.
-    fn reserve(&self, blob: BlobId, size: u64) -> io::Result<(u64, Arc<tokio::sync::Mutex<()>>)> {
+    pub(crate) fn reserve(
+        &self,
+        blob: BlobId,
+        size: u64,
+    ) -> io::Result<(u64, Arc<tokio::sync::Mutex<()>>)> {
         let mut victims = Vec::new();
         let got = {
             let mut st = self.state.lock().expect("cache lock");
@@ -294,7 +306,7 @@ impl Cache {
     }
 
     /// Drops a blob that failed to arrive, unless someone else is still waiting on it.
-    fn forget_if_unused(&self, blob: BlobId) {
+    pub(crate) fn forget_if_unused(&self, blob: BlobId) {
         let gone = {
             let mut st = self.state.lock().expect("cache lock");
             match st.blobs.get(&blob) {
@@ -377,19 +389,19 @@ impl Cache {
 /// Which chunks a part file has, kept on disk as a little-endian chunk size followed by one bit
 /// per chunk.
 #[derive(Debug)]
-struct Bitmap {
-    file: File,
-    bits: Vec<u8>,
+pub(crate) struct Bitmap {
+    pub(crate) file: File,
+    pub(crate) bits: Vec<u8>,
 }
 
 impl Bitmap {
     const HEAD: usize = 4;
 
-    fn has(&self, chunk: u64) -> bool {
+    pub(crate) fn has(&self, chunk: u64) -> bool {
         self.bits[Self::HEAD + (chunk / 8) as usize] & (1 << (chunk % 8)) != 0
     }
 
-    fn set(&mut self, chunk: u64) {
+    pub(crate) fn set(&mut self, chunk: u64) {
         self.bits[Self::HEAD + (chunk / 8) as usize] |= 1 << (chunk % 8);
     }
 
@@ -400,7 +412,11 @@ impl Bitmap {
 }
 
 /// Opens or makes a part file and its map, and lists the chunks it still needs.
-fn open_part(part_path: &Path, map_path: &Path, size: u64) -> io::Result<(File, Bitmap, Vec<u64>)> {
+pub(crate) fn open_part(
+    part_path: &Path,
+    map_path: &Path,
+    size: u64,
+) -> io::Result<(File, Bitmap, Vec<u64>)> {
     let chunks = size.div_ceil(CHUNK);
     let len = Bitmap::HEAD + chunks.div_ceil(8) as usize;
     let part =
