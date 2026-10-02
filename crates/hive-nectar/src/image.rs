@@ -20,6 +20,10 @@ pub struct LayerRef {
     pub data_size: u64,
     /// The chunk size it was built with.
     pub chunk_size: u32,
+    /// The [`crate::Leaves`] of the data blob, which lazy filling checks each chunk against.
+    /// Layers imported before there were leaves have none and are fetched whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_leaves: Option<BlobId>,
     /// The OCI digest of the uncompressed tar it came from, when it came from one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_id: Option<String>,

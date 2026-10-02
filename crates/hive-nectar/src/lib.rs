@@ -13,7 +13,8 @@
 //! - [`mount::Layers`] mounts an image's layers on a node, once each, with EROFS on loop devices
 //!   and an idmapped mount for the cells' id range.
 //!
-//! Lazy filling, chunk level dedup and the 3FS store come later.
+//! A blob can be filled lazily with [`Cache::lazy`], chunk by chunk as it is read, each chunk
+//! checked against the blob's [`Leaves`]. Chunk level dedup and the 3FS store come later.
 
 // Only the mount module has any, for loop device ioctls and `mount_setattr`.
 #![deny(unsafe_code)]
@@ -22,6 +23,8 @@ mod blob;
 pub mod cache;
 pub mod erofs;
 pub mod image;
+pub mod lazy;
+pub mod leaves;
 #[cfg(target_os = "linux")]
 pub mod mount;
 pub mod oci;
@@ -31,6 +34,8 @@ pub mod store;
 pub use blob::{BadBlobId, BlobId};
 pub use cache::{Cache, Held};
 pub use image::{ImageConfig, LayerRef, Manifest};
+pub use lazy::Lazy;
+pub use leaves::Leaves;
 pub use s3::{S3Config, S3Store};
 pub use store::{BlobCaps, BlobStat, BlobStore, PosixStore, PutReceipt, ReadReq};
 
