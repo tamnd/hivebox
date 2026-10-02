@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-nectar` keeps blobs in an S3 bucket as well as a directory, with `S3Store`, which signs its own requests with Signature Version 4 on the hyper client the tree already has. A batch of reads becomes ranged GETs, with reads that follow on from each other merged into one, 16 in flight. Blobs up to 64 MiB go up in one PUT and bigger ones as a multipart upload in 16 MiB parts, four at a time, and a failed upload is aborted. Requests that fail with a 5xx, a dropped connection or a 60 s timeout are tried three times. Only `http://` endpoints work until the tree has a TLS stack. The CLI takes `--s3 URL` in place of `--store DIR`, and `copy IMAGE --store DIR --to-s3 URL` puts an image and its layers in a bucket, manifest last. On server3 at a load of 43 to 65 against MinIO on the same machine, with 8 blobs of 64 MiB, filling an empty L1 cache ran at 45 to 77 MiB/s from the bucket and 49 to 70 MiB/s from a directory, both held back by the cache's synced writes. A random 4 KiB read took 27.8 ms at p50 from the bucket and 0.75 ms from the directory, and a 1 MiB read 87.6 ms and 4.5 ms.
+
 ## 0.0.14
 
 The gate takes API keys and quota shares from the keeper, comb leases, and biscuit tokens.

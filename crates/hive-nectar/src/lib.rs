@@ -5,14 +5,15 @@
 //! - [`oci::Importer`] turns an OCI image layout, or a flat root filesystem tar, into EROFS layers
 //!   with `mkfs.erofs`, each split into a metadata blob and a data blob, and stores them with a
 //!   [`Manifest`] that names them.
-//! - [`PosixStore`] keeps blobs in a directory, local or shared.
+//! - [`PosixStore`] keeps blobs in a directory, local or shared, and [`S3Store`] keeps them in an S3
+//!   bucket.
 //! - [`Cache`] is the node's L1: blobs fetched whole from a store onto local disk, resumable after
 //!   a crash, checked against their names, pinned while in use and evicted least recently used.
 //!
 //! - [`mount::Layers`] mounts an image's layers on a node, once each, with EROFS on loop devices
 //!   and an idmapped mount for the cells' id range.
 //!
-//! Lazy filling, chunk level dedup and the other stores come later.
+//! Lazy filling, chunk level dedup and the 3FS store come later.
 
 // Only the mount module has any, for loop device ioctls and `mount_setattr`.
 #![deny(unsafe_code)]
@@ -24,11 +25,13 @@ pub mod image;
 #[cfg(target_os = "linux")]
 pub mod mount;
 pub mod oci;
+pub mod s3;
 pub mod store;
 
 pub use blob::{BadBlobId, BlobId};
 pub use cache::{Cache, Held};
 pub use image::{ImageConfig, LayerRef, Manifest};
+pub use s3::{S3Config, S3Store};
 pub use store::{BlobCaps, BlobStat, BlobStore, PosixStore, PutReceipt, ReadReq};
 
 #[cfg(test)]
