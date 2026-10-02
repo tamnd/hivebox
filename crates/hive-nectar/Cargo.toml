@@ -18,15 +18,19 @@ workspace = true
 
 [dependencies]
 blake3.workspace = true
+bytes.workspace = true
 flate2.workspace = true
 futures.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "mount", "pipe"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
-tokio = { workspace = true, features = ["fs", "macros", "rt", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["mount", "process"] }
