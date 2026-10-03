@@ -31,6 +31,7 @@ pub struct Guest {
     // are doing.
     pub links: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
     pub paused: bool,
+    pub reclaimed: bool,
     pub exit: Option<ExitInfo>,
 }
 
@@ -112,8 +113,14 @@ impl CellDriver for Fake {
             // The "crash" image never gets its guest agent up.
             let drone =
                 (image != "crash").then(|| Drone::new(hive_drone::Config::default(), slot.secret));
-            let guest =
-                Guest { drone, listener: None, links: Arc::default(), paused: false, exit: None };
+            let guest = Guest {
+                drone,
+                listener: None,
+                links: Arc::default(),
+                paused: false,
+                reclaimed: false,
+                exit: None,
+            };
             self.guests.lock().unwrap().insert(id, guest);
             Ok(CellHandle {
                 id,
@@ -186,16 +193,19 @@ impl CellDriver for Fake {
         })
     }
 
-    fn pause<'a>(&'a self, h: &'a CellHandle, _: PauseMode) -> BoxFuture<'a, Result<(), Error>> {
+    fn pause<'a>(&'a self, h: &'a CellHandle, mode: PauseMode) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
-            self.with(h.id, |g| g.paused = true);
+            self.with(h.id, |g| {
+                g.paused = true;
+                g.reclaimed |= mode == PauseMode::Reclaim;
+            });
             Ok(())
         })
     }
 
     fn resume<'a>(&'a self, h: &'a CellHandle) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
-            self.with(h.id, |g| g.paused = false);
+            self.with(h.id, |g| (g.paused, g.reclaimed) = (false, false));
             Ok(())
         })
     }

@@ -255,6 +255,51 @@ async fn timers_expire_and_pause_cells() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn paused_cells_are_reclaimed_then_stopped_and_ttls_extend() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let cfg = Config {
+        reclaim_after: Duration::from_millis(200),
+        pause_ttl: Duration::from_secs(1),
+        ..config(&s.0)
+    };
+    let comb = open(cfg.clone(), &fake).await;
+    let id = comb.create(request(spec("python"))).await.unwrap().id;
+    comb.pause(id).await.unwrap();
+    assert!(!fake.with(id, |g| g.reclaimed));
+    let until = Instant::now() + Duration::from_secs(5);
+    while !fake.with(id, |g| g.reclaimed) {
+        assert!(Instant::now() < until, "not reclaimed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(comb.get(id).unwrap().status.state, CellState::Paused);
+    let stopped = reaches(&comb, id, CellState::Stopped).await;
+    assert_eq!(stopped.status.cause, Some(Cause::Idle));
+
+    // A hard TTL counted from now, and an idle one, both kept across a restart.
+    let mut short = spec("python");
+    short.hard_ttl = Some(Duration::from_millis(400));
+    let id = comb.create(request(short)).await.unwrap().id;
+    let hour = Duration::from_secs(3600);
+    let info = comb.extend_ttl(id, Some(hour), Some(hour)).await.unwrap();
+    let hard = info.spec.hard_ttl.unwrap();
+    assert!(hard >= hour && hard < hour + Duration::from_secs(5), "{hard:?}");
+    assert_eq!(info.spec.idle_ttl, Some(hour));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(comb.get(id).unwrap().status.state, CellState::Running);
+    comb.shutdown().await;
+    drop(comb);
+    let comb = open(cfg, &fake).await;
+    let info = comb.get(id).unwrap();
+    assert_eq!((info.spec.hard_ttl, info.spec.idle_ttl), (Some(hard), Some(hour)));
+    assert_eq!(info.status.state, CellState::Running);
+    comb.stop(id, None).await.unwrap();
+    let e = comb.extend_ttl(id, Some(hour), None).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CellNotRunning);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pause_and_resume_by_hand() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());

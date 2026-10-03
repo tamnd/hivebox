@@ -103,7 +103,8 @@ A comb in standalone mode serves Cells, Exec and Files itself, on a Unix socket 
 - `Watch` by id ends once the cell has ended. A watcher that falls more than 4,096 changes behind gets the current state of every cell that moved since it last heard, instead of the changes it missed.
 - `Pause`, `Resume` and `Stop` by labels pick only the cells the call can act on (running, paused and not yet ended), so `matched` counts those.
 - `Exec.Signal` reaches processes started with `Exec.Start` on the same comb. `user` is a uid or `uid:gid`.
-- Not served yet: `ExtendTtl`, `UpdatePolicy`, `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
+- `ExtendTtl` sets the hard TTL to run out a given time from now and replaces the idle TTL, leaving either alone when it is unset.
+- Not served yet: `UpdatePolicy`, `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
 
 ## 2. Error model
 
@@ -147,6 +148,8 @@ Every error carries `is_infra_error` in its metadata so trainers can mask sample
 ```
 
 A pause that does not take goes from PAUSING back to RUNNING, since the cell never stopped.
+
+A paused cell starts frozen with its memory in place. After `reclaim_after` (default 10 min) the comb reclaims it, swapping the cell's memory out so a resume pages it back in, and after `pause_ttl` (default 24 h) it stops the cell with cause `IDLE`.
 
 The comb owns all transitions. Each one is a WAL record `{cell, from, to, cause, ts, seq}`.
 

@@ -424,9 +424,16 @@ impl Cells for Api {
 
     async fn extend_ttl(
         &self,
-        _: Request<v1::ExtendTtlRequest>,
+        req: Request<v1::ExtendTtlRequest>,
     ) -> Result<Response<v1::Cell>, Status> {
-        Err(Status::unimplemented("ExtendTtl is not built yet"))
+        let project = project(&req)?;
+        let req = req.into_inner();
+        let id = parse_id(&req.id)?;
+        let hard = convert::duration_from_v1(req.hard_ttl, "hard_ttl").map_err(status)?;
+        let idle = convert::duration_from_v1(req.idle_ttl, "idle_ttl").map_err(status)?;
+        self.owned(&project, id).map_err(status)?;
+        let info = self.comb.extend_ttl(id, hard, idle).await.map_err(status)?;
+        Ok(Response::new(cell_to_v1(&info)))
     }
 
     async fn update_policy(

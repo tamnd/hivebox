@@ -77,9 +77,12 @@ message StopRequest {
   bool snapshot = 2;
 }
 
+// Unset fields stay as they were.
 message ExtendTtlRequest {
   string id = 1;
+  // How long from now until the cell is stopped, whatever it is doing.
   google.protobuf.Duration hard_ttl = 2;
+  // The new idle TTL, which starts counting again from now.
   google.protobuf.Duration idle_ttl = 3;
 }
 

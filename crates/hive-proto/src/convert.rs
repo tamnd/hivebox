@@ -109,7 +109,12 @@ pub fn cause_from_v1(c: v1::Cause) -> Option<Cause> {
     Cause::ALL.into_iter().find(|&k| cause_to_v1(k) == c)
 }
 
-fn duration_from_v1(
+/// A duration from the wire, which must not be negative.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` naming `field` if it is negative.
+pub fn duration_from_v1(
     d: Option<prost_types::Duration>,
     field: &str,
 ) -> Result<Option<Duration>, Error> {
