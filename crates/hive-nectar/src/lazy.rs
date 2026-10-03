@@ -580,7 +580,11 @@ impl hive_blockd::Source for Lazy {
         self.inner.size
     }
 
-    fn read_at(&self, offset: u64, len: usize) -> futures::future::BoxFuture<'_, io::Result<Vec<u8>>> {
+    fn read_at(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> futures::future::BoxFuture<'_, io::Result<Vec<u8>>> {
         Box::pin(Self::read_at(self, offset, len))
     }
 }

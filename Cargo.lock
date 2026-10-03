@@ -1311,6 +1311,7 @@ dependencies = [
  "hyper-util",
  "prost 0.14.4",
  "prost-reflect",
+ "prost-types 0.14.4",
  "serde",
  "serde_json",
  "tokio",

@@ -30,7 +30,7 @@ use crate::{Gate, MAX_REQUEST};
 const MAX_ANSWER: usize = 64 << 20;
 
 /// The flag on the envelope that ends a Connect stream.
-const END_STREAM: u8 = 2;
+pub(crate) const END_STREAM: u8 = 2;
 
 static POOL: LazyLock<Option<DescriptorPool>> =
     LazyLock::new(|| DescriptorPool::decode(hive_proto::FILE_DESCRIPTOR_SET).ok());
@@ -207,7 +207,10 @@ async fn send(
 }
 
 /// All of `body` and its trailers, if it is no bigger than `limit`.
-async fn collect(body: Body, limit: usize) -> Result<(Bytes, Option<http::HeaderMap>), Status> {
+pub(crate) async fn collect(
+    body: Body,
+    limit: usize,
+) -> Result<(Bytes, Option<http::HeaderMap>), Status> {
     let all = Limited::new(body, limit).collect().await.map_err(|e| {
         if e.is::<LengthLimitError>() {
             return Status::resource_exhausted(format!("a message over {limit} bytes"));
@@ -221,7 +224,7 @@ async fn collect(body: Body, limit: usize) -> Result<(Bytes, Option<http::Header
     Ok((all.to_bytes(), trailers))
 }
 
-fn answer(
+pub(crate) fn answer(
     status: http::StatusCode,
     content_type: &'static str,
     body: Bytes,
@@ -233,7 +236,7 @@ fn answer(
         .unwrap_or_default()
 }
 
-fn envelope(flags: u8, msg: &[u8]) -> Bytes {
+pub(crate) fn envelope(flags: u8, msg: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(5 + msg.len());
     out.put_u8(flags);
     out.put_u32(u32::try_from(msg.len()).unwrap_or(u32::MAX));
@@ -242,7 +245,7 @@ fn envelope(flags: u8, msg: &[u8]) -> Bytes {
 }
 
 /// The next whole message in `buf`, taken out of it, and its flags.
-fn next_flagged(buf: &mut BytesMut) -> Option<(u8, Bytes)> {
+pub(crate) fn next_flagged(buf: &mut BytesMut) -> Option<(u8, Bytes)> {
     let head = buf.get(..5)?;
     let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
     if buf.len() < 5 + len {
@@ -443,7 +446,7 @@ struct ErrorInfo {
     metadata: std::collections::HashMap<String, String>,
 }
 
-fn code_name(code: Code) -> &'static str {
+pub(crate) fn code_name(code: Code) -> &'static str {
     match code {
         Code::Ok => "ok",
         Code::Cancelled => "canceled",
@@ -466,7 +469,7 @@ fn code_name(code: Code) -> &'static str {
 }
 
 /// The HTTP status Connect gives each code on a unary call.
-fn http_status(code: Code) -> http::StatusCode {
+pub(crate) fn http_status(code: Code) -> http::StatusCode {
     let n = match code {
         Code::Ok => 200,
         Code::Cancelled => 499,

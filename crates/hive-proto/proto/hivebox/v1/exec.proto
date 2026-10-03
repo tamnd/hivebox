@@ -29,6 +29,7 @@ message RunRequest {
   google.protobuf.Duration timeout = 7;
   // The cell's output limit when zero.
   uint64 max_output_bytes = 8;
+  // A name from the cell's /etc/passwd, a uid, or uid:gid. The drone's user when empty.
   string user = 9;
   // A retry with the same key returns the first result instead of running again.
   string idempotency_key = 10;
@@ -54,6 +55,7 @@ message ProcessStart {
   string cwd = 4;
   map<string, string> env = 5;
   google.protobuf.Duration timeout = 6;
+  // A name from the cell's /etc/passwd, a uid, or uid:gid. The drone's user when empty.
   string user = 7;
   // Allocate a terminal of this size. No terminal when unset.
   PtySize pty = 8;
@@ -96,6 +98,7 @@ message SessionCreateRequest {
   string shell = 2;
   string cwd = 3;
   map<string, string> env = 4;
+  // A name from the cell's /etc/passwd, a uid, or uid:gid. The drone's user when empty.
   string user = 5;
 }
 

@@ -23,6 +23,59 @@ pub struct Config {
     /// The name the gate takes its share of each project's quota under, the same across
     /// restarts. The hostname and the listen port by default.
     pub name: String,
+    /// The E2B API, served when the file has an `[e2b]` table.
+    pub e2b: Option<E2b>,
+}
+
+/// How E2B sandboxes become cells.
+#[derive(Clone, Debug)]
+pub struct E2b {
+    /// The metadata key whose value is the image a sandbox runs, like `swe/image`.
+    pub image_key: Option<String>,
+    /// The image for each E2B template, for sandboxes whose metadata names none.
+    pub templates: HashMap<String, String>,
+    /// Resources by size name, which a sandbox picks with the `size` metadata key, or with
+    /// `swe/size` when `image_key` is `swe/image`.
+    pub sizes: HashMap<String, Size>,
+    /// The backend sandboxes run on, `container` unless the file says otherwise.
+    pub backend: hive_types::Backend,
+}
+
+impl Default for E2b {
+    fn default() -> Self {
+        Self {
+            image_key: None,
+            templates: HashMap::new(),
+            sizes: HashMap::new(),
+            backend: hive_types::Backend::Container,
+        }
+    }
+}
+
+impl E2b {
+    /// The metadata key that picks a size.
+    #[must_use]
+    pub fn size_key(&self) -> String {
+        match self.image_key.as_deref().and_then(|k| k.rsplit_once('/')) {
+            Some((prefix, _)) => format!("{prefix}/size"),
+            None => "size".into(),
+        }
+    }
+}
+
+/// The resources of one E2B size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Size {
+    /// Thousandths of a CPU.
+    #[serde(default)]
+    pub vcpu_milli: u32,
+    /// Memory in MiB.
+    #[serde(default)]
+    pub mem_mib: u32,
+    /// Disk in GiB.
+    #[serde(default)]
+    pub disk_gib: u32,
 }
 
 impl Config {
@@ -40,12 +93,20 @@ impl Config {
     /// [[key]]
     /// project = "swe"
     /// blake3 = "5c1f...64 hex digits"
+    ///
+    /// [e2b]
+    /// image_key = "swe/image"
+    /// templates = { base = "docker.io/library/python:3.12" }
+    /// sizes = { md = { vcpu_milli = 2000, mem_mib = 4096 } }
+    /// backend = "container"
     /// ```
     ///
     /// With `keeper`, the gate takes the keys the keeper holds, and `[[key]]` is for keys that
     /// have to work when the keeper is down, and creates are held to the projects' quotas.
     /// Without it, only the keys here work and there are no quotas.
-    /// `hive-gate key PROJECT` makes one and prints the lines to add here.
+    /// `hive-gate key PROJECT` makes one and prints the lines to add here. With `[e2b]`, the
+    /// gate serves the E2B REST API and the parts of envd that run commands and move files, so
+    /// the E2B SDK works with `E2B_API_URL` and `E2B_SANDBOX_URL` both set to the gate.
     ///
     /// # Errors
     ///
@@ -91,7 +152,36 @@ impl Config {
         if !hive_types::is_name(&name) {
             return Err(format!("gate.name = {name:?} is not a name, so set one"));
         }
-        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper, name })
+        let e2b = file
+            .e2b
+            .map(|e| {
+                let backend = match e.backend.as_deref().unwrap_or("container") {
+                    "container" => hive_types::Backend::Container,
+                    "microvm" => hive_types::Backend::Microvm,
+                    "fullvm" => hive_types::Backend::Fullvm,
+                    b => {
+                        return Err(format!(
+                            "e2b.backend = {b:?} is not container, microvm or fullvm"
+                        ));
+                    }
+                };
+                Ok(E2b {
+                    image_key: e.image_key.filter(|k| !k.is_empty()),
+                    templates: e.templates,
+                    sizes: e.sizes,
+                    backend,
+                })
+            })
+            .transpose()?;
+        if let Some(e) = &e2b {
+            if let Some(k) = e.image_key.as_deref().filter(|k| !hive_types::is_name(k)) {
+                return Err(format!("e2b.image_key = {k:?} is not a name"));
+            }
+            if e.image_key.is_none() && e.templates.is_empty() {
+                return Err("[e2b] needs image_key or templates, or no sandbox has an image".into());
+            }
+        }
+        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper, name, e2b })
     }
 }
 
@@ -142,6 +232,18 @@ struct File {
     gate: Gate,
     #[serde(default)]
     key: Vec<Key>,
+    e2b: Option<E2bFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct E2bFile {
+    image_key: Option<String>,
+    backend: Option<String>,
+    #[serde(default)]
+    templates: HashMap<String, String>,
+    #[serde(default)]
+    sizes: HashMap<String, Size>,
 }
 
 #[derive(Default, Deserialize)]
@@ -189,6 +291,24 @@ mod tests {
     }
 
     #[test]
+    fn e2b_takes_images_and_sizes() {
+        let c = Config::from_toml(
+            "[gate]\nscout = \"http://s:7410\"\nkeeper = [\"k:7430\"]\n[e2b]\n\
+             image_key = \"swe/image\"\ntemplates = { base = \"python:3.12\" }\n\
+             sizes = { md = { vcpu_milli = 2000, mem_mib = 4096 } }\n",
+        )
+        .unwrap();
+        let e = c.e2b.unwrap();
+        assert_eq!(e.image_key.as_deref(), Some("swe/image"));
+        assert_eq!(e.size_key(), "swe/size");
+        assert_eq!(e.templates["base"], "python:3.12");
+        assert_eq!(e.sizes["md"], Size { vcpu_milli: 2000, mem_mib: 4096, disk_gib: 0 });
+        assert_eq!(e.backend, hive_types::Backend::Container);
+        let plain = E2b { image_key: Some("image".into()), ..E2b::default() };
+        assert_eq!(plain.size_key(), "size");
+    }
+
+    #[test]
     fn mistakes_are_errors() {
         let key = "[[key]]\nproject = \"swe\"\nblake3 = \"".to_string() + &"ab".repeat(32) + "\"\n";
         let scout = "[gate]\nscout = \"http://s:7410\"\n";
@@ -203,6 +323,10 @@ mod tests {
             (format!("{scout}{}", key.replace("swe", "a b")), "not a name"),
             (format!("{scout}keeper = [\"http://k:7430\"]\n"), "not host:port"),
             (format!("{scout}name = \"a b\"\n{key}"), "gate.name"),
+            (format!("{scout}{key}[e2b]\n"), "needs image_key or templates"),
+            (format!("{scout}{key}[e2b]\nimage_key = \"a b\"\n"), "e2b.image_key"),
+            (format!("{scout}{key}[e2b]\nimage = \"x\"\n"), "unknown field"),
+            (format!("{scout}{key}[e2b]\nimage_key = \"i\"\nbackend = \"auto\"\n"), "e2b.backend"),
         ];
         for (text, want) in cases {
             let e = Config::from_toml(&text).unwrap_err();

@@ -270,7 +270,8 @@ async fn a_paused_cell_is_reclaimed_and_then_stopped() {
     // a process holding memory of its own.
     sh(&node.comb, id, "python3 -c 'import asyncio, json, sqlite3, ssl, decimal, unittest'").await;
     sh(&node.comb, id, "head -c 64M /dev/urandom > /tmp/blob && cat /tmp/blob > /dev/null").await;
-    let hold = "python3 -c 'import time; x = bytearray(96 << 20); time.sleep(3600)' >/dev/null 2>&1 &";
+    let hold =
+        "python3 -c 'import time; x = bytearray(96 << 20); time.sleep(3600)' >/dev/null 2>&1 &";
     sh(&node.comb, id, hold).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let before = mem();

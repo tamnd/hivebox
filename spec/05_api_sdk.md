@@ -203,19 +203,32 @@ hive.stop(&Selector::Labels(labels)).await?;
 
 `hivectl` is built on it. It talks to `$HIVE_SOCKET` or `--endpoint`, and has commands to create, list, get, pause, resume, stop and watch cells, `run` and `sh` to run commands, and `cat`, `cp`, `files` and `rm` for files. `hivectl run` exits with the command's exit code, 128 plus the signal when a signal killed it, and 124 when it timed out.
 
-## 6. E2B compatibility layer (in gate, feature `compat-e2b`)
+## 6. E2B compatibility layer (in the gate, with an `[e2b]` table)
+
+The E2B SDK talks to two places: the E2B API, which makes and ends sandboxes, and envd, a daemon in each sandbox that runs commands and moves files. With `E2B_API_URL` and `E2B_SANDBOX_URL` both set to the gate, the SDK sends both to the gate, and names the sandbox of every envd call in the `E2b-Sandbox-Id` header, so one address serves everything and no wildcard DNS is needed. A sandbox is a cell and its id is the cell id.
 
 | E2B surface | hivebox mapping |
 |---|---|
-| `POST /sandboxes {templateID, timeout, metadata}` | `Cells.Create(template, idle_ttl=timeout, labels=metadata)` |
-| `GET/DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/timeout`, `/pause`, `/resume`, `/refreshes` | Get/Stop/ExtendTtl/Pause/Resume |
-| `{port}-{id}.domain` host routing | gate host router; `49983` to drone envd-compatible Connect service |
-| envd `process.Process/Start|Connect|SendInput|SendSignal|List` | Exec.Start/Signal |
-| envd `filesystem.Filesystem/Stat|MakeDir|Move|ListDir|Remove|WatchDir` + `/files` upload/download | Files.* |
-| Templates (`e2b.toml`, Dockerfile build) | Images.Import(Dockerfile) + Template |
-| `X-API-Key`, `E2B-Access-Token` | API key exchanged for biscuit; per-cell access token = attenuated biscuit |
+| `POST /sandboxes`, `POST /v2/sandboxes` with `templateID`, `timeout`, `metadata`, `envVars` | `Cells.Create`, with the image from the metadata key `image_key` names or else from `templates`, resources from the size the metadata picks, `hard_ttl` from `timeout` and the metadata as labels |
+| `GET /sandboxes/{id}`, `GET /sandboxes`, `GET /v2/sandboxes` | `Cells.Get`, `Cells.List` with the `metadata` query as a label selector |
+| `DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/pause`, `/resume`, `/connect` | `Cells.Stop`, `Cells.Pause`, `Cells.Resume` |
+| `POST /sandboxes/{id}/timeout`, `/refreshes` | `Cells.ExtendTtl` |
+| envd `process.Process/Start`, `SendInput`, `CloseStdin`, `SendSignal` | `Exec.Start` and `Exec.Signal` on the comb that owns the cell |
+| envd `filesystem.Filesystem/Stat`, `ListDir`, `Remove`, `MakeDir`, `Move` | `Files.Stat`, `Files.List`, `Files.Remove`, and `Exec.Run` of `mkdir -p` and `mv` |
+| envd `GET /files`, `POST /files`, raw or multipart | `Files.Read`, `Files.Write` with the file owned by the caller's user |
+| `X-API-Key`, envd `X-Access-Token` | the same key or biscuit token the gate takes as a bearer |
 
-For conformance, CI runs E2B's public SDK test suites (Python and JS) against hivebox.
+Create gives back the key or token it was called with as `envdAccessToken`, which is what the SDK then sends to envd, so the gate checks envd calls the same way it checks every other call. The gate says it is envd 0.5.7, which turns on raw uploads and closing a process's input in the SDK, and leaves out file metadata. A user named in an envd call is looked up in the cell's `/etc/passwd` by the comb, and relative paths are taken from that user's home. Input to a process goes through the gate that started it, since that gate holds the process's stream to its comb, so a gate fleet behind a balancer needs sticky sessions by sandbox for processes started with their input open.
+
+Not served yet: templates, snapshots, metrics and logs, terminals, watching directories, `process.Process/List` and `Connect`, and gzip uploads.
+
+A gate config that serves the slime SWE examples:
+
+```toml
+[e2b]
+image_key = "swe/image"
+sizes = { md = { vcpu_milli = 2000, mem_mib = 4096 } }
+```
 
 ## 7. Other adapters (crate `hive-pollen`, Python `hivebox.adapters`)
 

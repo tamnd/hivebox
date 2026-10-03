@@ -173,7 +173,16 @@ fn exactly<'a>(args: &'a Args, n: usize, what: &str) -> Result<&'a [String], Str
 
 async fn create(client: &Client, args: &Args) -> Result<i32, String> {
     args.check(&[
-        "-n", "-l", "--label", "--mem", "--cpu", "--net", "--ttl", "--idle", "--on-idle", "--key",
+        "-n",
+        "-l",
+        "--label",
+        "--mem",
+        "--cpu",
+        "--net",
+        "--ttl",
+        "--idle",
+        "--on-idle",
+        "--key",
     ])?;
     let [image] = exactly(args, 1, "an image")? else { unreachable!() };
     let mut spec = CellSpec::new(Source::Image(image.clone()), Backend::Container);

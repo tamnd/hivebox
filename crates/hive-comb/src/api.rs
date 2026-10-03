@@ -19,7 +19,7 @@ use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_server::{Exec, ExecServer};
 use hive_proto::v1::files_server::{Files, FilesServer};
 use hive_types::{CellId, CellState, Error, Reason, is_name};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -530,16 +530,16 @@ impl Exec for Api {
             return Err(invalid("idempotency keys on exec are not supported yet"));
         }
         let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let (uid, gid) = user(&r.user)?;
+        let who = user(&drone, &r.user).await?;
         let command = drone::Command {
             argv: r.argv,
             shell: r.shell,
             cwd: r.cwd,
-            env: r.env.into_iter().collect(),
+            env: who.env(r.env),
             timeout_ms: millis(r.timeout)?,
             max_output_bytes: r.max_output_bytes,
-            uid,
-            gid,
+            uid: who.uid,
+            gid: who.gid,
         };
         let out = drone
             .run(&drone::RunRequest { command: Some(command), stdin: r.stdin })
@@ -563,16 +563,16 @@ impl Exec for Api {
             return Err(invalid("terminals are not supported yet"));
         }
         let (id, drone) = self.drone(&project, &s.cell_id).await?;
-        let (uid, gid) = user(&s.user)?;
+        let who = user(&drone, &s.user).await?;
         let command = drone::Command {
             argv: s.argv,
             shell: s.shell,
             cwd: s.cwd,
-            env: s.env.into_iter().collect(),
+            env: who.env(s.env),
             timeout_ms: millis(s.timeout)?,
             max_output_bytes: 0,
-            uid,
-            gid,
+            uid: who.uid,
+            gid: who.gid,
         };
         let (mut tx, rx) = drone.start(&command).await.map_err(status)?.split();
         let (signal_tx, mut signals) = mpsc::channel::<i32>(8);
@@ -649,13 +649,13 @@ impl Exec for Api {
         let project = project(&req)?;
         let r = req.into_inner();
         let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let (uid, gid) = user(&r.user)?;
+        let who = user(&drone, &r.user).await?;
         let spec = drone::SessionCreate {
             shell: r.shell,
             cwd: r.cwd,
-            env: r.env.into_iter().collect(),
-            uid,
-            gid,
+            env: who.env(r.env),
+            uid: who.uid,
+            gid: who.gid,
         };
         let info = drone.session_create(&spec).await.map_err(status)?;
         Ok(Response::new(v1::Session { cell_id: r.cell_id, id: info.id }))
@@ -736,14 +736,15 @@ impl Files for Api {
             return Err(invalid("the first message must be a header"));
         };
         let (_, drone) = self.drone(&project, &h.cell_id).await?;
+        let Who { uid, gid, .. } = user(&drone, &h.user).await?;
         let mut write = drone::FsWrite {
             path: h.path,
             data: bytes::Bytes::new(),
             mode: h.mode,
             make_parents: h.make_parents,
             append: h.append,
-            uid: None,
-            gid: None,
+            uid,
+            gid,
         };
         // Most writes are small files, which go in one message. Past that the file is streamed,
         // with what came so far as its start.
@@ -972,13 +973,59 @@ fn info_to_v1(i: drone::FileInfo) -> v1::FileInfo {
     }
 }
 
-/// `uid` or `uid:gid`. Names would have to be looked up in the cell's own passwd file, which
-/// comes later.
-fn user(u: &str) -> Result<(Option<u32>, Option<u32>), Status> {
+/// Who a command runs as. A user given by name also gets the `HOME`, `USER` and `LOGNAME` a login
+/// would give it, so its shell does not go looking in root's home.
+#[derive(Debug, PartialEq)]
+struct Who {
+    uid: Option<u32>,
+    gid: Option<u32>,
+    home: Option<(String, String)>,
+}
+
+impl Who {
+    /// `env` with the user's variables added where the caller did not set them.
+    fn env(&self, env: HashMap<String, String>) -> BTreeMap<String, String> {
+        let mut env: BTreeMap<_, _> = env.into_iter().collect();
+        if let Some((name, home)) = &self.home {
+            env.entry("HOME".into()).or_insert_with(|| home.clone());
+            env.entry("USER".into()).or_insert_with(|| name.clone());
+            env.entry("LOGNAME".into()).or_insert_with(|| name.clone());
+        }
+        env
+    }
+}
+
+/// `uid`, `uid:gid`, or a name from the cell's own `/etc/passwd`, which is read through its drone
+/// each time, since a command may have just added the user.
+async fn user(drone: &hive_drone::Client, u: &str) -> Result<Who, Status> {
+    if u == "root" {
+        let home = Some(("root".to_owned(), "/root".to_owned()));
+        return Ok(Who { uid: Some(0), gid: Some(0), home });
+    }
+    if u.is_empty() || u.starts_with(|c: char| c.is_ascii_digit()) {
+        let (uid, gid) = ids(u)?;
+        return Ok(Who { uid, gid, home: None });
+    }
+    let read = drone::FsRead { path: "/etc/passwd".into(), offset: 0, length: PASSWD_MAX };
+    let mut reader = drone.fs_open(&read).await.map_err(status)?;
+    let mut text = Vec::new();
+    while let Some(chunk) = reader.next().await.map_err(status)? {
+        text.extend_from_slice(&chunk);
+    }
+    let (uid, gid, home) =
+        passwd(&text, u).ok_or_else(|| invalid(format!("the cell has no user {u:?}")))?;
+    Ok(Who { uid: Some(uid), gid: Some(gid), home: Some((u.to_owned(), home)) })
+}
+
+/// The most of `/etc/passwd` read to find a user.
+const PASSWD_MAX: u64 = 1 << 20;
+
+/// `uid` or `uid:gid`, or nothing when empty.
+fn ids(u: &str) -> Result<(Option<u32>, Option<u32>), Status> {
     if u.is_empty() {
         return Ok((None, None));
     }
-    let bad = || invalid(format!("user {u:?} is not a uid or uid:gid"));
+    let bad = || invalid(format!("user {u:?} is not a name, a uid or uid:gid"));
     let (uid, gid) = match u.split_once(':') {
         Some((a, b)) => (a, Some(b)),
         None => (u, None),
@@ -986,6 +1033,20 @@ fn user(u: &str) -> Result<(Option<u32>, Option<u32>), Status> {
     let uid = uid.parse().map_err(|_| bad())?;
     let gid = gid.map(str::parse).transpose().map_err(|_| bad())?;
     Ok((Some(uid), gid))
+}
+
+/// The uid, gid and home of `name` in a passwd file.
+fn passwd(text: &[u8], name: &str) -> Option<(u32, u32, String)> {
+    String::from_utf8_lossy(text).lines().find_map(|line| {
+        let mut f = line.split(':');
+        if f.next()? != name {
+            return None;
+        }
+        let uid = f.nth(1)?.parse().ok()?;
+        let gid = f.next()?.parse().ok()?;
+        let home = f.nth(1)?;
+        Some((uid, gid, home.to_owned()))
+    })
 }
 
 /// A timeout in milliseconds, 0 when unset. A part of a millisecond counts as a whole one.
@@ -1020,12 +1081,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn users_are_numbers() {
-        assert_eq!(user("").unwrap(), (None, None));
-        assert_eq!(user("1000").unwrap(), (Some(1000), None));
-        assert_eq!(user("1000:100").unwrap(), (Some(1000), Some(100)));
-        assert!(user("root").is_err());
-        assert!(user("1000:").is_err());
+    fn users_are_numbers_or_names() {
+        assert_eq!(ids("").unwrap(), (None, None));
+        assert_eq!(ids("1000").unwrap(), (Some(1000), None));
+        assert_eq!(ids("1000:100").unwrap(), (Some(1000), Some(100)));
+        assert!(ids("1000:").is_err());
+        let text = b"root:x:0:0:root:/root:/bin/bash\nagent:x:1001:1002::/home/agent:/bin/bash\n";
+        assert_eq!(passwd(text, "agent"), Some((1001, 1002, "/home/agent".into())));
+        assert_eq!(passwd(text, "root"), Some((0, 0, "/root".into())));
+        assert_eq!(passwd(text, "age"), None);
+    }
+
+    #[test]
+    fn a_named_user_gets_its_home() {
+        let who = Who {
+            uid: Some(1001),
+            gid: Some(1002),
+            home: Some(("agent".into(), "/home/agent".into())),
+        };
+        let env = who.env(HashMap::from([("USER".into(), "me".into())]));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/agent"));
+        assert_eq!(env.get("USER").map(String::as_str), Some("me"));
+        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("agent"));
+        let who = Who { uid: Some(1000), gid: None, home: None };
+        assert!(who.env(HashMap::new()).is_empty());
     }
 
     #[test]
