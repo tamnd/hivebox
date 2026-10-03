@@ -60,9 +60,32 @@ pub struct CellInfo {
 }
 
 pub(crate) enum Cmd {
-    Stop { cause: Cause, grace: Duration, done: oneshot::Sender<()> },
-    Pause { done: oneshot::Sender<Result<(), Error>> },
-    Resume { done: oneshot::Sender<Result<(), Error>> },
+    Stop {
+        cause: Cause,
+        grace: Duration,
+        done: oneshot::Sender<()>,
+    },
+    Pause {
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    Resume {
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// New timers, each left as it was when `None`. The hard TTL counts from now.
+    ExtendTtl {
+        hard: Option<Duration>,
+        idle: Option<Duration>,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+}
+
+/// A cell's timers as they are now, which `ExtendTtl` can change after the create.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ttls {
+    /// From the create to the stop, whatever the cell does.
+    pub(crate) hard: Option<Duration>,
+    /// From the last use to the pause or stop.
+    pub(crate) idle: Option<Duration>,
 }
 
 /// The part of a cell anyone may read. The actor holds the rest.
@@ -76,6 +99,7 @@ pub(crate) struct Cell {
     pub(crate) status: watch::Sender<Status>,
     drone: RwLock<Option<Client>>,
     last_active_ms: AtomicU64,
+    ttls: RwLock<Ttls>,
     tx: mpsc::Sender<Cmd>,
 }
 
@@ -93,21 +117,25 @@ impl Cell {
             id,
             project,
             idem_key,
-            spec,
             created,
             status: watch::Sender::new(status),
             drone: RwLock::new(None),
             last_active_ms: AtomicU64::new(now_ms()),
+            ttls: RwLock::new(Ttls { hard: spec.hard_ttl, idle: spec.idle_ttl }),
+            spec,
             tx,
         };
         (Arc::new(cell), rx)
     }
 
     pub(crate) fn info(&self) -> CellInfo {
+        let mut spec = self.spec.clone();
+        let ttls = self.ttls();
+        (spec.hard_ttl, spec.idle_ttl) = (ttls.hard, ttls.idle);
         CellInfo {
             id: self.id,
             project: self.project.clone(),
-            spec: self.spec.clone(),
+            spec,
             status: self.status.borrow().clone(),
             created: self.created,
         }
@@ -122,6 +150,10 @@ impl Cell {
     pub(crate) fn drone(&self) -> Option<Client> {
         self.touch();
         self.drone.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn ttls(&self) -> Ttls {
+        *self.ttls.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn touch(&self) {
@@ -160,6 +192,8 @@ pub(crate) struct Actor {
     netns: Option<PathBuf>,
     /// The cell's interface in that namespace, when the node wires them.
     veth: Option<Veth>,
+    /// Whether the paused cell's memory has been reclaimed, so the reclaim timer is done.
+    reclaimed: bool,
 }
 
 impl Actor {
@@ -182,6 +216,7 @@ impl Actor {
             cgroup: None,
             netns: None,
             veth: None,
+            reclaimed: false,
         }
     }
 
@@ -493,6 +528,9 @@ impl Actor {
                             return;
                         }
                     }
+                    Some(Cmd::ExtendTtl { hard, idle, done }) => {
+                        let _ = done.send(self.extend_ttl(hard, idle).await);
+                    }
                     None => return,
                 },
                 () = lost => {
@@ -504,6 +542,18 @@ impl Actor {
                     let (_, what) = timer.expect("only wakes with a timer");
                     match what {
                         Timer::Hard => return self.stop(Cause::HardTtl, self.inner.cfg.stop_grace).await,
+                        Timer::PauseTtl => {
+                            if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
+                                continue;
+                            }
+                            return self.stop(Cause::Idle, self.inner.cfg.stop_grace).await;
+                        }
+                        Timer::Reclaim => {
+                            if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
+                                continue;
+                            }
+                            self.reclaim().await;
+                        }
                         Timer::Idle => {
                             // The cell was used while the timer slept, so it is not idle after all.
                             if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
@@ -528,18 +578,61 @@ impl Actor {
         let now_sys = SystemTime::now();
         let now = Instant::now();
         let at = |t: SystemTime| now + t.duration_since(now_sys).unwrap_or_default();
-        let hard = self.cell.spec.hard_ttl.map(|ttl| (at(self.cell.created + ttl), Timer::Hard));
-        let idle = match (self.cell.state(), self.cell.spec.idle_ttl) {
+        let ttls = self.cell.ttls();
+        let hard = ttls.hard.map(|ttl| (at(self.cell.created + ttl), Timer::Hard));
+        let cfg = &self.inner.cfg;
+        let (idle, reclaim, pause_ttl) = match (self.cell.state(), ttls.idle) {
             (CellState::Running, Some(ttl)) => {
                 let last = time(self.cell.last_active_ms.load(Ordering::Relaxed));
-                Some((at(last + ttl), Timer::Idle))
+                (Some((at(last + ttl), Timer::Idle)), None, None)
             }
-            _ => None,
+            (CellState::Paused, _) => {
+                let since = self.cell.status.borrow().changed;
+                let reclaim = (!self.reclaimed && self.driver.caps().pause)
+                    .then(|| (at(since + cfg.reclaim_after), Timer::Reclaim));
+                (None, reclaim, Some((at(since + cfg.pause_ttl), Timer::PauseTtl)))
+            }
+            _ => (None, None, None),
         };
-        match (hard, idle) {
-            (Some(h), Some(i)) => Some(if i.0 < h.0 { i } else { h }),
-            (h, i) => h.or(i),
+        [hard, idle, reclaim, pause_ttl].into_iter().flatten().min_by_key(|(at, _)| *at)
+    }
+
+    /// Swaps a paused cell's memory out. A failed reclaim leaves the cell frozen as it was, and is
+    /// not tried again until the next pause.
+    async fn reclaim(&mut self) {
+        self.reclaimed = true;
+        let handle = self.handle.clone().expect("a live cell has a handle");
+        let _ = self.driver.pause(&handle, PauseMode::Reclaim).await;
+    }
+
+    async fn extend_ttl(
+        &mut self,
+        hard: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> Result<(), Error> {
+        let state = self.cell.state();
+        if state.is_terminal() {
+            return Err(not_running(state));
         }
+        let mut ttls = self.cell.ttls();
+        if let Some(h) = hard {
+            let lived = SystemTime::now().duration_since(self.cell.created).unwrap_or_default();
+            ttls.hard = Some(lived + h);
+        }
+        if idle.is_some() {
+            ttls.idle = idle;
+        }
+        if let Some(spec) = &mut self.record.spec {
+            spec.hard_ttl = ttls.hard.map(hive_proto::convert::duration_to_v1);
+            spec.idle_ttl = ttls.idle.map(hive_proto::convert::duration_to_v1);
+        }
+        let message = self.cell.status.borrow().message.clone();
+        let cause = self.cell.status.borrow().cause;
+        self.commit(state, cause, &message).await?;
+        *self.cell.ttls.write().unwrap_or_else(PoisonError::into_inner) = ttls;
+        // Counts as use, so a cell given a longer idle TTL is not paused on the old clock.
+        self.cell.touch();
+        Ok(())
     }
 
     /// The guest agent's connection dropped. Returns whether the cell lives on.
@@ -615,6 +708,7 @@ impl Actor {
         self.commit(CellState::Running, None, "").await?;
         let handle = self.handle.clone().expect("a live cell has a handle");
         self.cell.touch();
+        self.reclaimed = false;
         if let Err(e) = self.driver.resume(&handle).await {
             // Still frozen, so it goes back to paused, the only way there being through pausing.
             self.commit(CellState::Pausing, None, "").await?;
@@ -724,7 +818,7 @@ impl Actor {
                 () = &mut sleep => break,
                 cmd = self.rx.recv() => match cmd {
                     Some(Cmd::Stop { done, .. }) => { let _ = done.send(()); }
-                    Some(Cmd::Pause { done } | Cmd::Resume { done }) => {
+                    Some(Cmd::Pause { done } | Cmd::Resume { done } | Cmd::ExtendTtl { done, .. }) => {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     None => return,
@@ -741,6 +835,8 @@ impl Actor {
 enum Timer {
     Hard,
     Idle,
+    Reclaim,
+    PauseTtl,
 }
 
 /// Connects to a cell's guest agent and runs the handshake. With no `patience` it keeps trying

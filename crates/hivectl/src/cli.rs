@@ -4,7 +4,7 @@
 
 use hive_proto::v1;
 use hive_sdk::{Cell, Client, Command, Output, Selector};
-use hive_types::{Backend, CellSpec, Resources, Source};
+use hive_types::{Backend, CellSpec, IdleAction, Resources, Source};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, SystemTime};
@@ -16,9 +16,10 @@ usage: hivectl [--socket PATH | --endpoint URL] [--project NAME] COMMAND
 
 Cells:
   create IMAGE [-n COUNT] [-l KEY=VALUE]... [--mem MIB] [--cpu MILLICORES]
-         [--net PROFILE] [--ttl DURATION] [--idle DURATION] [--key KEY]
+         [--net PROFILE] [--ttl DURATION] [--idle DURATION] [--on-idle pause|stop] [--key KEY]
   ls [-l KEY=VALUE]... [--state STATE]...
   get ID
+  extend ID [--ttl DURATION] [--idle DURATION]     the TTL counts from now
   pause|resume|stop ID... | -l KEY=VALUE...
   watch [ID | -l KEY=VALUE...]
 
@@ -148,6 +149,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "create" => create(&client, &args).await,
         "ls" => ls(&client, &args).await,
         "get" => get(&client, &args).await,
+        "extend" => extend(&client, &args).await,
         "pause" | "resume" | "stop" => bulk(&client, &command, &args).await,
         "watch" => watch(&client, &args).await,
         "run" => run(&client, &args).await,
@@ -170,7 +172,9 @@ fn exactly<'a>(args: &'a Args, n: usize, what: &str) -> Result<&'a [String], Str
 }
 
 async fn create(client: &Client, args: &Args) -> Result<i32, String> {
-    args.check(&["-n", "-l", "--label", "--mem", "--cpu", "--net", "--ttl", "--idle", "--key"])?;
+    args.check(&[
+        "-n", "-l", "--label", "--mem", "--cpu", "--net", "--ttl", "--idle", "--on-idle", "--key",
+    ])?;
     let [image] = exactly(args, 1, "an image")? else { unreachable!() };
     let mut spec = CellSpec::new(Source::Image(image.clone()), Backend::Container);
     let number = |flag: &str| -> Result<Option<u32>, String> {
@@ -188,6 +192,11 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
     }
     spec.hard_ttl = args.one(&["--ttl"]).map(duration).transpose()?;
     spec.idle_ttl = args.one(&["--idle"]).map(duration).transpose()?;
+    spec.idle_action = match args.one(&["--on-idle"]) {
+        None | Some("pause") => IdleAction::Pause,
+        Some("stop") => IdleAction::Stop,
+        Some(v) => return Err(format!("--on-idle {v}: pause or stop")),
+    };
     spec.labels = args.labels()?;
     let count = number("-n")?.unwrap_or(1);
     let made = client.create_many(&spec, count, args.one(&["--key"])).await.map_err(err)?;
@@ -230,6 +239,18 @@ async fn ls(client: &Client, args: &Args) -> Result<i32, String> {
         })
         .collect();
     table(&["ID", "STATE", "AGE", "IMAGE", "LABELS"], &rows);
+    Ok(0)
+}
+
+async fn extend(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&["--ttl", "--idle"])?;
+    let [id] = exactly(args, 1, "a cell id")? else { unreachable!() };
+    let hard = args.one(&["--ttl"]).map(duration).transpose()?;
+    let idle = args.one(&["--idle"]).map(duration).transpose()?;
+    if hard.is_none() && idle.is_none() {
+        return Err("extend needs --ttl or --idle".into());
+    }
+    client.extend_ttl(id, hard, idle).await.map_err(err)?;
     Ok(0)
 }
 

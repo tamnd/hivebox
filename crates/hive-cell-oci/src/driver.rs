@@ -333,7 +333,10 @@ impl CellDriver for OciDriver {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             if mode == PauseMode::Reclaim {
-                // Best effort: whatever the kernel can push out now goes to swap.
+                // Best effort: whatever the kernel can push out now goes, the page cache back to
+                // disk and the rest to swap where there is any. The kernel gives up early with
+                // EAGAIN once it cannot find more, which is fine.
+                cgroup::swap(&h.cgroup, true);
                 let used = cgroup::metrics(&h.cgroup).mem_bytes;
                 let _ = cgroup::write(&h.cgroup, "memory.reclaim", &used.to_string());
             }
@@ -344,7 +347,10 @@ impl CellDriver for OciDriver {
     fn resume<'a>(&'a self, h: &'a CellHandle) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             cgroup::freeze(&h.cgroup, false)
-                .map_err(|e| Error::new(Reason::Internal, format!("resuming: {e}")))
+                .map_err(|e| Error::new(Reason::Internal, format!("resuming: {e}")))?;
+            // Pages already in swap stay there until touched, and new ones stop going out.
+            cgroup::swap(&h.cgroup, false);
+            Ok(())
         })
     }
 

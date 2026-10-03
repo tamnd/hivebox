@@ -33,6 +33,13 @@ pub struct Config {
     pub stop_grace: Duration,
     /// How long a stopped or failed cell stays visible before its record is dropped.
     pub keep_ended: Duration,
+    /// How long a cell stays frozen with its memory in place before the node reclaims it, swapping
+    /// the cell's memory out so a resume pages it back in.
+    pub reclaim_after: Duration,
+    /// How long a cell may stay paused before it is stopped.
+    pub pause_ttl: Duration,
+    /// Longest an exec or file call on a paused cell waits for the resume it causes.
+    pub resume_timeout: Duration,
     /// The cgroup the comb puts its cells under, which it makes if it has to. `None` runs cells
     /// with no cgroup of their own, with no limits and no kill on stop, which only suits tests.
     pub cgroup_root: Option<PathBuf>,
@@ -196,6 +203,9 @@ impl Default for Config {
             create_deadline: Duration::from_secs(30),
             stop_grace: Duration::from_secs(10),
             keep_ended: Duration::from_secs(600),
+            reclaim_after: Duration::from_secs(600),
+            pause_ttl: Duration::from_secs(24 * 3600),
+            resume_timeout: Duration::from_secs(5),
             cgroup_root: Some(PathBuf::from("/sys/fs/cgroup/hive.slice")),
             cgroup_depth: 256,
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
@@ -233,6 +243,9 @@ impl Config {
     /// [lifecycle]
     /// create_deadline = "30s"
     /// keep_ended = "10m"
+    /// reclaim_after = "10m"
+    /// pause_ttl = "24h"
+    /// resume_timeout = "5s"
     ///
     /// [backends.create_limit]
     /// container = 128
@@ -306,6 +319,9 @@ impl Config {
             (&mut c.create_deadline, l.create_deadline, "create_deadline"),
             (&mut c.stop_grace, l.stop_grace, "stop_grace"),
             (&mut c.keep_ended, l.keep_ended, "keep_ended"),
+            (&mut c.reclaim_after, l.reclaim_after, "reclaim_after"),
+            (&mut c.pause_ttl, l.pause_ttl, "pause_ttl"),
+            (&mut c.resume_timeout, l.resume_timeout, "resume_timeout"),
         ] {
             if let Some(v) = value {
                 *field = duration(&v).ok_or_else(|| {
@@ -521,6 +537,9 @@ struct LifecycleFile {
     create_deadline: Option<String>,
     stop_grace: Option<String>,
     keep_ended: Option<String>,
+    reclaim_after: Option<String>,
+    pause_ttl: Option<String>,
+    resume_timeout: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -571,6 +590,7 @@ mod tests {
             create_deadline = "5s"
             stop_grace = "250ms"
             keep_ended = "10m"
+            reclaim_after = "30s"
 
             [backends.create_limit]
             container = 8
@@ -603,6 +623,8 @@ mod tests {
         assert_eq!(c.create_deadline, Duration::from_secs(5));
         assert_eq!(c.stop_grace, Duration::from_millis(250));
         assert_eq!(c.keep_ended, Duration::from_secs(600));
+        assert_eq!(c.reclaim_after, Duration::from_secs(30));
+        assert_eq!(c.pause_ttl, Duration::from_secs(24 * 3600));
         assert_eq!(c.create_limit[&Backend::Container], 8);
         assert_eq!(c.create_limit[&Backend::Microvm], 64);
         assert_eq!(c.container.drone, PathBuf::from("/opt/hive-drone"));

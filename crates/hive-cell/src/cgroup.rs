@@ -21,7 +21,15 @@ pub fn write(dir: &Path, file: &str, value: &str) -> io::Result<()> {
 /// on `memory.oom.group`, so the OOM killer takes the whole cell rather than one process in it.
 pub fn limit(dir: &Path, r: &Resources) -> io::Result<()> {
     write(dir, "memory.oom.group", "1")?;
+    swap(dir, false);
     relimit(dir, None, r)
+}
+
+/// Lets the cgroup `dir` use swap or not. A running cell gets none, so it never slows down paging
+/// in, and a reclaimed one gets all it needs. Hosts without swap accounting have no file to write,
+/// which is fine, since they have nothing to swap to either.
+pub fn swap(dir: &Path, on: bool) {
+    let _ = write(dir, "memory.swap.max", if on { "max" } else { "0" });
 }
 
 /// Changes the limits on a cgroup that [`limit`] set to `was`, writing only the ones that differ.

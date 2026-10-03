@@ -17,7 +17,7 @@ struct Node {
     // Dropped in this order: the comb before its cgroups, its pins and its directory.
     comb: Comb,
     guard: Option<Guarded>,
-    _tree: Tree,
+    tree: Tree,
     _scratch: Scratch,
 }
 
@@ -115,7 +115,7 @@ impl Node {
         };
         let drone = PathBuf::from(drone);
         let comb = open_oci(&cfg, &drone).await;
-        Some(Self { cfg, drone, comb, guard, _tree: tree, _scratch: scratch })
+        Some(Self { cfg, drone, comb, guard, tree, _scratch: scratch })
     }
 
     /// Shuts the comb down, which leaves its cells running, and opens a new one on the same data.
@@ -252,6 +252,66 @@ async fn a_container_cell_goes_through_the_comb_and_outlives_it() {
     let info = node.comb.stop(id, None).await.unwrap();
     assert_eq!(info.status.state, CellState::Stopped);
     assert!(!node.cfg.data_dir.join("oci").join(id.to_string()).exists());
+    node.comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_cell_is_reclaimed_and_then_stopped() {
+    let Some(mut node) = Node::new(4).await else { return };
+    node.cfg.reclaim_after = Duration::from_millis(500);
+    node.cfg.pause_ttl = Duration::from_secs(4);
+    node.restart().await;
+    let mem = || {
+        let text = std::fs::read_to_string(node.tree.0.join("memory.current")).unwrap();
+        text.trim().parse::<u64>().unwrap() >> 20
+    };
+    let id = node.comb.create(request(spec("python"))).await.unwrap().id;
+    // A cell that has done some work: a page cache full of the image and the files it wrote, and
+    // a process holding memory of its own.
+    sh(&node.comb, id, "python3 -c 'import asyncio, json, sqlite3, ssl, decimal, unittest'").await;
+    sh(&node.comb, id, "head -c 64M /dev/urandom > /tmp/blob && cat /tmp/blob > /dev/null").await;
+    let hold = "python3 -c 'import time; x = bytearray(96 << 20); time.sleep(3600)' >/dev/null 2>&1 &";
+    sh(&node.comb, id, hold).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = mem();
+
+    // Frozen and thawed, with an exec right after as a user would send.
+    let t = Instant::now();
+    assert_eq!(node.comb.pause(id).await.unwrap().status.state, CellState::Paused);
+    let froze = t.elapsed();
+    let t = Instant::now();
+    sh(&node.comb, id, "true").await;
+    let thawed = t.elapsed();
+
+    // Paused long enough to be reclaimed, then woken by an exec alone.
+    node.comb.pause(id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reclaimed = mem();
+    let t = Instant::now();
+    sh(&node.comb, id, "python3 -c 'import json'").await;
+    let woke = t.elapsed();
+    let after = mem();
+    println!(
+        "{before} MiB before, {reclaimed} MiB once reclaimed, {after} MiB after a python start; \
+         freeze {froze:.2?}, exec after a freeze {thawed:.2?}, python start after a reclaim {woke:.2?}"
+    );
+    assert!(reclaimed < before, "{reclaimed} MiB reclaimed from {before} MiB");
+
+    // The longer TTL takes, and then a paused cell runs out of its pause.
+    let info = node.comb.extend_ttl(id, Some(Duration::from_secs(3600)), None).await.unwrap();
+    assert!(info.spec.hard_ttl.unwrap() >= Duration::from_secs(3600));
+    node.comb.pause(id).await.unwrap();
+    let t = Instant::now();
+    let ended = loop {
+        let s = node.comb.get(id).unwrap().status;
+        if s.state.is_terminal() {
+            break s;
+        }
+        assert!(t.elapsed() < Duration::from_secs(30), "still {} after 30s", s.state);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!((ended.state, ended.cause), (CellState::Stopped, Some(Cause::Idle)));
+    assert!(t.elapsed() >= Duration::from_secs(3), "stopped after {:.2?}", t.elapsed());
     node.comb.shutdown().await;
 }
 

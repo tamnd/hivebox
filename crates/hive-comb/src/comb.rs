@@ -462,12 +462,35 @@ impl Comb {
         Ok(cell.info())
     }
 
+    /// Changes a live cell's timers. `hard` is how long from now until the cell is stopped, and
+    /// `idle` replaces its idle TTL. Either is left as it was when `None`.
+    pub async fn extend_ttl(
+        &self,
+        id: CellId,
+        hard: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> Result<CellInfo, Error> {
+        let cell = self.inner.find(id)?;
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::ExtendTtl { hard, idle, done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        wait.await.map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        Ok(cell.info())
+    }
+
     /// The guest agent client for a running cell, for exec and file calls. A paused cell is
-    /// resumed first, since a request is what wakes it.
+    /// resumed first, since a request is what wakes it, waiting at most `resume_timeout`.
     pub async fn drone(&self, id: CellId) -> Result<Client, Error> {
         let cell = self.inner.find(id)?;
         if cell.state() == CellState::Paused {
-            self.resume(id).await?;
+            let wait = self.inner.cfg.resume_timeout;
+            tokio::time::timeout(wait, self.resume(id)).await.map_err(|_| {
+                Error::new(
+                    Reason::CellNotRunning,
+                    format!("the cell did not resume within {wait:?}"),
+                )
+            })??;
         }
         match (cell.state(), cell.drone()) {
             (CellState::Running, Some(c)) if !c.is_closed() => Ok(c),

@@ -246,6 +246,27 @@ impl Client {
         Ok(r.map_err(from_status)?.into_inner())
     }
 
+    /// Changes a cell's timers: `hard` is how long from now until it is stopped, and `idle`
+    /// replaces its idle TTL. Either is left as it was when `None`.
+    ///
+    /// # Errors
+    ///
+    /// The cell is not found or has ended.
+    pub async fn extend_ttl(
+        &self,
+        id: &str,
+        hard: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> Result<Cell, Error> {
+        let r = v1::ExtendTtlRequest {
+            id: id.to_string(),
+            hard_ttl: hard.map(convert::duration_to_v1),
+            idle_ttl: idle.map(convert::duration_to_v1),
+        };
+        let c = self.cells().extend_ttl(self.req(r)).await.map_err(from_status)?.into_inner();
+        Ok(Cell::new(self.clone(), c))
+    }
+
     /// The changes of state of what `sel` picks, starting with each cell's current state. A
     /// watch by id ends once the cell has ended.
     ///
@@ -416,6 +437,16 @@ impl Cell {
 
     fn sel(&self) -> Selector {
         Selector::Id(self.info.id.clone())
+    }
+
+    /// Gives the cell `hard` more time from now before it is stopped.
+    ///
+    /// # Errors
+    ///
+    /// The cell has ended.
+    pub async fn extend(&mut self, hard: Duration) -> Result<(), Error> {
+        self.info = self.client.extend_ttl(&self.info.id, Some(hard), None).await?.info;
+        Ok(())
     }
 
     /// Pauses the cell.
