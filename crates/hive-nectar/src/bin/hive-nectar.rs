@@ -7,7 +7,14 @@
 //! hive-nectar show IMAGE --store DIR
 //! hive-nectar fetch IMAGE --store DIR --cache DIR [--capacity BYTES]
 //! hive-nectar copy IMAGE --store DIR --to-s3 URL      # an image and its layers, to a bucket
+//! hive-nectar run IMAGE --store DIR --cache DIR --work DIR --cmd CMD [--mode MODE]
 //! ```
+//!
+//! `run` mounts the image as a cell would get it and runs `CMD` with `sh -c` chrooted into it,
+//! then says how long the mount and the command took. It needs root. `--mode whole` fetches every
+//! blob before mounting, `lazy`, the default, mounts lazily over NBD with the image's prefetch
+//! traces leading the fill, and `trace` mounts lazily, records what the command read, stores it
+//! as prefetch traces and prints the name of the traced image.
 //!
 //! Imports take `--mkfs PATH` for a `mkfs.erofs` that is not on the path, and `--chunk BYTES` for
 //! the layer chunk size. They remember built layers in `--work DIR`, which is `STORE/import` by
@@ -22,6 +29,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
@@ -29,8 +37,8 @@ use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 
 const USAGE: &str = "usage: hive-nectar import-oci LAYOUT | import-tar TAR | show IMAGE | fetch IMAGE \
-                     | copy IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] \
-                     [--cache DIR] [--capacity BYTES] [--to-s3 URL]";
+                     | copy IMAGE | run IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] \
+                     [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -62,21 +70,21 @@ fn main() -> ExitCode {
 }
 
 async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(), String> {
-    let (store, store_dir): (Box<dyn BlobStore>, Option<PathBuf>) =
+    let (shared, store_dir): (Arc<dyn BlobStore>, Option<PathBuf>) =
         match (flags.get("store"), flags.get("s3")) {
             (Some(dir), None) => {
                 let dir = PathBuf::from(dir);
                 let store =
                     PosixStore::open(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-                (Box::new(store), Some(dir))
+                (Arc::new(store), Some(dir))
             }
             (None, Some(url)) => {
                 let cfg = S3Config::from_url_and_env(url).map_err(|e| e.to_string())?;
-                (Box::new(S3Store::new(cfg).map_err(|e| e.to_string())?), None)
+                (Arc::new(S3Store::new(cfg).map_err(|e| e.to_string())?), None)
             }
             _ => return Err("one of --store or --s3 is needed".into()),
         };
-    let store = store.as_ref();
+    let store = shared.as_ref();
     let number = |name: &str, default: u64| {
         flags
             .get(name)
@@ -158,7 +166,7 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
             let mut blobs: Vec<BlobId> = m
                 .layers
                 .iter()
-                .flat_map(|l| [Some(l.meta), Some(l.data), l.data_leaves])
+                .flat_map(|l| [Some(l.meta), Some(l.data), l.data_leaves, l.data_trace])
                 .flatten()
                 .collect();
             // The manifest goes last, so an image in the bucket always has all its layers.
@@ -178,7 +186,91 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
             );
             Ok(())
         }
+        #[cfg(target_os = "linux")]
+        "run" => {
+            let id: BlobId = what.parse().map_err(|e| format!("{what}: {e}"))?;
+            let cache_dir = PathBuf::from(flags.get("cache").ok_or("--cache is needed")?);
+            let work = PathBuf::from(flags.get("work").ok_or("--work is needed")?);
+            let cmd = flags.get("cmd").ok_or("--cmd is needed")?;
+            let mode = flags.get("mode").map_or("lazy", String::as_str);
+            if !matches!(mode, "whole" | "lazy" | "trace") {
+                return Err(format!("--mode {mode}: whole, lazy or trace"));
+            }
+            let cache = Cache::open(&cache_dir, number("capacity", 64 << 30)?)
+                .map_err(|e| format!("{}: {e}", cache_dir.display()))?;
+            let m = load_manifest(store, id).await.map_err(|e| format!("image {id}: {e}"))?;
+            let started = Instant::now();
+            let layers = hive_nectar::mount::Layers::new(work.join("layers"), cache, None)
+                .map_err(|e| e.to_string())?;
+            let layers = if mode == "whole" { layers } else { layers.lazily() };
+            let lowers = layers.mount(&shared, &m).await.map_err(|e| e.to_string())?;
+            let root = overlay(&work, &lowers).map_err(|e| format!("overlay: {e}"))?;
+            let mounted = started.elapsed();
+            let status = tokio::process::Command::new("chroot")
+                .arg(&root.merged)
+                .args(["/bin/sh", "-c", cmd])
+                .status()
+                .await
+                .map_err(|e| format!("chroot: {e}"))?;
+            let ran = started.elapsed() - mounted;
+            eprintln!(
+                "{mode}: mounted in {mounted:.2?}, ran in {ran:.2?}, {status}, {:.2?} in all",
+                started.elapsed()
+            );
+            drop(root);
+            if mode == "trace" {
+                let traces = layers.traces();
+                let chunks: usize = traces.values().map(Vec::len).sum();
+                let (traced, _) = hive_nectar::trace::put(store, &m, &traces, &work)
+                    .await
+                    .map_err(|e| format!("storing traces: {e}"))?;
+                eprintln!("{chunks} chunks traced across {} layers", traces.len());
+                println!("{traced}");
+            }
+            Ok(())
+        }
         _ => Err(USAGE.into()),
+    }
+}
+
+/// A cell's overlay on the layers, with its writes kept under `work`, until it drops.
+#[cfg(target_os = "linux")]
+struct Overlay {
+    work: PathBuf,
+    merged: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn overlay(work: &std::path::Path, lowers: &[PathBuf]) -> std::io::Result<Overlay> {
+    let root = Overlay { work: work.to_owned(), merged: work.join("root") };
+    let (upper, scratch) = (work.join("upper"), work.join("ovl"));
+    for d in [&upper, &scratch, &root.merged] {
+        std::fs::create_dir_all(d)?;
+    }
+    let lowerdir: Vec<String> = lowers.iter().map(|p| p.display().to_string()).collect();
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={},volatile",
+        lowerdir.join(":"),
+        upper.display(),
+        scratch.display()
+    );
+    rustix::mount::mount(
+        "overlay",
+        &root.merged,
+        "overlay",
+        rustix::mount::MountFlags::empty(),
+        std::ffi::CString::new(options).map_err(std::io::Error::other)?.as_c_str(),
+    )?;
+    Ok(root)
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        let _ = rustix::mount::unmount(&self.merged, rustix::mount::UnmountFlags::DETACH);
+        for d in ["root", "upper", "ovl"] {
+            let _ = std::fs::remove_dir_all(self.work.join(d));
+        }
     }
 }
 

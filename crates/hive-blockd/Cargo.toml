@@ -15,3 +15,8 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+futures.workspace = true
+libc.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }

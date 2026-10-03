@@ -20,7 +20,7 @@ use std::io;
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -38,6 +38,9 @@ const DEMAND: u64 = 4;
 
 /// Background fetches in flight for one blob. Reads never queue behind them.
 const BACKGROUND: usize = 4;
+
+/// Reads up to this long are done on the calling task rather than on a blocking thread.
+const INLINE_READ: usize = 256 << 10;
 
 /// The longest a chunk that came in waits before the map records it.
 pub const FLUSH_AFTER: Duration = Duration::from_millis(50);
@@ -67,8 +70,31 @@ pub(crate) struct Inner {
     finished: watch::Sender<Outcome>,
     requests: AtomicU64,
     bytes: AtomicU64,
+    trace: Mutex<Trace>,
     /// Keeps the blob pinned while anything still uses it.
     held: Held,
+}
+
+/// The chunks reads have asked for, in the order they first asked.
+#[derive(Default)]
+struct Trace {
+    seen: Vec<u64>,
+    order: Vec<u64>,
+}
+
+impl Trace {
+    fn touch(&mut self, first: u64, end: u64) {
+        for c in first..end {
+            let (word, bit) = ((c / 64) as usize, 1 << (c % 64));
+            if self.seen.len() <= word {
+                self.seen.resize(word + 1, 0);
+            }
+            if self.seen[word] & bit == 0 {
+                self.seen[word] |= bit;
+                self.order.push(c);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Inner {
@@ -211,6 +237,7 @@ impl Inner {
             finished,
             requests: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            trace: Mutex::default(),
             held,
         })
     }
@@ -265,6 +292,7 @@ impl Inner {
             finished: watch::channel(None).0,
             requests: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            trace: Mutex::default(),
             held,
         })
     }
@@ -438,7 +466,16 @@ impl Lazy {
         if len == 0 {
             return Ok(Vec::new());
         }
-        self.inner.ensure(offset / CHUNK, end.div_ceil(CHUNK)).await?;
+        let (first, last) = (offset / CHUNK, end.div_ceil(CHUNK));
+        self.inner.trace.lock().unwrap_or_else(PoisonError::into_inner).touch(first, last);
+        self.inner.ensure(first, last).await?;
+        // The chunks were just written or read, so a small read is almost always in the page
+        // cache and costs less than the hop to a blocking thread.
+        if len <= INLINE_READ {
+            let mut buf = vec![0; len];
+            self.inner.file.read_exact_at(&mut buf, offset)?;
+            return Ok(buf);
+        }
         let inner = self.inner.clone();
         blocking(move || {
             let mut buf = vec![0; len];
@@ -517,6 +554,14 @@ impl Lazy {
             bytes: self.inner.bytes.load(Ordering::Relaxed),
         }
     }
+
+    /// The chunks reads have asked for so far, in the order they first asked, as a prefetch
+    /// trace for [`Lazy::fill_rest`] the next time. Chunks only the background fill brought in
+    /// are not in it.
+    #[must_use]
+    pub fn trace(&self) -> Vec<u64> {
+        self.inner.trace.lock().unwrap_or_else(PoisonError::into_inner).order.clone()
+    }
 }
 
 async fn wait(mut rx: watch::Receiver<Outcome>) -> io::Result<()> {
@@ -525,6 +570,18 @@ async fn wait(mut rx: watch::Receiver<Outcome>) -> io::Result<()> {
     match got.as_ref().expect("waited for it") {
         Ok(()) => Ok(()),
         Err((kind, why)) => Err(io::Error::new(*kind, why.to_string())),
+    }
+}
+
+/// A lazy blob serves a block device, so EROFS can mount a layer before it is all in.
+#[cfg(target_os = "linux")]
+impl hive_blockd::Source for Lazy {
+    fn size(&self) -> u64 {
+        self.inner.size
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> futures::future::BoxFuture<'_, io::Result<Vec<u8>>> {
+        Box::pin(Self::read_at(self, offset, len))
     }
 }
 
@@ -637,8 +694,11 @@ mod tests {
         let e = lazy.read_at(len as u64 - 10, 11).await.unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
         assert!(!cache.has(blob));
+        // The trace has each chunk once, in the order reads first wanted it.
+        assert_eq!(lazy.trace(), [10, 13, 1, 2, 40]);
 
         lazy.fill_rest(&[30, 31]).await.unwrap();
+        assert_eq!(lazy.trace(), [10, 13, 1, 2, 40], "the background fill is not in it");
         assert!(lazy.is_complete() && cache.has(blob));
         let p = lazy.progress();
         assert_eq!((p.have, p.chunks, p.bytes), (41, 41, len as u64));

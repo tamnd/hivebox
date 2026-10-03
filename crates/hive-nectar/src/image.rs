@@ -24,6 +24,10 @@ pub struct LayerRef {
     /// Layers imported before there were leaves have none and are fetched whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_leaves: Option<BlobId>,
+    /// The chunks of the data blob a run of the image read, in the order it first read them, as
+    /// a blob of little endian `u32` chunk numbers. A lazy mount fills these first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_trace: Option<BlobId>,
     /// The OCI digest of the uncompressed tar it came from, when it came from one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_id: Option<String>,

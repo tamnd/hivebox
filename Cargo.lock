@@ -1180,6 +1180,11 @@ dependencies = [
 [[package]]
 name = "hive-blockd"
 version = "0.0.15"
+dependencies = [
+ "futures",
+ "libc",
+ "tokio",
+]
 
 [[package]]
 name = "hive-cell"
@@ -1358,6 +1363,7 @@ dependencies = [
  "bytes",
  "flate2",
  "futures",
+ "hive-blockd",
  "http-body-util",
  "hyper",
  "hyper-util",

@@ -120,7 +120,9 @@ impl Default for Network {
 /// one, and a file holds the id of an image in the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Images {
-    /// The blob store images are in. `None` leaves only unpacked images.
+    /// The blob store images are in: a directory, or a bucket as in
+    /// `http://10.0.0.5:9000/bucket/prefix` with keys from `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY`. `None` leaves only unpacked images.
     pub store: Option<PathBuf>,
     /// The node's cache of blobs from the store, `data_dir/cache` unless set.
     pub cache_dir: PathBuf,
@@ -128,6 +130,9 @@ pub struct Images {
     pub cache_bytes: u64,
     /// Where layers are mounted, once each for every cell that uses them.
     pub layers_dir: PathBuf,
+    /// Whether layers are mounted before their data is in, filled as they are read. It needs the
+    /// `nbd` module.
+    pub lazy: bool,
 }
 
 impl Default for Images {
@@ -137,6 +142,7 @@ impl Default for Images {
             cache_dir: PathBuf::from("/var/lib/hivebox/cache"),
             cache_bytes: 64 << 30,
             layers_dir: PathBuf::from("/run/hivebox/layers"),
+            lazy: false,
         }
     }
 }
@@ -246,6 +252,7 @@ impl Config {
     /// store = "/srv/hivebox/store"
     /// cache_dir = "/var/lib/hivebox/cache"
     /// cache_bytes = 68719476736
+    /// lazy = false
     ///
     /// [scout]
     /// endpoint = "http://10.0.0.5:7410"
@@ -334,6 +341,7 @@ impl Config {
         c.images.cache_dir = i.cache_dir.unwrap_or_else(|| c.data_dir.join("cache"));
         set(&mut c.images.cache_bytes, i.cache_bytes);
         set(&mut c.images.layers_dir, i.layers_dir);
+        set(&mut c.images.lazy, i.lazy);
         let w = file.network;
         set(&mut c.network.guard, w.guard);
         set(&mut c.network.pin_dir, w.pin_dir);
@@ -480,6 +488,7 @@ struct ImagesFile {
     cache_dir: Option<PathBuf>,
     cache_bytes: Option<u64>,
     layers_dir: Option<PathBuf>,
+    lazy: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]

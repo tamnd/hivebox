@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::OnceCell;
 
 use crate::store::blocking;
-use crate::{BlobId, BlobStore, Cache, Held, LayerRef, Manifest};
+use crate::lazy::Progress;
+use crate::{BlobId, BlobStore, Cache, Held, LayerRef, Lazy, Manifest};
 
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags, fsconfig_create,
@@ -183,14 +184,29 @@ pub fn mount_layer(
     target: &Path,
     idmap: Option<&IdMap>,
 ) -> io::Result<Mounted> {
-    // Both devices stay open until the mount has them, since autoclear frees a device on the last
-    // close.
-    let meta_dev = attach(meta)?;
+    // The data device stays open until the mount has it, since autoclear frees a device on the
+    // last close.
     let data_dev = data.map(attach).transpose()?;
+    mount_layer_on(meta, data_dev.as_ref().map(|d| d.path.as_path()), target, idmap)
+}
+
+/// Mounts a layer as [`mount_layer`] does, with its data already on the block device
+/// `data_device`, as a lazily filled layer has it.
+///
+/// # Errors
+///
+/// The metadata blob cannot be put on a loop device, the layer is not EROFS, or the mount fails.
+pub fn mount_layer_on(
+    meta: &Path,
+    data_device: Option<&Path>,
+    target: &Path,
+    idmap: Option<&IdMap>,
+) -> io::Result<Mounted> {
+    let meta_dev = attach(meta)?;
     let fs = fsopen("erofs", FsOpenFlags::FSOPEN_CLOEXEC)?;
     fsconfig_set_string(&fs, "source", &meta_dev.path)?;
-    if let Some(d) = &data_dev {
-        fsconfig_set_string(&fs, "device", &d.path)?;
+    if let Some(d) = data_device {
+        fsconfig_set_string(&fs, "device", d)?;
     }
     fsconfig_set_flag(&fs, "ro")?;
     fsconfig_create(&fs)
@@ -293,14 +309,34 @@ pub struct Layers {
     dir: PathBuf,
     cache: Arc<Cache>,
     idmap: Option<Arc<IdMap>>,
+    lazy: bool,
     mounted: Mutex<HashMap<BlobId, Arc<OnceCell<Arc<Layer>>>>>,
 }
 
+/// A mounted layer. The fields drop in order, so the mount goes before the device under it.
 #[derive(Debug)]
 struct Layer {
     mounted: Mounted,
     _meta: Held,
-    _data: Option<Held>,
+    _data: Data,
+}
+
+/// Where a layer's file contents are.
+#[derive(Debug)]
+enum Data {
+    None,
+    Whole(Held),
+    Lazy { _device: hive_blockd::Device, _fill: Filling, lazy: Lazy },
+}
+
+/// The background fill of a lazy layer, stopped when the layer goes.
+#[derive(Debug)]
+struct Filling(tokio::task::JoinHandle<()>);
+
+impl Drop for Filling {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Layers {
@@ -323,17 +359,59 @@ impl Layers {
             let _ = unmount(&path, UnmountFlags::DETACH);
             std::fs::remove_dir(&path)?;
         }
-        Ok(Self { dir, cache, idmap: idmap.map(Arc::new), mounted: Mutex::default() })
+        Ok(Self { dir, cache, idmap: idmap.map(Arc::new), lazy: false, mounted: Mutex::default() })
+    }
+
+    /// Mounts layers that have leaves before their data is in: the data blob is served on an NBD
+    /// device from a lazy fill, reads fetch only the chunks they touch, and the rest fills in the
+    /// background. It needs the `nbd` module. Layers without leaves are still fetched whole.
+    ///
+    /// A lazy layer's device goes when this does, and anything still reading the layer then gets
+    /// I/O errors, so cells must be gone first.
+    #[must_use]
+    pub const fn lazily(mut self) -> Self {
+        self.lazy = true;
+        self
+    }
+
+    /// How far each lazily mounted layer's data is in, by layer.
+    #[must_use]
+    pub fn progress(&self) -> Vec<(BlobId, Progress)> {
+        let m = self.mounted.lock().unwrap_or_else(PoisonError::into_inner);
+        m.iter()
+            .filter_map(|(d, c)| match &c.get()?._data {
+                Data::Lazy { lazy, .. } => Some((*d, lazy.progress())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The chunks each lazily mounted layer's data has had read so far, in the order they were
+    /// first read, by layer. Layers nothing has read yet are left out. [`crate::trace::put`]
+    /// stores them as prefetch traces.
+    #[must_use]
+    pub fn traces(&self) -> HashMap<BlobId, Vec<u64>> {
+        let m = self.mounted.lock().unwrap_or_else(PoisonError::into_inner);
+        m.iter()
+            .filter_map(|(d, c)| match &c.get()?._data {
+                Data::Lazy { lazy, .. } => Some((*d, lazy.trace())).filter(|(_, t)| !t.is_empty()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Fetches the image's blobs from `store` into the cache where they are not there yet, mounts
     /// the layers that are not mounted yet, and returns where they are, top first as overlayfs
-    /// wants them.
+    /// wants them. Lazily, the data blobs are not fetched first.
     ///
     /// # Errors
     ///
     /// A blob cannot be fetched or a layer cannot be mounted.
-    pub async fn mount(&self, store: &dyn BlobStore, image: &Manifest) -> io::Result<Vec<PathBuf>> {
+    pub async fn mount(
+        &self,
+        store: &Arc<dyn BlobStore>,
+        image: &Manifest,
+    ) -> io::Result<Vec<PathBuf>> {
         let each = image.layers.iter().rev().map(|l| self.one(store, l));
         let layers = futures::future::try_join_all(each).await?;
         Ok(layers.iter().map(|l| l.mounted.path().to_owned()).collect())
@@ -360,7 +438,7 @@ impl Layers {
         m.iter().filter(|(_, c)| c.initialized()).map(|(d, _)| *d).collect()
     }
 
-    async fn one(&self, store: &dyn BlobStore, layer: &LayerRef) -> io::Result<Arc<Layer>> {
+    async fn one(&self, store: &Arc<dyn BlobStore>, layer: &LayerRef) -> io::Result<Arc<Layer>> {
         let cell = self
             .mounted
             .lock()
@@ -370,24 +448,47 @@ impl Layers {
             .clone();
         let got = cell
             .get_or_try_init(|| async {
-                let meta = self.cache.get(store, layer.meta).await?;
-                let data = if layer.data_size == 0 {
-                    None
-                } else {
-                    Some(self.cache.get(store, layer.data).await?)
+                let meta = self.cache.get(&**store, layer.meta).await?;
+                let data = match layer.data_leaves {
+                    _ if layer.data_size == 0 => Data::None,
+                    Some(leaves) if self.lazy => {
+                        let lazy =
+                            self.cache.lazy(store.clone(), layer.data, layer.data_size, leaves).await?;
+                        let device = hive_blockd::Device::attach(Arc::new(lazy.clone())).await?;
+                        let (filler, from, trace) = (lazy.clone(), store.clone(), layer.data_trace);
+                        let fill = Filling(tokio::spawn(async move {
+                            // The trace leads the fill. Without one, or if it cannot be read, the
+                            // fill goes in order. A failed fill leaves the chunks it missed to be
+                            // fetched on demand.
+                            let first = match trace {
+                                Some(t) => crate::trace::load(&*from, t).await.unwrap_or_default(),
+                                None => Vec::new(),
+                            };
+                            let _ = filler.fill_rest(&first).await;
+                        }));
+                        Data::Lazy { _device: device, _fill: fill, lazy }
+                    }
+                    _ => Data::Whole(self.cache.get(&**store, layer.data).await?),
                 };
                 let target = self.dir.join(layer.digest.to_string());
-                let (paths, idmap) = (
-                    (meta.path().to_owned(), data.as_ref().map(|d| d.path().to_owned())),
-                    self.idmap.clone(),
-                );
+                let meta_path = meta.path().to_owned();
+                let (data_path, on_device) = match &data {
+                    Data::None => (None, false),
+                    Data::Whole(h) => (Some(h.path().to_owned()), false),
+                    Data::Lazy { _device: d, .. } => (Some(d.path().to_owned()), true),
+                };
+                let idmap = self.idmap.clone();
                 let t = target.clone();
                 let mounted = blocking(move || {
                     match std::fs::create_dir(&t) {
                         Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
                         _ => {}
                     }
-                    mount_layer(&paths.0, paths.1.as_deref(), &t, idmap.as_deref())
+                    if on_device {
+                        mount_layer_on(&meta_path, data_path.as_deref(), &t, idmap.as_deref())
+                    } else {
+                        mount_layer(&meta_path, data_path.as_deref(), &t, idmap.as_deref())
+                    }
                 })
                 .await?;
                 Ok::<_, io::Error>(Arc::new(Layer { mounted, _meta: meta, _data: data }))

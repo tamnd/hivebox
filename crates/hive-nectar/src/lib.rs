@@ -30,6 +30,7 @@ pub mod mount;
 pub mod oci;
 pub mod s3;
 pub mod store;
+pub mod trace;
 
 pub use blob::{BadBlobId, BlobId};
 pub use cache::{Cache, Held};
