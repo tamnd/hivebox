@@ -14,7 +14,7 @@ use hive_drone::Client;
 use hive_guard::Profile;
 use hive_nectar::mount::{IdMap, Layers};
 use hive_nectar::oci::load_manifest;
-use hive_nectar::{BlobId, Cache, PosixStore};
+use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 use hive_proto::convert;
 use hive_rt::{OsRng, Rng};
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Source, is_name};
@@ -92,16 +92,28 @@ fn at(what: &str, path: &std::path::Path) -> impl FnOnce(io::Error) -> io::Error
 }
 
 /// Images from a `hive-nectar` store, and the layers of them this node has mounted.
-#[derive(Debug)]
 struct Nectar {
-    store: PosixStore,
+    store: Arc<dyn BlobStore>,
     layers: Layers,
+}
+
+impl std::fmt::Debug for Nectar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Nectar").field("layers", &self.layers).finish_non_exhaustive()
+    }
 }
 
 impl Nectar {
     fn open(cfg: &Config) -> io::Result<Option<Self>> {
         let Some(dir) = &cfg.images.store else { return Ok(None) };
-        let store = PosixStore::open(dir).map_err(at("opening the image store", dir))?;
+        let store: Arc<dyn BlobStore> = match dir.to_str().filter(|d| d.starts_with("http://")) {
+            Some(url) => Arc::new(
+                S3Config::from_url_and_env(url)
+                    .and_then(S3Store::new)
+                    .map_err(at("opening the image bucket", dir))?,
+            ),
+            None => Arc::new(PosixStore::open(dir).map_err(at("opening the image store", dir))?),
+        };
         let i = &cfg.images;
         let cache = Cache::open(&i.cache_dir, i.cache_bytes)
             .map_err(at("opening the image cache", &i.cache_dir))?;
@@ -109,8 +121,11 @@ impl Nectar {
         let c = &cfg.container;
         let idmap = IdMap::new(c.uid_base, c.uid_count)
             .map_err(|e| io::Error::new(e.kind(), format!("making the id map for layers: {e}")))?;
-        let layers = Layers::new(&i.layers_dir, cache, Some(idmap))
+        let mut layers = Layers::new(&i.layers_dir, cache, Some(idmap))
             .map_err(at("clearing the layer mounts in", &i.layers_dir))?;
+        if i.lazy {
+            layers = layers.lazily();
+        }
         Ok(Some(Self { store, layers }))
     }
 }
@@ -626,7 +641,7 @@ impl Inner {
         let id: BlobId =
             text.trim().parse().map_err(|e: hive_nectar::BadBlobId| unavailable(e.to_string()))?;
         let manifest =
-            load_manifest(&nectar.store, id).await.map_err(|e| unavailable(e.to_string()))?;
+            load_manifest(&*nectar.store, id).await.map_err(|e| unavailable(e.to_string()))?;
         let lowers = nectar
             .layers
             .mount(&nectar.store, &manifest)

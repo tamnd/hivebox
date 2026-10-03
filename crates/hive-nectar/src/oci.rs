@@ -236,6 +236,7 @@ impl Importer {
                 data_size,
                 chunk_size: chunk,
                 data_leaves: Some(leaves),
+                data_trace: None,
                 diff_id: src.diff_id,
             };
             if let Some(memo) = &memo {
