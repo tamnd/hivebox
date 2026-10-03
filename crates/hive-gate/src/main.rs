@@ -120,6 +120,9 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         let api = hive_gate::tokens::Api::new(&cfg.keeper).map_err(std::io::Error::other)?;
         gate = gate.with_tokens(api);
     }
+    if let Some(e2b) = cfg.e2b {
+        gate = gate.with_e2b(e2b);
+    }
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     tokio::spawn({

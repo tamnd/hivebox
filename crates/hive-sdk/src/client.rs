@@ -623,7 +623,7 @@ impl Cell {
             path: path.into(),
             mode,
             make_parents: true,
-            append: false,
+            ..Default::default()
         };
         let head =
             stream::once(async move { v1::WriteFileChunk { part: Some(Part::Header(header)) } });

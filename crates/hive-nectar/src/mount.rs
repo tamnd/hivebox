@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::OnceCell;
 
-use crate::store::blocking;
 use crate::lazy::Progress;
+use crate::store::blocking;
 use crate::{BlobId, BlobStore, Cache, Held, LayerRef, Lazy, Manifest};
 
 use rustix::mount::{
@@ -452,8 +452,10 @@ impl Layers {
                 let data = match layer.data_leaves {
                     _ if layer.data_size == 0 => Data::None,
                     Some(leaves) if self.lazy => {
-                        let lazy =
-                            self.cache.lazy(store.clone(), layer.data, layer.data_size, leaves).await?;
+                        let lazy = self
+                            .cache
+                            .lazy(store.clone(), layer.data, layer.data_size, leaves)
+                            .await?;
                         let device = hive_blockd::Device::attach(Arc::new(lazy.clone())).await?;
                         let (filler, from, trace) = (lazy.clone(), store.clone(), layer.data_trace);
                         let fill = Filling(tokio::spawn(async move {

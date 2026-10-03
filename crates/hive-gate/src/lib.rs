@@ -6,12 +6,16 @@
 //! The gate keeps no state of its own. It follows scout for the nodes and their addresses, so
 //! any number of gates can run side by side, and one that restarts is serving again as soon as
 //! scout has sent it the cluster. The design is in `spec/04_control_plane.md`, section 3.
+//!
+//! With an `[e2b]` table in its config, the gate also speaks enough of the E2B API and of envd,
+//! the daemon in an E2B sandbox, for the E2B SDK to make cells and run commands in them.
 
 #![forbid(unsafe_code)]
 
 pub mod cells;
 pub mod config;
 mod connect;
+mod e2b;
 pub mod keys;
 pub mod nodes;
 pub mod proxy;
@@ -68,8 +72,10 @@ const MAX_REQUEST: usize = 64 << 20;
 pub struct Gate {
     keys: Keys,
     nodes: Nodes,
+    api: cells::Api,
     cells: CellsServer<cells::Api>,
     tokens: Option<TokensServer<tokens::Api>>,
+    e2b: Option<Arc<e2b::E2b>>,
     calls: CounterVec,
 }
 
@@ -87,8 +93,10 @@ impl Gate {
         Self {
             keys: keys.into(),
             nodes,
-            cells: CellsServer::new(api).max_decoding_message_size(MAX_REQUEST),
+            cells: CellsServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
+            api,
             tokens: None,
+            e2b: None,
             calls: registry.counter(
                 "hive_gate_calls_total",
                 "Calls the gate took, by method and whether the key was good.",
@@ -104,6 +112,13 @@ impl Gate {
         self
     }
 
+    /// The gate with the E2B API, making sandboxes into cells as `cfg` says.
+    #[must_use]
+    pub fn with_e2b(mut self, cfg: config::E2b) -> Self {
+        self.e2b = Some(Arc::new(e2b::E2b::new(cfg)));
+        self
+    }
+
     /// Who the `authorization: Bearer KEY` header says the caller is: the project, and the
     /// token or the hash of the key it was.
     fn caller(&self, req: &http::Request<Body>) -> Result<(Arc<str>, Credential), String> {
@@ -111,6 +126,11 @@ impl Gate {
         let value = req.headers().get(http::header::AUTHORIZATION).ok_or_else(missing)?;
         let bearer =
             value.to_str().ok().and_then(|v| v.strip_prefix("Bearer ")).ok_or_else(missing)?;
+        self.who(bearer)
+    }
+
+    /// Who a key or a token says the caller is.
+    fn who(&self, bearer: &str) -> Result<(Arc<str>, Credential), String> {
         if hive_auth::is_token(bearer) {
             let t = self.keys.token(bearer)?;
             return Ok((Arc::from(t.project.as_str()), Credential::Token(Grant(t))));
@@ -140,6 +160,12 @@ impl Service<http::Request<Body>> for Gate {
     }
 
     fn call(&mut self, mut req: http::Request<Body>) -> Self::Future {
+        // Before Connect, which would take the E2B calls for its own, being JSON too.
+        if let Some(e2b) = &self.e2b
+            && let Some(kind) = e2b::Kind::of(&req)
+        {
+            return Box::pin(e2b::call(self.clone(), e2b.clone(), kind, req).map(Ok));
+        }
         if let Some(codec) = connect::Codec::of(req.headers()) {
             return Box::pin(connect::call(self.clone(), codec, req).map(Ok));
         }

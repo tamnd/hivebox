@@ -5,8 +5,8 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::unix::fs::MetadataExt;
 use std::collections::BTreeMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -200,11 +200,17 @@ async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
     assert!(m.layers.iter().all(|l| l.data_size == 0 || l.data_leaves.is_some()));
     let in_use = nbd_in_use();
 
-    let whole = Layers::new(dir.join("whole"), Cache::open(dir.join("l1-whole"), 64 << 30).unwrap(), None)
-        .unwrap();
+    let whole =
+        Layers::new(dir.join("whole"), Cache::open(dir.join("l1-whole"), 64 << 30).unwrap(), None)
+            .unwrap();
     let t = Instant::now();
     let eager = whole.mount(&store, m).await.unwrap();
-    println!("{} layers, {} MiB of data, fetched whole and mounted in {:.2?}", m.layers.len(), data >> 20, t.elapsed());
+    println!(
+        "{} layers, {} MiB of data, fetched whole and mounted in {:.2?}",
+        m.layers.len(),
+        data >> 20,
+        t.elapsed()
+    );
 
     let cache = Cache::open(dir.join("l1-lazy"), 64 << 30).unwrap();
     let layers = Layers::new(dir.join("lazy"), cache.clone(), None).unwrap().lazily();
@@ -229,7 +235,10 @@ async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
                 while !p.progress().iter().all(|(_, g)| g.have == g.chunks) {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                (since.elapsed() + mounted, p.progress().iter().map(|(_, g)| g.requests).sum::<u64>())
+                (
+                    since.elapsed() + mounted,
+                    p.progress().iter().map(|(_, g)| g.requests).sum::<u64>(),
+                )
             }),
             progress,
         )
@@ -258,7 +267,9 @@ async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
     );
     let (filled, requests) =
         tokio::time::timeout(std::time::Duration::from_secs(300), filled).await.unwrap().unwrap();
-    println!("the background fill finished {filled:.2?} after the mount began, {requests} requests");
+    println!(
+        "the background fill finished {filled:.2?} after the mount began, {requests} requests"
+    );
     let layers = Arc::try_unwrap(layers).unwrap();
 
     drop(layers);

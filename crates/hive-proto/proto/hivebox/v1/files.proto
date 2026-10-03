@@ -53,6 +53,9 @@ message WriteFileHeader {
   bool make_parents = 4;
   // Add to the end instead of replacing.
   bool append = 5;
+  // Who owns the file, as a name from the cell's /etc/passwd, a uid, or uid:gid. The drone's
+  // user when empty.
+  string user = 6;
 }
 
 message WriteFileChunk {

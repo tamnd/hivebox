@@ -30,6 +30,7 @@ http-body-util.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
 prost.workspace = true
 prost-reflect = { workspace = true, features = ["serde"] }
+prost-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

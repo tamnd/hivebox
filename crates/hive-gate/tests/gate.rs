@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use hive_gate::{Gate, Nodes};
 use hive_proto::v1;
@@ -13,6 +14,7 @@ use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::exec_server::{Exec, ExecServer};
+use hive_proto::v1::files_server::{Files, FilesServer};
 use hive_scout::NodeReport;
 use hive_types::{Backend, CellId, Reason};
 use hive_waggle::{BackendSet, LayerBloom};
@@ -31,6 +33,10 @@ struct FakeComb {
     room: Arc<Mutex<u32>>,
     cells: Arc<Mutex<BTreeMap<CellId, v1::Cell>>>,
     seq: Arc<Mutex<u64>>,
+    /// Files by path, with the user that wrote each.
+    files: Arc<Mutex<BTreeMap<String, (bytes::Bytes, String)>>>,
+    /// The signals sent to processes, by pid.
+    signals: Arc<Mutex<Vec<(u32, i32)>>>,
 }
 
 fn project<T>(r: &Request<T>) -> String {
@@ -226,18 +232,48 @@ impl Exec for FakeComb {
         }))
     }
 
+    /// Says the command and who runs it, then echoes stdin until it closes, and exits with 3.
     async fn start(
         &self,
-        _req: Request<Streaming<v1::ProcessInput>>,
+        req: Request<Streaming<v1::ProcessInput>>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        Err(Status::unimplemented("start"))
+        use v1::process_input::Input;
+        use v1::process_output::Output;
+        let project = project(&req);
+        let mut inputs = req.into_inner();
+        let Some(Input::Start(start)) = inputs.message().await?.and_then(|m| m.input) else {
+            return Err(Status::invalid_argument("start first"));
+        };
+        self.find(&project, &start.cell_id)?;
+        let said = format!("{} as {:?} in {:?}", start.argv.join(" "), start.user, start.cwd);
+        let first = [Output::Pid(7), Output::Stdout(said.into())];
+        let echo = futures::stream::unfold(Some(inputs), |inputs| async move {
+            let mut inputs = inputs?;
+            loop {
+                match inputs.message().await {
+                    Ok(Some(v1::ProcessInput { input: Some(Input::Stdin(b)) })) => {
+                        return Some((Output::Stdout(b), Some(inputs)));
+                    }
+                    Ok(Some(v1::ProcessInput { input: Some(Input::Eof(_)) }) | None) | Err(_) => {
+                        let exit = v1::RunResult { exit_code: 3, ..Default::default() };
+                        return Some((Output::Exit(exit), None));
+                    }
+                    Ok(Some(_)) => {}
+                }
+            }
+        });
+        let out = futures::stream::iter(first)
+            .chain(echo)
+            .map(|o| Ok(v1::ProcessOutput { output: Some(o) }));
+        Ok(Response::new(Box::pin(out)))
     }
 
-    async fn signal(
-        &self,
-        _req: Request<v1::SignalRequest>,
-    ) -> Result<Response<v1::Empty>, Status> {
-        Err(Status::unimplemented("signal"))
+    async fn signal(&self, req: Request<v1::SignalRequest>) -> Result<Response<v1::Empty>, Status> {
+        let project = project(&req);
+        let req = req.into_inner();
+        self.find(&project, &req.cell_id)?;
+        self.signals.lock().unwrap().push((req.pid, req.signal));
+        Ok(Response::new(v1::Empty {}))
     }
 
     async fn session_create(
@@ -266,6 +302,100 @@ impl Exec for FakeComb {
         _req: Request<v1::SessionRef>,
     ) -> Result<Response<v1::Empty>, Status> {
         Err(Status::unimplemented("session"))
+    }
+}
+
+#[tonic::async_trait]
+impl Files for FakeComb {
+    type ReadStream = Out<v1::Chunk>;
+    type WatchStream = Out<v1::FsEvent>;
+
+    async fn read(
+        &self,
+        req: Request<v1::ReadFileRequest>,
+    ) -> Result<Response<Self::ReadStream>, Status> {
+        let project = project(&req);
+        let req = req.into_inner();
+        self.find(&project, &req.cell_id)?;
+        let files = self.files.lock().unwrap();
+        let (data, _) =
+            files.get(&req.path).cloned().ok_or_else(|| Status::not_found("no file"))?;
+        // Two chunks, to see they are put back together.
+        let half = data.len() / 2;
+        let chunks = [data.slice(..half), data.slice(half..)];
+        let out = chunks.into_iter().map(|data| Ok(v1::Chunk { data }));
+        Ok(Response::new(Box::pin(futures::stream::iter(out))))
+    }
+
+    async fn write(
+        &self,
+        req: Request<Streaming<v1::WriteFileChunk>>,
+    ) -> Result<Response<v1::FileInfo>, Status> {
+        use v1::write_file_chunk::Part;
+        let project = project(&req);
+        let mut chunks = req.into_inner();
+        let Some(Part::Header(h)) = chunks.message().await?.and_then(|c| c.part) else {
+            return Err(Status::invalid_argument("header first"));
+        };
+        self.find(&project, &h.cell_id)?;
+        let mut data = Vec::new();
+        while let Some(c) = chunks.message().await? {
+            if let Some(Part::Data(b)) = c.part {
+                data.extend_from_slice(&b);
+            }
+        }
+        let size = data.len() as u64;
+        self.files.lock().unwrap().insert(h.path.clone(), (data.into(), h.user));
+        Ok(Response::new(v1::FileInfo { path: h.path, size, ..Default::default() }))
+    }
+
+    async fn stat(&self, req: Request<v1::PathRequest>) -> Result<Response<v1::FileInfo>, Status> {
+        let project = project(&req);
+        let req = req.into_inner();
+        self.find(&project, &req.cell_id)?;
+        let files = self.files.lock().unwrap();
+        let (data, _) = files.get(&req.path).ok_or_else(|| Status::not_found("no file"))?;
+        let info = v1::FileInfo {
+            path: req.path,
+            r#type: v1::FileType::File.into(),
+            size: data.len() as u64,
+            mode: 0o644,
+            ..Default::default()
+        };
+        Ok(Response::new(info))
+    }
+
+    async fn list(
+        &self,
+        _req: Request<v1::ListDirRequest>,
+    ) -> Result<Response<v1::ListDirResponse>, Status> {
+        Err(Status::unimplemented("list"))
+    }
+
+    async fn remove(&self, req: Request<v1::PathRequest>) -> Result<Response<v1::Empty>, Status> {
+        let project = project(&req);
+        let req = req.into_inner();
+        self.find(&project, &req.cell_id)?;
+        self.files.lock().unwrap().remove(&req.path).ok_or_else(|| Status::not_found("no file"))?;
+        Ok(Response::new(v1::Empty {}))
+    }
+
+    async fn watch(
+        &self,
+        _req: Request<v1::WatchDirRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        Err(Status::unimplemented("watch"))
+    }
+
+    async fn diff(
+        &self,
+        _req: Request<v1::DiffRequest>,
+    ) -> Result<Response<v1::DiffResult>, Status> {
+        Err(Status::unimplemented("diff"))
+    }
+
+    async fn apply(&self, _req: Request<v1::ApplyRequest>) -> Result<Response<v1::Empty>, Status> {
+        Err(Status::unimplemented("apply"))
     }
 }
 
@@ -313,6 +443,11 @@ struct Cluster {
 impl Cluster {
     /// Two combs, nodes 1 and 2, with room for `room` cells each.
     async fn new(room: u32) -> Self {
+        Self::with(room, None).await
+    }
+
+    /// The same, with the gate serving E2B as `e2b` says.
+    async fn with(room: u32, e2b: Option<hive_gate::config::E2b>) -> Self {
         let stop = CancellationToken::new();
         let scout = hive_scout::Service::new();
         tokio::spawn(scout.clone().run(stop.clone()));
@@ -330,6 +465,7 @@ impl Cluster {
                 tonic::transport::Server::builder()
                     .add_service(CellsServer::new(comb.clone()))
                     .add_service(ExecServer::new(comb.clone()))
+                    .add_service(FilesServer::new(comb.clone()))
                     .serve_with_incoming_shutdown(incoming(l), stop.clone().cancelled_owned()),
             );
             // Reports keep coming, as from a real comb, so the node never goes stale.
@@ -355,7 +491,10 @@ impl Cluster {
         }
         assert_eq!(nodes.all(), vec![1, 2], "the gate sees both nodes");
         let keys = HashMap::from([(*blake3::hash(KEY.as_bytes()).as_bytes(), Arc::from("swe"))]);
-        let gate = Gate::new(keys, nodes, None, &hive_telemetry::Registry::new());
+        let mut gate = Gate::new(keys, nodes, None, &hive_telemetry::Registry::new());
+        if let Some(e2b) = e2b {
+            gate = gate.with_e2b(e2b);
+        }
         let (gl, gaddr) = listen().await;
         tokio::spawn(hive_gate::serve(gate, gl, stop.clone()));
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{gaddr}"))
@@ -652,4 +791,270 @@ async fn connect_callers_get_the_same_api_over_http_1() {
         connect(&c, "/hivebox.v1.Cells/Create", "application/json", Some(KEY), b"{}".to_vec())
             .await;
     assert_eq!(status, 400, "a unary content type on a streaming method");
+}
+
+/// One HTTP/1.1 call: the status, the headers and the body that came back.
+async fn http(
+    c: &Cluster,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: impl Into<bytes::Bytes>,
+) -> (u16, tonic::codegen::http::HeaderMap, bytes::Bytes) {
+    use http_body_util::BodyExt;
+    let stream = tokio::net::TcpStream::connect(c.addr).await.unwrap();
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(conn);
+    let mut req =
+        tonic::codegen::http::Request::builder().method(method).uri(path).header("host", "gate");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let req = req.body(http_body_util::Full::new(body.into())).unwrap();
+    let resp = send.send_request(req).await.unwrap();
+    let (parts, body) = resp.into_parts();
+    (parts.status.as_u16(), parts.headers, body.collect().await.unwrap().to_bytes())
+}
+
+/// The messages of a Connect stream, and whether each one ends it.
+fn envelopes(mut rest: &[u8]) -> Vec<(bool, serde_json::Value)> {
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let len = u32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+        out.push((rest[0] & 2 != 0, json(&rest[5..5 + len])));
+        rest = &rest[5 + len..];
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_e2b_sdk_makes_sandboxes_moves_files_and_runs_commands() {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let e2b = hive_gate::config::E2b {
+        image_key: Some("swe/image".into()),
+        templates: [("base".to_string(), "python:3.12".to_string())].into(),
+        ..Default::default()
+    };
+    let c = Cluster::with(100, Some(e2b)).await;
+    let key = [("x-api-key", KEY), ("content-type", "application/json")];
+
+    let (status, _, body) = http(&c, "POST", "/v2/sandboxes", &[], "{}").await;
+    assert_eq!(status, 401, "{body:?}");
+    let (status, _, body) =
+        http(&c, "POST", "/v2/sandboxes", &key, r#"{"templateID":"other"}"#).await;
+    assert_eq!(status, 400);
+    assert!(json(&body)["message"].as_str().unwrap().contains("no image"), "{body:?}");
+
+    let new =
+        r#"{"templateID":"base","timeout":300,"metadata":{"swe/image":"swe:42","task":"t1"}}"#;
+    let (status, _, body) = http(&c, "POST", "/v2/sandboxes", &key, new).await;
+    assert_eq!(status, 201, "{body:?}");
+    let made = json(&body);
+    let id = made["sandboxID"].as_str().unwrap().to_string();
+    assert_eq!(made["envdAccessToken"], KEY);
+    assert_eq!(made["envdVersion"], "0.5.7");
+    let cell = c.combs.iter().find_map(|comb| comb.find("swe", &id).ok()).unwrap();
+    let spec = cell.spec.unwrap();
+    assert!(
+        matches!(spec.source, Some(v1::cell_spec::Source::Image(ref i)) if i.r#ref == "swe:42")
+    );
+    assert_eq!(spec.labels["task"], "t1");
+
+    let (status, _, body) = http(&c, "GET", &format!("/sandboxes/{id}"), &key, "").await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["metadata"], serde_json::json!({ "swe/image": "swe:42", "task": "t1" }));
+    let (status, headers, body) =
+        http(&c, "GET", "/v2/sandboxes?metadata=task%3Dt1", &key, "").await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body).as_array().unwrap().len(), 1, "{headers:?}");
+
+    // envd: the sandbox in a header, the token create gave back, and the user in Basic auth.
+    let agent = format!("Basic {}", b64.encode("agent:"));
+    let envd = |extra: &'static str| {
+        let mut h = vec![("e2b-sandbox-id", id.clone()), ("x-access-token", KEY.to_string())];
+        h.push(("authorization", agent.clone()));
+        if !extra.is_empty() {
+            h.push(("content-type", extra.to_string()));
+        }
+        h
+    };
+    let refs =
+        |h: &[(&'static str, String)]| h.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>();
+    let call =
+        |h: Vec<(&'static str, String)>, method: &'static str, path: String, body: bytes::Bytes| {
+            let c = &c;
+            async move {
+                let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                http(c, method, &path, &h, body).await
+            }
+        };
+    let (status, _, _) = call(envd(""), "GET", "/health".into(), bytes::Bytes::new()).await;
+    assert_eq!(status, 204);
+
+    let form = "--xx\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes/a.txt\"\r\n\r\n\
+                hello sandbox\r\n--xx--\r\n";
+    let (status, _, body) = call(
+        envd("multipart/form-data; boundary=xx"),
+        "POST",
+        "/files?path=notes%2Fa.txt&username=agent".into(),
+        form.into(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(json(&body)[0]["path"], "/home/agent/notes/a.txt");
+    let raw = bytes::Bytes::from(vec![7u8; 100_000]);
+    let (status, _, _) = call(
+        envd("application/octet-stream"),
+        "POST",
+        "/files?path=/tmp/b.bin&username=root".into(),
+        raw.clone(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    {
+        let files = c
+            .combs
+            .iter()
+            .flat_map(|comb| comb.files.lock().unwrap().clone())
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            files["/home/agent/notes/a.txt"],
+            (bytes::Bytes::from("hello sandbox"), "agent".to_string())
+        );
+        assert_eq!(files["/tmp/b.bin"].0.len(), 100_000);
+        assert_eq!(files["/tmp/b.bin"].1, "root");
+    }
+    let (status, _, body) = call(
+        envd(""),
+        "GET",
+        "/files?path=%2Ftmp%2Fb.bin&username=root".into(),
+        bytes::Bytes::new(),
+    )
+    .await;
+    assert_eq!((status, body), (200, raw));
+    let (status, _, body) =
+        call(envd(""), "GET", "/files?path=/nope&username=root".into(), bytes::Bytes::new()).await;
+    assert_eq!(status, 404, "{body:?}");
+
+    let stat = br#"{"path":"notes/a.txt"}"#.as_slice();
+    let (status, _, body) =
+        call(envd("application/json"), "POST", "/filesystem.Filesystem/Stat".into(), stat.into())
+            .await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(json(&body)["entry"]["size"], 13);
+    assert_eq!(json(&body)["entry"]["permissions"], "-rw-r--r--");
+
+    // A command with its input closed: the pid, what it said, and how it ended.
+    let start = serde_json::json!({
+        "process": { "cmd": "/bin/bash", "args": ["-l", "-c", "echo hi"], "cwd": "work" },
+    });
+    let mut h = envd("application/connect+json");
+    h.push(("connect-timeout-ms", "60000".into()));
+    let (status, headers, body) = call(
+        h,
+        "POST",
+        "/process.Process/Start".into(),
+        envelope(0, start.to_string().as_bytes()).into(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-type"], "application/connect+json");
+    let events = envelopes(&body);
+    assert_eq!(events[0], (false, serde_json::json!({ "event": { "start": { "pid": 7 } } })));
+    let said = b64.decode(events[1].1["event"]["data"]["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8(said).unwrap(),
+        r#"/bin/bash -l -c echo hi as "agent" in "/home/agent/work""#
+    );
+    assert_eq!(
+        events[2].1["event"]["end"],
+        serde_json::json!({ "exitCode": 3, "exited": true, "status": "exit status 3" })
+    );
+    assert_eq!(events.last().unwrap(), &(true, serde_json::json!({})));
+
+    // With its input open, the stream stays up until input sent through other calls closes it.
+    let start = serde_json::json!({ "process": { "cmd": "cat" }, "stdin": true });
+    let h = refs(&envd("application/connect+json"));
+    let running = tokio::spawn({
+        let addr = c.addr;
+        let body = envelope(0, start.to_string().as_bytes());
+        async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let (mut send, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+            tokio::spawn(conn);
+            let mut req = tonic::codegen::http::Request::post("/process.Process/Start")
+                .header("host", "gate");
+            for (k, v) in &h {
+                req = req.header(*k, v.as_str());
+            }
+            let resp = send
+                .send_request(
+                    req.body(http_body_util::Full::new(bytes::Bytes::from(body))).unwrap(),
+                )
+                .await
+                .unwrap();
+            http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes()
+        }
+    });
+    let unary = |method: &'static str, msg: serde_json::Value| {
+        call(
+            envd("application/json"),
+            "POST",
+            format!("/process.Process/{method}"),
+            msg.to_string().into(),
+        )
+    };
+    let input =
+        serde_json::json!({ "process": { "pid": 7 }, "input": { "stdin": b64.encode("typed") } });
+    let mut sent = 0;
+    for _ in 0..100 {
+        let (status, _, _) = unary("SendInput", input.clone()).await;
+        if status == 200 {
+            sent += 1;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(sent, 1, "the process took input once it had started");
+    let (status, _, _) = unary(
+        "SendSignal",
+        serde_json::json!({ "process": { "pid": 7 }, "signal": "SIGNAL_SIGKILL" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _, _) = unary("CloseStdin", serde_json::json!({ "process": { "pid": 7 } })).await;
+    assert_eq!(status, 200);
+    let events = envelopes(&running.await.unwrap());
+    let typed = events
+        .iter()
+        .find_map(|(_, e)| e["event"]["data"]["stdout"].as_str().map(|s| b64.decode(s).unwrap()));
+    assert_eq!(typed.as_deref(), Some(b"cat as \"agent\" in \"\"".as_slice()));
+    assert!(
+        events.iter().any(|(_, e)| e["event"]["data"]["stdout"] == b64.encode("typed")),
+        "{events:?}"
+    );
+    assert_eq!(events[events.len() - 2].1["event"]["end"]["exitCode"], 3);
+    let signals: Vec<_> =
+        c.combs.iter().flat_map(|comb| comb.signals.lock().unwrap().clone()).collect();
+    assert_eq!(signals, vec![(7, 9)]);
+    let (status, _, body) =
+        unary("CloseStdin", serde_json::json!({ "process": { "pid": 7 } })).await;
+    assert_eq!((status, json(&body)["code"].as_str()), (404, Some("not_found")));
+
+    let (status, _, _) = http(&c, "POST", &format!("/sandboxes/{id}/pause"), &key, "").await;
+    assert_eq!(status, 204);
+    let (status, _, _) = http(&c, "POST", &format!("/sandboxes/{id}/pause"), &key, "").await;
+    assert_eq!(status, 409);
+    let (status, _, body) =
+        http(&c, "POST", &format!("/sandboxes/{id}/connect"), &key, r#"{"timeout":60}"#).await;
+    assert_eq!(status, 201, "{body:?}");
+    let (status, _, _) = http(&c, "DELETE", &format!("/sandboxes/{id}"), &key, "").await;
+    assert_eq!(status, 204);
+    let (status, _, _) = http(&c, "GET", &format!("/sandboxes/{id}"), &key, "").await;
+    assert_eq!(status, 404);
+    let (status, _, _) = http(&c, "DELETE", "/sandboxes/not-a-cell", &key, "").await;
+    assert_eq!(status, 404);
 }

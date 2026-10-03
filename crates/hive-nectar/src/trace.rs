@@ -75,11 +75,8 @@ pub async fn put(
 async fn put_bytes(store: &dyn BlobStore, bytes: &[u8], work: &Path) -> io::Result<BlobId> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let id = BlobId::of(bytes);
-    let path = work.join(format!(
-        "{id}.{}.{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path =
+        work.join(format!("{id}.{}.{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
     tokio::fs::write(&path, bytes).await?;
     let r = store.put(id, &path).await;
     let _ = tokio::fs::remove_file(&path).await;
