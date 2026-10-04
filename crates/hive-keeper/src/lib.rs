@@ -47,7 +47,7 @@ pub async fn run(
     std::fs::create_dir_all(&cfg.data)
         .map_err(|e| format!("making {}: {e}", cfg.data.display()))?;
     let path = cfg.data.join(DB_FILE);
-    let store = Store::open(&path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+    let store = Store::open(&path).await.map_err(|e| format!("opening {}: {e}", path.display()))?;
     let raft_cfg = openraft::Config {
         cluster_name: "hive-keeper".into(),
         // A busy machine can hold up a heartbeat for a few hundred milliseconds, and an election

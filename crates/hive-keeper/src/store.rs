@@ -105,15 +105,17 @@ impl Store {
     /// # Errors
     ///
     /// The file cannot be opened, or what is in it does not decode.
-    pub fn open(path: &Path) -> StoreResult<Self> {
+    pub async fn open(path: &Path) -> StoreResult<Self> {
         // redb takes the file for one handle. A member that just stopped in the same process can
-        // still hold it for a moment while openraft's tasks wind down, so wait that out.
+        // still hold it while openraft's tasks and the connections it served wind down, which
+        // takes seconds on a loaded machine, so wait that out without holding up the runtime
+        // those tasks run on.
         let mut tries = 0;
         let db = loop {
             match Database::create(path) {
-                Err(redb::DatabaseError::DatabaseAlreadyOpen) if tries < 50 => {
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if tries < 300 => {
                     tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 r => break r.map_err(write)?,
             }
@@ -508,7 +510,7 @@ mod tests {
     impl StoreBuilder<TypeConfig, Half, Half, Scratch> for Builder {
         async fn build(&self) -> StoreResult<(Scratch, Half, Half)> {
             let dir = Scratch::new();
-            let store = Store::open(&dir.0.join("keeper.redb"))?;
+            let store = Store::open(&dir.0.join("keeper.redb")).await?;
             let (log, sm) = Adaptor::new(store);
             Ok((dir, log, sm))
         }
@@ -544,7 +546,7 @@ mod tests {
     async fn the_state_comes_back_after_a_reopen() {
         let dir = Scratch::new();
         let path = dir.0.join("keeper.redb");
-        let mut store = Store::open(&path).unwrap();
+        let mut store = Store::open(&path).await.unwrap();
         let cmds = [
             Command::CreateProject { name: "swe".into(), quota: Default::default(), now_ms: 1 },
             Command::AddKey {
@@ -559,6 +561,7 @@ mod tests {
                 epoch: 0,
                 now_ms: 3,
                 ttl_ms: 30_000,
+                wait: true,
             },
         ];
         let entries: Vec<Entry<TypeConfig>> = cmds
@@ -574,7 +577,7 @@ mod tests {
         let before = store.read(Clone::clone);
         drop(store);
 
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path).await.unwrap();
         assert_eq!(store.read(Clone::clone), before);
         assert_eq!(store.applied(), 3);
         assert_eq!(store.read(|s| s.project_of(&[7; 32]).map(str::to_owned)), Some("swe".into()));

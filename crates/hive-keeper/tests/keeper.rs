@@ -94,7 +94,7 @@ impl Group {
     }
 
     /// The leader, once the members still running agree on one.
-    async fn leader(&self) -> u64 {
+    async fn leader(&mut self) -> u64 {
         for _ in 0..200 {
             let mut seen = Vec::new();
             for id in self.members.keys() {
@@ -112,10 +112,15 @@ impl Group {
         let mut last = Vec::new();
         for id in self.members.keys() {
             let s = self.client(*id).await.status(pb::StatusRequest {}).await;
-            let m = &self.members[id];
-            last.push((*id, m.task.is_finished(), s.map(|s| s.into_inner().leader)));
+            last.push((*id, s.map(|s| s.into_inner().leader)));
         }
-        panic!("no leader the members agree on, (id, exited, leader): {last:?}");
+        let mut exited = Vec::new();
+        for (id, m) in &mut self.members {
+            if m.task.is_finished() {
+                exited.push((*id, (&mut m.task).await));
+            }
+        }
+        panic!("no leader the members agree on, (id, leader): {last:?}, exited: {exited:?}");
     }
 
     /// Waits until every running member has applied at least `index`.

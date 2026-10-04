@@ -45,6 +45,9 @@ struct Cell {
 #[derive(Debug, Default)]
 struct Disk {
     lease: Option<(u16, u16)>,
+    /// When the last lease runs out on the machine's clock, as the lease file has it, until the
+    /// comb stops the cells from it.
+    until: Option<u64>,
     /// The cell sequence reserved so far.
     seq: u64,
 }
@@ -54,6 +57,8 @@ enum Phase {
     Registering {
         call: u64,
         backoff: u64,
+        /// When the call went out, on the machine's clock.
+        sent: u64,
     },
     Serving {
         node: u16,
@@ -160,17 +165,28 @@ impl World {
                 let life = mach.life;
                 mach.comb = Some(Comb {
                     life,
-                    phase: Phase::Registering { call: 0, backoff: RETRY },
+                    phase: Phase::Registering { call: 0, backoff: RETRY, sent: 0 },
                     idem: BTreeMap::new(),
                     next: 0,
                     block: 0,
                     waiting: BTreeMap::new(),
                     turned: BTreeMap::new(),
                 });
+                // Past the last lease the keeper may give the node to another comb, so the
+                // cells from it stop then unless the keeper gives the node back first.
+                if let Some(until) = mach.disk.until {
+                    let left = until.saturating_sub(self.local(m));
+                    self.local_tick(m, left, Tick::Lapse(life));
+                }
                 self.log(|| format!("comb {m} starts, life {life}"));
                 self.register(m);
             }
             Tick::Register(l) if life == Some(l) => self.register(m),
+            Tick::Lapse(l) if life == Some(l) => {
+                if self.machines[m].serving().is_none() {
+                    self.comb_lose(m, "could not register before the last lease ran out");
+                }
+            }
             Tick::Renew(l) if life == Some(l) => self.renew(m),
             Tick::Report(l) if life == Some(l) => self.node_report(m),
             Tick::Timeout(call) => self.comb_timeout(m, call),
@@ -198,11 +214,14 @@ impl World {
 
     fn register(&mut self, m: usize) {
         let call = self.call_id();
+        let now = self.local(m);
         let mach = &mut self.machines[m];
-        let Some(Comb { phase: Phase::Registering { call: c, .. }, .. }) = &mut mach.comb else {
+        let Some(Comb { phase: Phase::Registering { call: c, sent, .. }, .. }) = &mut mach.comb
+        else {
             return;
         };
         *c = call;
+        *sent = now;
         let name = mach.name.clone();
         let epoch = mach.disk.lease.map_or(0, |(_, e)| e);
         self.send(Addr::Comb(m), Addr::Keeper, Body::Register { call, name, epoch });
@@ -211,17 +230,22 @@ impl World {
 
     fn comb_timeout(&mut self, m: usize, call: u64) {
         let Some(c) = &mut self.machines[m].comb else { return };
-        let life = c.life;
         match &mut c.phase {
-            Phase::Registering { call: c, backoff } if *c == call => {
-                let wait = *backoff;
-                *backoff = (*backoff * 2).min(MAX_BACKOFF);
-                *c = 0;
-                self.local_tick(m, wait, Tick::Register(life));
-            }
+            Phase::Registering { call: c, .. } if *c == call => self.register_later(m),
             Phase::Serving { renew: Some((c, _)), .. } if *c == call => self.renew_failed(m),
             _ => {}
         }
+    }
+
+    /// Tries to register again after the backoff, which doubles each time.
+    fn register_later(&mut self, m: usize) {
+        let Some(c) = &mut self.machines[m].comb else { return };
+        let life = c.life;
+        let Phase::Registering { call, backoff, .. } = &mut c.phase else { return };
+        let wait = *backoff;
+        *backoff = (*backoff * 2).min(MAX_BACKOFF);
+        *call = 0;
+        self.local_tick(m, wait, Tick::Register(life));
     }
 
     fn renew(&mut self, m: usize) {
@@ -261,7 +285,7 @@ impl World {
     pub(crate) fn comb_got(&mut self, m: usize, from: Addr, body: Body) {
         match body {
             Body::Registered { call, got } => {
-                let Some(Comb { phase: Phase::Registering { call: c, .. }, .. }) =
+                let Some(Comb { phase: Phase::Registering { call: c, sent, .. }, .. }) =
                     &self.machines[m].comb
                 else {
                     return;
@@ -269,8 +293,12 @@ impl World {
                 if *c != call {
                     return;
                 }
+                let sent = *sent;
                 match got {
-                    Ok(n) => self.open(m, n.node, n.epoch),
+                    Ok(n) => self.open(m, n.node, n.epoch, sent),
+                    // Another comb holds the node until its lease runs out, so this one waits
+                    // the way it does when the keeper is out of reach.
+                    Err(Refusal::Held(_)) => self.register_later(m),
                     // The keeper refused the node outright, so the comb stops, and its
                     // supervisor starts it again later.
                     Err(e) => self.comb_exit(m, &format!("the keeper refused it: {e:?}"), 5000),
@@ -293,6 +321,7 @@ impl World {
                         *ends = sent + LEASE_MS;
                         *renew = None;
                         let _ = now;
+                        self.machines[m].disk.until = Some(sent + LEASE_MS);
                         self.local_tick(m, LEASE_MS / 3, Tick::Renew(life));
                     }
                     Err(Refusal::LeaseLost(_) | Refusal::NotFound(_)) => {
@@ -311,10 +340,11 @@ impl World {
 
     /// The comb has its lease: it takes in the cells it finds, fences off the ones from older
     /// epochs, and starts serving.
-    fn open(&mut self, m: usize, node: u16, epoch: u16) {
+    fn open(&mut self, m: usize, node: u16, epoch: u16, sent: u64) {
         let now = self.local(m);
         let mach = &mut self.machines[m];
         mach.disk.lease = Some((node, epoch));
+        mach.disk.until = Some(sent + LEASE_MS);
         let stale: Vec<CellId> =
             mach.cells.keys().copied().filter(|id| id.epoch() < epoch).collect();
         for id in &stale {
@@ -337,7 +367,7 @@ impl World {
         c.idem = idem;
         c.next = seq;
         c.block = seq;
-        c.phase = Phase::Serving { node, epoch, ends: now + LEASE_MS, renew: None };
+        c.phase = Phase::Serving { node, epoch, ends: sent + LEASE_MS, renew: None };
         let life = c.life;
         self.log(|| format!("comb {m} serves node {node} epoch {epoch}"));
         let at = self.now;
@@ -364,6 +394,7 @@ impl World {
     /// As `Comb::lose`: the comb lost its lease, so it stops every cell it has on its way out.
     fn comb_lose(&mut self, m: usize, why: &str) {
         self.comb_down(m, why);
+        self.machines[m].disk.until = None;
         let ids: Vec<CellId> = self.machines[m].cells.keys().copied().collect();
         for id in ids {
             self.end_cell(m, id);

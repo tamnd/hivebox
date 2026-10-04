@@ -102,22 +102,32 @@ async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
         Some(link) => {
             std::fs::create_dir_all(&cfg.data_dir)?;
             let mut k = lease::Keeper::new(&link.members).map_err(std::io::Error::other)?;
-            let l = lease::register(&mut k, &link, &cfg.data_dir)
+            let start = lease::register(&mut k, &link, &cfg.data_dir)
                 .await
                 .map_err(std::io::Error::other)?;
+            let (l, sent) = match start {
+                lease::Start::Leased(l, sent) => (l, sent),
+                lease::Start::Lapsed(node, epoch) => {
+                    (cfg.node, cfg.epoch) = (node, epoch);
+                    return lapse(cfg).await;
+                }
+            };
             eprintln!(
                 "hive-comb: registered as {} with the keeper: node {}, epoch {}, lease {:?}",
                 link.name, l.node, l.epoch, l.ttl
             );
             (cfg.node, cfg.epoch) = (l.node, l.epoch);
-            Some((k, l))
+            Some((k, l, sent))
         }
         None => None,
     };
     // Renewing starts now, since opening the comb over many cells can take longer than a lease.
     let stop = CancellationToken::new();
     let mut held = match keeper {
-        Some((k, l)) => tokio::spawn(lease::keep(k, l, stop.clone())),
+        Some((k, l, sent)) => {
+            let file = cfg.data_dir.join(lease::FILE);
+            tokio::spawn(lease::keep(k, l, sent, file, stop.clone()))
+        }
         None => tokio::spawn(std::future::pending()),
     };
     let (socket, listen, metrics, scout) =
@@ -189,6 +199,24 @@ async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
         Some(e) => Err(std::io::Error::other(e)),
         None => result,
     }
+}
+
+/// The comb could not get its node back from the keeper before its last lease ran out, so the
+/// keeper may have given the node to another comb, which can make the same keyed cells again. It
+/// stops every cell it has from that lease, notes that in the lease file, and goes, and the next
+/// start waits on the keeper for as long as it takes.
+#[cfg(target_os = "linux")]
+async fn lapse(cfg: hive_comb::Config) -> std::io::Result<()> {
+    let file = cfg.data_dir.join(hive_comb::lease::FILE);
+    let (node, epoch) = (cfg.node, cfg.epoch);
+    let drivers = drivers(&cfg).await;
+    let comb = hive_comb::Comb::open(cfg, drivers).await?;
+    comb.lose().await;
+    comb.shutdown().await;
+    hive_comb::lease::lapsed(&file)?;
+    Err(std::io::Error::other(format!(
+        "could not reach the keeper before the lease of node {node} in epoch {epoch} ran out"
+    )))
 }
 
 /// Every backend this node can run. One that cannot is left out, and the log says why.

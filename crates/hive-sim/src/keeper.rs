@@ -80,7 +80,8 @@ impl World {
         let reply = match body {
             Body::Register { call, name, epoch } => {
                 let addr = format!("{from:?}");
-                let cmd = Command::Register { name, addr, epoch, now_ms, ttl_ms: LEASE_MS };
+                let cmd =
+                    Command::Register { name, addr, epoch, now_ms, ttl_ms: LEASE_MS, wait: true };
                 let got = match self.keeper.state.apply(cmd).0 {
                     Reply::Node(n) => {
                         self.keeper.first.entry(n.node).or_insert(n.epoch);

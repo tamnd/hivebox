@@ -7,7 +7,10 @@
 //! and fails the cells it still has from the old epoch.
 //!
 //! The last node index and epoch are kept in the `lease` file in the data directory, so the comb
-//! can ask for the same epoch back after a restart.
+//! can ask for the same epoch back after a restart, along with when the lease runs out by this
+//! machine's clock. The cells keep running while the comb is down, and nothing else stops them
+//! once the lease is gone and the keeper gives the node to another comb, so a comb that cannot
+//! register again before then stops them itself.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -111,9 +114,21 @@ impl Keeper {
     }
 }
 
+/// How registering ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// The keeper gave the comb its node. The lease counts from the instant, when the call that
+    /// got it went out.
+    Leased(Lease, Instant),
+    /// The last lease ran out before the keeper gave the node back, so the cells the comb has
+    /// from it have to stop. These are its node index and epoch.
+    Lapsed(u16, u16),
+}
+
 /// Registers `link` and returns the lease, trying until the keeper answers. The epoch asked for
 /// is the one in the data directory's `lease` file, and the lease is written there before this
-/// returns.
+/// returns. If the file says when that lease runs out and the keeper has not answered by then,
+/// this gives up and says so.
 ///
 /// # Errors
 ///
@@ -123,9 +138,13 @@ pub async fn register(
     keeper: &mut Keeper,
     link: &KeeperLink,
     data_dir: &Path,
-) -> Result<Lease, String> {
+) -> Result<Start, String> {
     let path = data_dir.join(FILE);
-    let last = read(&path);
+    let last = last(&path);
+    let lapse = last
+        .and_then(|(.., until)| until)
+        .map(|until| Instant::now() + Duration::from_millis(until.saturating_sub(now_ms())));
+    let last = last.map(|(node, epoch, _)| (node, epoch));
     let req = pb::RegisterRequest {
         name: link.name.clone(),
         addr: link.advertise.clone(),
@@ -133,13 +152,19 @@ pub async fn register(
     };
     let mut backoff = RETRY;
     let mut said = false;
-    let l = loop {
+    let (l, sent, wall) = loop {
+        let (sent, wall) = (Instant::now(), now_ms());
         match keeper.register(req.clone()).await {
-            Ok(l) => break l,
+            Ok(l) => break (l, sent, wall),
             Err(s) if !retry(&s) => {
                 return Err(format!("the keeper refused node {}: {}", link.name, s.message()));
             }
             Err(s) => {
+                if let (Some((node, epoch)), Some(at)) = (last, lapse)
+                    && Instant::now() >= at
+                {
+                    return Ok(Start::Lapsed(node, epoch));
+                }
                 if !said {
                     eprintln!(
                         "hive-comb: registering with the keeper at {}: {}",
@@ -148,7 +173,8 @@ pub async fn register(
                     );
                     said = true;
                 }
-                tokio::time::sleep(backoff).await;
+                let left = lapse.map_or(backoff, |at| at.saturating_duration_since(Instant::now()));
+                tokio::time::sleep(backoff.min(left)).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
@@ -158,28 +184,37 @@ pub async fn register(
     {
         eprintln!("hive-comb: the keeper moved this node from index {node} to {}", l.node);
     }
-    write(&path, l).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    Ok(l)
+    write(&path, l, Some(until(wall, l)))
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(Start::Leased(l, sent))
 }
 
 /// Renews `lease` a third of the way through each lease until `stop`. The lease is counted from
-/// when the comb sent the call that got it, which is no later than the keeper counts it from.
+/// when the comb sent the call that got it, `since` for the first, which is no later than the
+/// keeper counts it from. Each renewal writes when the lease now runs out to `file`.
 ///
 /// # Errors
 ///
 /// The keeper says the lease is gone: it ran out, or the node registered again in a newer
 /// epoch. Or the keeper could not be reached until the lease ran out. Either way the comb has
 /// lost its node and has to stop.
-pub async fn keep(mut keeper: Keeper, mut l: Lease, stop: CancellationToken) -> Result<(), String> {
+pub async fn keep(
+    mut keeper: Keeper,
+    mut l: Lease,
+    since: Instant,
+    file: PathBuf,
+    stop: CancellationToken,
+) -> Result<(), String> {
     let mut wait = l.ttl / 3;
-    let mut ends = Instant::now() + l.ttl;
+    let mut ends = since + l.ttl;
     let mut said = false;
+    let mut unwritten = false;
     loop {
         tokio::select! {
             () = stop.cancelled() => return Ok(()),
             () = tokio::time::sleep(wait) => {}
         }
-        let sent = Instant::now();
+        let (sent, wall) = (Instant::now(), now_ms());
         if sent >= ends {
             return Err(format!(
                 "could not renew the lease of node {} in epoch {} before it ran out",
@@ -189,6 +224,14 @@ pub async fn keep(mut keeper: Keeper, mut l: Lease, stop: CancellationToken) -> 
         match keeper.renew(l).await {
             Ok(renewed) => {
                 ends = sent + renewed.ttl;
+                match write(&file, renewed, Some(until(wall, renewed))) {
+                    Ok(()) => unwritten = false,
+                    Err(e) if !unwritten => {
+                        eprintln!("hive-comb: writing {}: {e}", file.display());
+                        unwritten = true;
+                    }
+                    Err(_) => {}
+                }
                 if said {
                     eprintln!("hive-comb: renewed the lease through {}", keeper.member());
                     said = false;
@@ -238,16 +281,51 @@ fn lease(l: &pb::Lease) -> Lease {
 
 /// The node index and epoch in the `lease` file, if there is one that reads.
 pub fn read(path: &Path) -> Option<(u16, u16)> {
+    last(path).map(|(node, epoch, _)| (node, epoch))
+}
+
+/// Notes in the `lease` file at `path` that the cells from its lease were stopped, so the next
+/// start waits on the keeper for as long as it takes.
+///
+/// # Errors
+///
+/// The file could not be written.
+pub fn lapsed(path: &Path) -> std::io::Result<()> {
+    match last(path) {
+        Some((node, epoch, _)) => write(path, Lease { node, epoch, ttl: Duration::ZERO }, None),
+        None => Ok(()),
+    }
+}
+
+/// The node index, the epoch and, from a comb that wrote it, the Unix time in milliseconds the
+/// lease runs out at.
+fn last(path: &Path) -> Option<(u16, u16, Option<u64>)> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (node, epoch) = text.trim().split_once(' ')?;
-    Some((node.parse().ok()?, epoch.parse().ok()?))
+    let mut words = text.split_whitespace();
+    let node = words.next()?.parse().ok()?;
+    let epoch = words.next()?.parse().ok()?;
+    Some((node, epoch, words.next().and_then(|w| w.parse().ok())))
 }
 
 /// Writes the lease to `path`, through a file next to it so a crash leaves the old one or the
 /// new one.
-fn write(path: &Path, l: Lease) -> std::io::Result<()> {
+fn write(path: &Path, l: Lease, until: Option<u64>) -> std::io::Result<()> {
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    std::fs::write(&tmp, format!("{} {}\n", l.node, l.epoch))?;
+    let text = match until {
+        Some(u) => format!("{} {} {u}\n", l.node, l.epoch),
+        None => format!("{} {}\n", l.node, l.epoch),
+    };
+    std::fs::write(&tmp, text)?;
     std::fs::File::open(&tmp)?.sync_all()?;
     std::fs::rename(&tmp, path)
+}
+
+/// When a lease got by a call sent at Unix time `wall` runs out.
+fn until(wall: u64, l: Lease) -> u64 {
+    wall.saturating_add(u64::try_from(l.ttl.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn now_ms() -> u64 {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
