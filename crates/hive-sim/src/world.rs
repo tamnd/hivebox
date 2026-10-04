@@ -291,6 +291,8 @@ pub(crate) enum Tick {
     Renew(u64),
     /// A comb tries to register again.
     Register(u64),
+    /// The last lease of a comb that has not registered since it started runs out.
+    Lapse(u64),
     /// A comb reports to scout.
     Report(u64),
     /// A cell's hard TTL runs out.

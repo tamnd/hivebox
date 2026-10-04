@@ -54,7 +54,7 @@ Pools are sized from the per-template demand forecast that scout publishes. Comb
 - Record: `{id, spec_hash, state, driver_handle{pid, api_sock, vsock_cid, cgroup, netns, rootfs devs}, ttl, labels, idem_key, created_at, last_activity}`.
 - Restart: comb loads the table, then verifies liveness for each non-terminal cell (pidfd open, cgroup populated, VMM API ping). It then re-opens drone channels (the drone accepts a reconnect with the same session secret), rebuilds eBPF maps from pinned bpffs, and resumes timers. Unknown processes in `hive.slice` without a record are orphans and get killed.
 - Cells are not children of comb. VMMs and containers are spawned via `systemd-run --scope`, or by double-fork with `PR_SET_CHILD_SUBREAPER` handled by a tiny `hive-shim` per cell. A comb restart therefore does not SIGKILL cells.
-- Epoch fencing: if the lease is lost for longer than the TTL, comb stops accepting ops, re-registers and gets a new epoch. If keeper declared the old epoch dead, comb kills the old cells.
+- Epoch fencing: if the lease is lost for longer than the TTL, comb stops accepting ops, re-registers and gets a new epoch. If keeper declared the old epoch dead, comb kills the old cells. A comb that restarts and cannot reach the keeper before its last lease runs out, which it reads from its `lease` file, stops the cells it has from that lease, since the keeper may have given the node to another comb by then.
 
 ## 5. Memory density controller
 

@@ -120,6 +120,11 @@ pub enum Command {
         now_ms: u64,
         /// How long the lease lasts.
         ttl_ms: u64,
+        /// A comb asking with an older epoch than the node's waits while the node's lease is
+        /// live. Commands logged before this was added read as false, and take a new epoch at
+        /// once as they did then.
+        #[serde(default)]
+        wait: bool,
     },
     /// A comb renewing its lease.
     Renew {
@@ -195,6 +200,9 @@ pub enum Refusal {
     LeaseLost(String),
     /// Every node index is taken, or a node used up its epochs.
     Exhausted(String),
+    /// The node's lease is live in a newer epoch than the comb asked with, so the comb waits for
+    /// it to run out.
+    Held(String),
 }
 
 /// Everything the keeper agrees on.
@@ -288,14 +296,27 @@ impl State {
                 self.root = Some(private);
                 (Reply::Root(private), Some(Changed::Root))
             }
-            Command::Register { name, addr, epoch, now_ms, ttl_ms } => {
+            Command::Register { name, addr, epoch, now_ms, ttl_ms, wait } => {
                 if !hive_types::is_name(&name) {
                     return refused(Refusal::Invalid(format!("{name:?} is not a node name")));
                 }
                 let expires_ms = now_ms.saturating_add(ttl_ms);
                 if let Some(n) = self.nodes.values_mut().find(|n| n.name == name) {
+                    let live = n.expires_ms > now_ms;
                     // A comb back within its lease keeps its epoch, and with it its cells.
-                    if !(epoch == n.epoch && n.expires_ms > now_ms) {
+                    if !(epoch == n.epoch && live) {
+                        // One with an older epoch is another machine under the node's name, or
+                        // this one after it lost its data, and whichever comb holds the lease
+                        // may still run cells. Once the lease runs out that comb has stopped
+                        // them, so only then does the node start again in a new epoch.
+                        if wait && live && epoch < n.epoch {
+                            return refused(Refusal::Held(format!(
+                                "node {} is held in epoch {} for {} ms more",
+                                n.node,
+                                n.epoch,
+                                n.expires_ms - now_ms
+                            )));
+                        }
                         let Some(next) = n.epoch.max(epoch).checked_add(1) else {
                             return refused(Refusal::Exhausted(format!(
                                 "node {} used up its epochs",
@@ -432,7 +453,15 @@ mod tests {
 
     fn register(s: &mut State, name: &str, epoch: u16, now_ms: u64) -> Reply {
         let addr = format!("http://{name}:7420");
-        s.apply(Command::Register { name: name.into(), addr, epoch, now_ms, ttl_ms: 30_000 }).0
+        let cmd = Command::Register {
+            name: name.into(),
+            addr,
+            epoch,
+            now_ms,
+            ttl_ms: 30_000,
+            wait: true,
+        };
+        s.apply(cmd).0
     }
 
     fn node(r: Reply) -> Node {
@@ -499,9 +528,21 @@ mod tests {
         assert!(matches!(renew(&mut s, 1, 1, 70_000), Reply::Refused(Refusal::LeaseLost(_))));
         let a = node(register(&mut s, "a", 1, 70_001));
         assert_eq!((a.node, a.epoch), (1, 2));
-        // A comb that forgot its epoch gets a new one too, even within the lease.
-        let a = node(register(&mut s, "a", 0, 70_002));
+        // A comb that forgot its epoch waits for the lease to run out, and gets a new one then.
+        assert!(matches!(register(&mut s, "a", 0, 70_002), Reply::Refused(Refusal::Held(_))));
+        assert!(matches!(register(&mut s, "a", 1, 100_000), Reply::Refused(Refusal::Held(_))));
+        let a = node(register(&mut s, "a", 0, 100_001));
         assert_eq!((a.node, a.epoch), (1, 3));
+        // As one logged before combs waited did, it takes a new epoch at once.
+        let old = Command::Register {
+            name: "a".into(),
+            addr: "http://a:7420".into(),
+            epoch: 0,
+            now_ms: 100_002,
+            ttl_ms: 30_000,
+            wait: false,
+        };
+        assert_eq!(node(s.apply(old).0).epoch, 4);
     }
 
     #[test]
@@ -514,7 +555,7 @@ mod tests {
         assert_eq!(node(register(&mut s, "d", 0, 0)).node, 2);
         assert_eq!(node(register(&mut s, "e", 0, 0)).node, 4);
         s.nodes.get_mut(&1).unwrap().epoch = u16::MAX;
-        assert!(matches!(register(&mut s, "a", 0, 0), Reply::Refused(Refusal::Exhausted(_))));
+        assert!(matches!(register(&mut s, "a", 0, 30_000), Reply::Refused(Refusal::Exhausted(_))));
     }
 
     #[test]

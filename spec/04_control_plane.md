@@ -130,5 +130,5 @@ Partial admits are allowed and return k. A reject includes fresh headroom, so wa
 ## 8. Failure semantics
 
 - Total control-plane outage: running cells are unaffected. Data-plane requests fail while the gate is down, which multiple gates mitigate. Comb TTL enforcement continues locally.
-- Comb lease expiry (node partition > 30 s): the keeper bumps the node epoch and cells on that node are reported to clients as `LOST`. If the node comes back with the old epoch, the comb must kill those cells (fencing) unless the lease was renewed.
+- Comb lease expiry (node partition > 30 s): the keeper bumps the node epoch and cells on that node are reported to clients as `LOST`. If the node comes back with the old epoch, the comb must kill those cells (fencing) unless the lease was renewed. A comb asking for the node with an older epoch than the keeper's, such as a replacement machine under the same name or one that lost its disk, waits until the live lease runs out, so the comb holding it has stopped its cells before the node starts again in a new epoch. A comb keeps in its `lease` file when its lease runs out by its own clock, and if it restarts and cannot register again before then, it stops the cells it has and starts over.
 - Split brain on quota is bounded by slice sizes.

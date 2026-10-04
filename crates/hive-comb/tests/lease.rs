@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hive_comb::KeeperLink;
-use hive_comb::lease::{self, Keeper, Lease};
+use hive_comb::lease::{self, Keeper, Lease, Start};
 use tokio_util::sync::CancellationToken;
 
 struct Dir(PathBuf);
@@ -42,6 +42,13 @@ async fn keeper(dir: &Dir, lease_ms: u64, stop: &CancellationToken) -> String {
     addr.to_string()
 }
 
+fn leased(s: Start) -> (Lease, tokio::time::Instant) {
+    match s {
+        Start::Leased(l, sent) => (l, sent),
+        Start::Lapsed(..) => panic!("{s:?}"),
+    }
+}
+
 fn link(addr: &str, name: &str) -> KeeperLink {
     KeeperLink {
         members: vec![addr.to_owned()],
@@ -60,28 +67,57 @@ async fn a_comb_keeps_its_epoch_until_it_registers_afresh() {
     std::fs::create_dir_all(&data).unwrap();
 
     let mut k = Keeper::new(&link.members).unwrap();
-    let first = lease::register(&mut k, &link, &data).await.unwrap();
+    let (first, _) = leased(lease::register(&mut k, &link, &data).await.unwrap());
     assert_eq!((first.node, first.epoch), (1, 1));
     assert_eq!(first.ttl, Duration::from_secs(3));
     assert_eq!(lease::read(&data.join(lease::FILE)), Some((1, 1)));
 
     // Back within its lease, with the epoch in its file: the same epoch, so the cells stay.
-    let again = lease::register(&mut k, &link, &data).await.unwrap();
+    let (again, sent) = leased(lease::register(&mut k, &link, &data).await.unwrap());
     assert_eq!(again, first);
-    let held = tokio::spawn(lease::keep(k, again, stop.clone()));
+    let renewing = CancellationToken::new();
+    let file = data.join(lease::FILE);
+    let held = tokio::spawn(lease::keep(k, again, sent, file, renewing.clone()));
 
-    // The same name with no file, like a machine that lost its disk, gets a new epoch, and the
-    // comb still holding the old one finds out at its next renewal.
+    // The same name with no file, like a machine that lost its disk, waits while the comb that
+    // holds the node renews its lease, and gets a new epoch once that comb stops and its lease
+    // runs out.
     let fresh = dir.0.join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     let mut k = Keeper::new(&link.members).unwrap();
-    let second = lease::register(&mut k, &link, &fresh).await.unwrap();
+    let second = tokio::spawn(async move { lease::register(&mut k, &link, &fresh).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!second.is_finished());
+    renewing.cancel();
+    held.await.unwrap().unwrap();
+    let stopped = Instant::now();
+    let (second, _) = leased(second.await.unwrap().unwrap());
     assert_eq!((second.node, second.epoch), (1, 2));
-    let started = Instant::now();
-    let e = tokio::time::timeout(Duration::from_secs(5), held).await.unwrap().unwrap().unwrap_err();
-    assert!(e.contains("lost the lease of node 1 in epoch 1"), "{e}");
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    let took = stopped.elapsed();
+    assert!(took >= Duration::from_secs(1) && took < Duration::from_secs(10), "{took:?}");
     stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comb_that_cannot_register_before_its_last_lease_runs_out_says_so() {
+    let dir = Dir::new("lapse");
+    let file = dir.0.join(lease::FILE);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let until = u64::try_from(now.as_millis()).unwrap() + 1200;
+    std::fs::write(&file, format!("4 2 {until}\n")).unwrap();
+    // Nothing listens on port 1.
+    let link = link("127.0.0.1:1", "node-a");
+    let mut k = Keeper::new(&link.members).unwrap();
+    let started = Instant::now();
+    assert_eq!(lease::register(&mut k, &link, &dir.0).await.unwrap(), Start::Lapsed(4, 2));
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(1200) && took < Duration::from_secs(4), "{took:?}");
+
+    // Once the comb has stopped those cells, the next start waits for as long as it takes.
+    lease::lapsed(&file).unwrap();
+    assert_eq!(lease::read(&file), Some((4, 2)));
+    let wait = lease::register(&mut k, &link, &dir.0);
+    assert!(tokio::time::timeout(Duration::from_secs(2), wait).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -90,7 +126,10 @@ async fn a_comb_that_cannot_reach_the_keeper_stops_when_its_lease_runs_out() {
     let k = Keeper::new(&["127.0.0.1:1".to_owned()]).unwrap();
     let l = Lease { node: 4, epoch: 2, ttl: Duration::from_millis(1200) };
     let started = Instant::now();
-    let e = lease::keep(k, l, CancellationToken::new()).await.unwrap_err();
+    let dir = Dir::new("renew");
+    let file = dir.0.join(lease::FILE);
+    let since = tokio::time::Instant::now();
+    let e = lease::keep(k, l, since, file, CancellationToken::new()).await.unwrap_err();
     assert!(e.contains("before it ran out"), "{e}");
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(1200) && took < Duration::from_secs(3), "{took:?}");

@@ -249,6 +249,7 @@ impl keeper_server::Keeper for Keeper {
             epoch,
             now_ms: now_ms(),
             ttl_ms: self.lease_ms,
+            wait: true,
         };
         match self.write(cmd).await? {
             Reply::Node(n) => Ok(Response::new(self.lease(&n))),
@@ -409,6 +410,8 @@ fn refusal(r: Reply) -> Result<Reply, Status> {
         Reply::Refused(Refusal::Exists(m)) => Err(Status::already_exists(m)),
         Reply::Refused(Refusal::LeaseLost(m)) => Err(Status::failed_precondition(m)),
         Reply::Refused(Refusal::Exhausted(m)) => Err(Status::resource_exhausted(m)),
+        // The comb tries again, as it does when the keeper is out of reach.
+        Reply::Refused(Refusal::Held(m)) => Err(Status::unavailable(m)),
         r => Ok(r),
     }
 }
