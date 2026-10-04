@@ -6,6 +6,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 - `hive-sim` runs a whole cluster in one thread from a seed: a keeper, scout, three gates and five combs with a spare, clients that make and end keyed and unkeyed cells for three projects, and faults on a schedule (crashes, power loss, cuts, lost and repeated messages, clock drift, a keeper that goes down, a machine replaced by the spare). The same seed gives the same run, digest and all. It checks that no cell id is used twice, every cell ends exactly once, no comb serves a node another comb serves, no comb keeps cells from an older epoch, a key runs at most one cell unless the gates saw the key's nodes differently, and a project's live cells stay within its quota plus the bound the shares allow. `hive-sim --seeds N` sweeps seeds, and `--trace` prints the messages of one.
 - A keyed create no longer makes a second cell when its home is full. A comb that turned a key away for room now turns it away again for five to ten minutes, so a create sent again walks past it to the node that made the cell, and only when every node turns it away does the gate walk once more with `x-hive-anyway`, which the first node with room takes. The simulation is what found the second cells.
+- The gate now answers `CELL_LOST` for a cell on a node whose lease ran out, or on a node that came back in a newer epoch, as the spec says. It reads the keeper's node list once a second for this. Before, a cell on a killed node came back as not found once scout forgot the node.
 
 ## 0.0.16
 

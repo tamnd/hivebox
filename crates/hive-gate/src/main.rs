@@ -107,6 +107,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     if !cfg.keeper.is_empty() {
         hive_gate::keys::follow(keys.clone(), &cfg.keeper, stop.clone())
             .map_err(std::io::Error::other)?;
+        hive_gate::nodes::follow(nodes.clone(), &cfg.keeper, stop.clone())
+            .map_err(std::io::Error::other)?;
     }
     let quotas = if cfg.keeper.is_empty() {
         None
