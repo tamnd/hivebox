@@ -24,7 +24,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,10 @@ const SHARDS: usize = 64;
 /// Sequence numbers are reserved in the WAL this many at a time, so most creates don't write
 /// the counter.
 const SEQ_BLOCK: u64 = 4096;
+/// A key turned away for room is turned away again for between half this and this.
+const TURNED_FOR: Duration = Duration::from_secs(600);
+/// The most keys `Turned` holds in one generation.
+const TURNED_MAX: usize = 65_536;
 
 /// A request for a new cell.
 #[derive(Clone, Debug)]
@@ -42,6 +46,9 @@ pub struct CreateRequest {
     pub project: String,
     /// A retry with the same key in the same project gets the same cell back instead of a new one.
     pub idem_key: Option<String>,
+    /// Make the cell if there is room even when this node turned the key away lately. A gate
+    /// sets it when every node in the key's order turned the cell away.
+    pub anyway: bool,
 }
 
 /// What the WAL has done since the comb opened. Writes over syncs is how many transitions each disk flush carried.
@@ -82,6 +89,7 @@ pub(crate) struct Inner {
     pub(crate) metrics: Metrics,
     pub(crate) shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
+    turned: Mutex<Turned>,
     seq: tokio::sync::Mutex<SeqBlock>,
     events: broadcast::Sender<CellEvent>,
 }
@@ -197,6 +205,7 @@ impl Comb {
             metrics: Metrics::default(),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
+            turned: Mutex::default(),
             // Whatever was reserved before the restart may have been handed out, so the new block
             // starts past all of it.
             seq: tokio::sync::Mutex::new(SeqBlock { next, reserved: next }),
@@ -313,21 +322,34 @@ impl Comb {
     /// so callers were told those cells are lost, and they must not go on running.
     async fn fence(&self) {
         let epoch = self.inner.cfg.epoch;
-        let old: Vec<Arc<Cell>> = self
+        let n = self.end(|c| c.id.epoch() < epoch).await;
+        if n > 0 {
+            eprintln!("hive-comb: stopped {n} cells from before epoch {epoch}");
+        }
+    }
+
+    /// Stops every cell on the node because it lost its lease. Keeper may already have told
+    /// callers the node is gone, and a gate may be making their keyed cells again elsewhere, so
+    /// none of these may go on running until the next start fences them.
+    pub async fn lose(&self) {
+        let n = self.end(|_| true).await;
+        eprintln!("hive-comb: lost the lease, stopped {n} cells");
+    }
+
+    /// Stops the cells that `pick` picks and have not ended, as lost with the node, and returns
+    /// how many. Gives up waiting on them after 30 seconds.
+    async fn end(&self, pick: impl Fn(&Cell) -> bool) -> usize {
+        let cells: Vec<Arc<Cell>> = self
             .inner
             .shards
             .iter()
             .flat_map(|s| {
                 let s = s.read().unwrap_or_else(PoisonError::into_inner);
-                s.values().filter(|c| c.id.epoch() < epoch).cloned().collect::<Vec<_>>()
+                s.values().filter(|c| pick(c)).cloned().collect::<Vec<_>>()
             })
             .filter(|c| !c.state().is_terminal())
             .collect();
-        if old.is_empty() {
-            return;
-        }
-        eprintln!("hive-comb: stopping {} cells from before epoch {epoch}", old.len());
-        let stops = old.iter().map(|cell| async move {
+        let stops = cells.iter().map(|cell| async move {
             let (done, wait) = oneshot::channel();
             let cmd = Cmd::Stop { cause: Cause::NodeLost, grace: Duration::ZERO, done };
             if cell.send(cmd).await {
@@ -336,6 +358,7 @@ impl Comb {
         });
         let _ =
             tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(stops)).await;
+        cells.len()
     }
 
     /// Makes a cell and returns once it is running, or once it has failed.
@@ -364,8 +387,24 @@ impl Comb {
             {
                 return wait_started(&cell).await;
             }
+            if !req.anyway && inner.lock_turned().has(&req.project, key, Instant::now()) {
+                return Err(Error::new(
+                    Reason::CapacityUnavailable,
+                    "this node turned the key away for room lately, so it goes where it went then",
+                ));
+            }
         }
-        let reservation = inner.admission.reserve(&req.spec)?;
+        let reservation = match inner.admission.reserve(&req.spec) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(key) = &idem
+                    && e.reason == Reason::CapacityUnavailable
+                {
+                    inner.lock_turned().add(&req.project, key, Instant::now());
+                }
+                return Err(e);
+            }
+        };
         let id = inner.next_id().await?;
         let secret = random();
         let now = SystemTime::now();
@@ -388,6 +427,7 @@ impl Comb {
                 let other =
                     map.get(&(req.project.clone(), key.clone())).and_then(|&o| inner.cell(o));
                 if other.is_none() {
+                    inner.lock_turned().remove(&req.project, &key);
                     map.insert((req.project, key), id);
                 }
                 other
@@ -628,6 +668,10 @@ impl Inner {
         self.idem.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn lock_turned(&self) -> std::sync::MutexGuard<'_, Turned> {
+        self.turned.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn changed(&self, cell: &Cell) {
         let status = cell.status.borrow().clone();
         let _ = self.events.send(CellEvent { id: cell.id, status });
@@ -729,4 +773,49 @@ fn not_found(id: CellId) -> Error {
 
 pub(crate) fn random() -> [u8; 32] {
     OsRng.secret()
+}
+
+/// The keys this node turned away for room lately. A gate sends a keyed cell to the nodes in
+/// its key's order, top first, so when a retry comes back here after the cell was made further
+/// down, turning it away again takes it to that cell rather than making a second one. Two
+/// generations of half of `TURNED_FOR` each keep it small without a timer.
+#[derive(Default)]
+struct Turned {
+    new: HashSet<(String, String)>,
+    old: HashSet<(String, String)>,
+    since: Option<Instant>,
+}
+
+impl Turned {
+    fn roll(&mut self, now: Instant) {
+        let age = self.since.map(|s| now.saturating_duration_since(s));
+        match age {
+            Some(a) if a < TURNED_FOR / 2 => return,
+            Some(a) if a < TURNED_FOR => self.old = std::mem::take(&mut self.new),
+            _ => {
+                self.old.clear();
+                self.new.clear();
+            }
+        }
+        self.since = Some(now);
+    }
+
+    fn add(&mut self, project: &str, key: &str, now: Instant) {
+        self.roll(now);
+        if self.new.len() < TURNED_MAX {
+            self.new.insert((project.to_owned(), key.to_owned()));
+        }
+    }
+
+    fn has(&mut self, project: &str, key: &str, now: Instant) -> bool {
+        self.roll(now);
+        let k = (project.to_owned(), key.to_owned());
+        self.new.contains(&k) || self.old.contains(&k)
+    }
+
+    fn remove(&mut self, project: &str, key: &str) {
+        let k = (project.to_owned(), key.to_owned());
+        self.new.remove(&k);
+        self.old.remove(&k);
+    }
 }

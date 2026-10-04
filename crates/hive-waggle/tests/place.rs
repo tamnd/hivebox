@@ -221,3 +221,44 @@ fn the_same_seed_and_view_give_the_same_placement() {
     assert_eq!(a, b);
     assert_ne!(a, c, "another seed samples other nodes");
 }
+
+#[test]
+fn a_key_goes_to_the_same_node_from_any_placer_and_moves_only_with_its_node() {
+    let mut view = cluster(6);
+    view.nodes[1].backends = BackendSet::of(&[Backend::Microvm]);
+    let (mut a, mut b) = (Placer::new(1), Placer::new(2));
+    let r = req(1, res(100, 64));
+    let mut homes = HashMap::new();
+    for k in 0..600u32 {
+        let key = format!("swe\0k{k}");
+        let here = a.home(&view, &r, key.as_bytes(), T0).unwrap();
+        assert_eq!(b.home(&view, &r, key.as_bytes(), T0), Some(here), "{key}");
+        let order = Placer::key_order(&view, Backend::Container, key.as_bytes());
+        assert_eq!((order.len(), order[0]), (5, here), "{key}");
+        let without = PlaceReq { exclude: &order[..1], ..r };
+        assert_eq!(a.home(&view, &without, key.as_bytes(), T0), Some(order[1]), "{key}");
+        homes.insert(k, here);
+    }
+    let mut per = [0u32; 6];
+    for n in homes.values() {
+        per[usize::from(*n)] += 1;
+    }
+    assert_eq!(per[1], 0, "{per:?}");
+    assert!(per.iter().enumerate().all(|(i, n)| i == 1 || (80..=160).contains(n)), "{per:?}");
+
+    // A full node is still home to its keys.
+    view.nodes[2].mem_committed_mib = view.nodes[2].mem_admit_mib;
+    // A node that goes down or is excluded hands its keys on, and no other key moves.
+    view.nodes[3].healthy = false;
+    let exclude = [4];
+    let r = PlaceReq { exclude: &exclude, ..r };
+    for (k, &was) in &homes {
+        let key = format!("swe\0k{k}");
+        let now = a.home(&view, &r, key.as_bytes(), T0).unwrap();
+        if was == 3 || was == 4 {
+            assert!(now != 3 && now != 4 && now != 1, "{key} went to {now}");
+        } else {
+            assert_eq!(now, was, "{key}");
+        }
+    }
+}

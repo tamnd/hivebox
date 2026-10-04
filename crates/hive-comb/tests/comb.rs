@@ -80,6 +80,37 @@ async fn one_idempotency_key_makes_one_cell() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_key_turned_away_for_room_is_turned_away_again() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let comb = open(Config { mem_mib: Some(1024), ..config(&s.0) }, &fake).await;
+    let sized = |mem_mib| {
+        let mut s = spec("python");
+        s.resources.mem_mib = mem_mib;
+        s.qos = Qos::Latency;
+        s
+    };
+    comb.create(request(sized(768))).await.unwrap();
+    let keyed = |mem_mib, anyway| CreateRequest {
+        idem_key: Some("k1".into()),
+        anyway,
+        ..request(sized(mem_mib))
+    };
+    let e = comb.create(keyed(768, false)).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+    // A smaller cell fits, but the key went elsewhere, so it is turned away again until the
+    // gate says to make it anyway.
+    let e = comb.create(keyed(256, false)).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+    let other = CreateRequest { idem_key: Some("k2".into()), ..request(sized(64)) };
+    comb.create(other).await.unwrap();
+    let made = comb.create(keyed(128, true)).await.unwrap();
+    assert_eq!(comb.create(keyed(128, false)).await.unwrap().id, made.id);
+    assert_eq!(comb.list().len(), 3);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admission_and_bad_requests_leave_nothing_behind() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());
@@ -393,6 +424,28 @@ async fn a_comb_back_in_a_new_epoch_stops_the_old_cells() {
     assert_eq!(comb.get(forgotten).unwrap_err().reason, Reason::CellLost);
     let unknown = CellId::new(new.unit(), new.node(), new.epoch(), 999, 1).unwrap();
     assert_eq!(comb.get(unknown).unwrap_err().reason, Reason::CellNotFound);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comb_that_loses_its_lease_stops_its_cells() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let comb = open(config(&s.0), &fake).await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(comb.create(request(spec("python"))).await.unwrap().id);
+    }
+    comb.pause(ids[1]).await.unwrap();
+    comb.stop(ids[2], None).await.unwrap();
+    comb.lose().await;
+    assert_eq!(fake.live(), 0);
+    let c = comb.get(ids[0]).unwrap();
+    assert_eq!((c.status.state, c.status.cause), (CellState::Failed, Some(Cause::NodeLost)));
+    let c = comb.get(ids[1]).unwrap();
+    assert_eq!((c.status.state, c.status.cause), (CellState::Failed, Some(Cause::NodeLost)));
+    // One that had already ended keeps its own end.
+    assert_eq!(comb.get(ids[2]).unwrap().status.state, CellState::Stopped);
     comb.shutdown().await;
 }
 

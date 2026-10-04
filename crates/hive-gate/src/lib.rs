@@ -46,6 +46,10 @@ pub use quota::Quotas;
 /// drops whatever the caller put there.
 pub const PROJECT_HEADER: &str = "x-hive-project";
 
+/// The header that tells a comb to make a keyed cell if it has room even when it turned the
+/// key away lately, which the gate sets once every node in the key's order turned it away.
+pub const ANYWAY_HEADER: &str = "x-hive-anyway";
+
 /// A token the call came with, which the services ask what it allows once they know the call's
 /// cell. A call with an API key has none.
 #[derive(Clone, Debug)]

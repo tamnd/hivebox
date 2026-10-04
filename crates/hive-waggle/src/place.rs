@@ -139,17 +139,7 @@ impl Placer {
         placed.sort_by(|a, b| b.1.cmp(&a.1).then(feasible[a.0].0.node.cmp(&feasible[b.0].0.node)));
         for (i, cells) in placed {
             let node = feasible[i].0;
-            let at = usize::from(node.node);
-            if self.inflight.len() <= at {
-                self.inflight.resize_with(at + 1, Vec::new);
-            }
-            self.inflight[at].push(Inflight {
-                report: node.report,
-                until: now + INFLIGHT_TTL,
-                cells,
-                mem_mib: u64::from(req.resources.mem_mib) * u64::from(cells),
-                cpu_milli: u64::from(req.resources.vcpu_milli) * u64::from(cells),
-            });
+            self.count(node, cells, &req.resources, now);
             out.nodes.push((node.node, cells));
         }
         out.unplaced = left;
@@ -162,6 +152,57 @@ impl Placer {
             }
         }
         out
+    }
+
+    /// Picks the node for one cell with an idempotency key: of the healthy nodes that run the
+    /// backend and are not excluded, the one whose hash with `key` is highest, with room or
+    /// without. Every placer picks the same node from the same view, so a create that is tried
+    /// again reaches the comb that has its key and gets the same cell back, and a node leaving
+    /// moves only the keys it had. A comb checks the key before its room, so a full one still
+    /// answers for a cell it has and turns a new one away. Asked again with that node excluded,
+    /// this picks the next node in the same order, so every try walks the nodes the same way.
+    pub fn home(
+        &mut self,
+        view: &ClusterView,
+        req: &PlaceReq<'_>,
+        key: &[u8],
+        now: Duration,
+    ) -> Option<u16> {
+        let node = view
+            .nodes
+            .iter()
+            .filter(|n| n.healthy && n.backends.has(req.backend) && !req.exclude.contains(&n.node))
+            .max_by_key(|n| rendezvous(key, n.node))?;
+        self.count(node, 1, &req.resources, now);
+        Some(node.node)
+    }
+
+    /// The healthy nodes that run `backend`, in the order `home` tries them for `key`.
+    #[must_use]
+    pub fn key_order(view: &ClusterView, backend: Backend, key: &[u8]) -> Vec<u16> {
+        let mut nodes: Vec<(u64, u16)> = view
+            .nodes
+            .iter()
+            .filter(|n| n.healthy && n.backends.has(backend))
+            .map(|n| (rendezvous(key, n.node), n.node))
+            .collect();
+        nodes.sort_unstable_by(|a, b| b.cmp(a));
+        nodes.into_iter().map(|(_, n)| n).collect()
+    }
+
+    /// Counts `cells` placed on `node` in the overlay.
+    fn count(&mut self, node: &NodeView, cells: u32, r: &Resources, now: Duration) {
+        let at = usize::from(node.node);
+        if self.inflight.len() <= at {
+            self.inflight.resize_with(at + 1, Vec::new);
+        }
+        self.inflight[at].push(Inflight {
+            report: node.report,
+            until: now + INFLIGHT_TTL,
+            cells,
+            mem_mib: u64::from(r.mem_mib) * u64::from(cells),
+            cpu_milli: u64::from(r.vcpu_milli) * u64::from(cells),
+        });
     }
 
     /// Takes back cells a node refused out of the `placed` it was sent, so they stop counting
@@ -340,6 +381,18 @@ fn score(node: &NodeView, load: &Load, given: u32, req: &PlaceReq<'_>, w: Weight
     let mine = node.project_cells(req.project) + given;
     let project = ratio(u64::from(mine), u64::from(load.cells + given).max(1));
     w.mem * mem + w.cpu * cpu + w.pool * pool - w.rate * rate - w.project * project
+}
+
+/// How much `node` wants `key`: FNV-1a over both, then mixed, so nodes whose indexes differ in
+/// one bit get unrelated weights.
+fn rendezvous(key: &[u8], node: u16) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in key.iter().chain(&node.to_be_bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 fn ratio(a: u64, b: u64) -> f64 {

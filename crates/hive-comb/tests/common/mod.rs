@@ -296,7 +296,7 @@ pub fn spec(image: &str) -> CellSpec {
 }
 
 pub fn request(s: CellSpec) -> CreateRequest {
-    CreateRequest { spec: s, project: "p".into(), idem_key: None }
+    CreateRequest { spec: s, project: "p".into(), idem_key: None, anyway: false }
 }
 
 pub async fn echo(comb: &Comb, id: CellId, text: &str) -> String {

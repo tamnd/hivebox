@@ -26,15 +26,16 @@ use tonic::transport::Channel;
 use crate::nodes::Nodes;
 
 /// The soonest a project whose share ran short asks the keeper again.
-const RETRY: Duration = Duration::from_millis(500);
-/// The fewest cells and creates a second asked for, so a quiet project can still start a
-/// burst without waiting for a second share.
-const MIN_CELLS: u64 = 64;
-const MIN_RATE: u32 = 20;
+pub const RETRY: Duration = Duration::from_millis(500);
+/// The fewest cells asked for, so a quiet project can still start a burst without waiting for
+/// a second share.
+pub const MIN_CELLS: u64 = 64;
+/// The fewest creates a second asked for, for the same reason.
+pub const MIN_RATE: u32 = 20;
 /// How soon a gate asks again when the keeper said some gate got less than it asked for.
-const CONTENDED: Duration = Duration::from_secs(1);
+pub const CONTENDED: Duration = Duration::from_secs(1);
 /// How long a project the keeper does not know is let through before the gate asks again.
-const UNKNOWN: Duration = Duration::from_secs(30);
+pub const UNKNOWN: Duration = Duration::from_secs(30);
 
 /// The quota shares this gate holds, one per project. Cloning it is cheap.
 #[derive(Clone, Debug)]
@@ -99,24 +100,17 @@ impl Quotas {
         {
             let mut projects = self.lock();
             if let Some(s) = projects.get_mut(project) {
-                match s.charge(n, now) {
-                    Ok(()) => {
-                        if s.wants_more(now) {
-                            s.asking = true;
-                            s.asked = now;
+                match s.take(n, now) {
+                    Take::Taken { ask } => {
+                        if ask {
                             let this = self.clone();
                             let project = project.to_owned();
                             tokio::spawn(async move { this.ask(&project, 0).await });
                         }
                         return Ok(());
                     }
-                    Err(e) if s.asking || now < s.asked + RETRY => {
-                        return Err(self.refuse(e));
-                    }
-                    Err(_) => {
-                        s.asking = true;
-                        s.asked = now;
-                    }
+                    Take::Short(e) => return Err(self.refuse(e)),
+                    Take::Ask => {}
                 }
             }
         }
@@ -188,7 +182,7 @@ impl Quotas {
                 let s = projects.entry(Arc::from(project)).or_insert_with(|| Share::new(now));
                 s.renew(q.cells, q.creates_per_s, slice.cells, slice.creates_per_s, ttl, now);
                 if slice.contended {
-                    s.next = CONTENDED;
+                    s.contended();
                 }
             }
             Err(e) if e.code() == Code::NotFound => {
@@ -204,7 +198,7 @@ impl Quotas {
                     e.message()
                 );
                 match projects.get_mut(project) {
-                    Some(s) => s.asking = false,
+                    Some(s) => s.failed(),
                     // No share yet: let the project through for a while, and ask again then
                     // rather than on every create.
                     None => {
@@ -243,14 +237,32 @@ impl Quotas {
 
 /// Which limit a create ran into, with the project's quota for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Short {
+pub enum Short {
+    /// The quota of live cells.
     Cells(u64),
+    /// The quota of creates a second.
     Rate(u32),
 }
 
-/// What is left of one project's share, and how much the project asked for lately.
+/// What a create did with a share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// The cells came out of the share, and the gate should ask for the next one if `ask`.
+    Taken {
+        /// Whether to ask the keeper for the next share now.
+        ask: bool,
+    },
+    /// The share is too small, and the gate asked lately, so the create is refused.
+    Short(Short),
+    /// The share is too small: ask the keeper now and charge the new share.
+    Ask,
+}
+
+/// What is left of one project's share, and how much the project asked for lately. A gate
+/// keeps one per project. It is public so the simulation in `hive-sim` runs the same
+/// accounting the gate does, on its own clock.
 #[derive(Debug)]
-struct Share {
+pub struct Share {
     /// The project's whole quota, where 0 is no limit.
     max_cells: u64,
     max_rate: u32,
@@ -281,7 +293,9 @@ struct Share {
 }
 
 impl Share {
-    fn new(now: Instant) -> Self {
+    /// A share with nothing in it yet, asked for at `now`.
+    #[must_use]
+    pub fn new(now: Instant) -> Self {
         Self {
             max_cells: 0,
             max_rate: 0,
@@ -305,7 +319,7 @@ impl Share {
     }
 
     /// Takes in a new share.
-    fn renew(
+    pub fn renew(
         &mut self,
         max_cells: u64,
         max_rate: u32,
@@ -337,7 +351,8 @@ impl Share {
 
     /// What to ask for: one and a half times what the project asked for lately, the cells for
     /// a whole share's life since the gate asks again halfway.
-    fn want(&self, now: Instant) -> (u64, u32) {
+    #[must_use]
+    pub fn want(&self, now: Instant) -> (u64, u32) {
         let secs = now.duration_since(self.got).as_secs_f64().max(1.0);
         let per_s = self.per_s.max(self.demand as f64 / secs) * 1.5;
         let cells = (per_s * self.ttl.max(Duration::from_secs(1)).as_secs_f64()) as u64;
@@ -350,7 +365,12 @@ impl Share {
         self.filled = now;
     }
 
-    fn charge(&mut self, n: u64, now: Instant) -> Result<(), Short> {
+    /// Takes `n` cells out of the share, if it has them and the creates a second allow it.
+    ///
+    /// # Errors
+    ///
+    /// The limit the cells ran into.
+    pub fn charge(&mut self, n: u64, now: Instant) -> Result<(), Short> {
         self.demand += n;
         if self.max_cells > 0 && self.cells < n {
             return Err(Short::Cells(self.max_cells));
@@ -373,11 +393,42 @@ impl Share {
 
     /// Whether to ask for the next share now: half of this one is spent or half its life is
     /// gone, or a second when the quota is short.
-    fn wants_more(&self, now: Instant) -> bool {
+    #[must_use]
+    pub fn wants_more(&self, now: Instant) -> bool {
         !self.asking
             && now >= self.asked + RETRY
             && (now >= self.got + self.next
                 || (self.max_cells > 0 && self.cells * 2 < self.granted))
+    }
+
+    /// Charges a create of `n` cells, deciding whether to ask the keeper for more.
+    pub fn take(&mut self, n: u64, now: Instant) -> Take {
+        match self.charge(n, now) {
+            Ok(()) => {
+                let ask = self.wants_more(now);
+                if ask {
+                    self.asking = true;
+                    self.asked = now;
+                }
+                Take::Taken { ask }
+            }
+            Err(e) if self.asking || now < self.asked + RETRY => Take::Short(e),
+            Err(_) => {
+                self.asking = true;
+                self.asked = now;
+                Take::Ask
+            }
+        }
+    }
+
+    /// The keeper said some gate got less than it asked for, so ask again sooner.
+    pub fn contended(&mut self) {
+        self.next = CONTENDED;
+    }
+
+    /// The ask failed, and the share stays as it was.
+    pub fn failed(&mut self) {
+        self.asking = false;
     }
 
     fn count(&mut self, n: u64, now: Instant) {
@@ -391,7 +442,8 @@ impl Share {
     }
 
     /// The cells made this second and the one before.
-    fn recent(&self, now: Instant) -> u64 {
+    #[must_use]
+    pub fn recent(&self, now: Instant) -> u64 {
         match now.duration_since(self.born).as_secs().saturating_sub(self.second) {
             0 => self.now_n + self.last_n,
             1 => self.now_n,
