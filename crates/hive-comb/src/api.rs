@@ -35,6 +35,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 /// The header that names the caller's project.
 pub const PROJECT_HEADER: &str = "x-hive-project";
+/// The header a gate sets on a keyed create that every node in the key's order turned away,
+/// so a node makes it if it has room even when it turned the key away lately.
+pub const ANYWAY_HEADER: &str = "x-hive-anyway";
 /// The project of a caller that names none.
 pub const DEFAULT_PROJECT: &str = "local";
 /// The most cells one create call may ask for.
@@ -274,6 +277,7 @@ impl Cells for Api {
         req: Request<v1::CreateRequest>,
     ) -> Result<Response<Self::CreateStream>, Status> {
         let project = project(&req)?;
+        let anyway = req.metadata().contains_key(ANYWAY_HEADER);
         let req = req.into_inner();
         let count = req.count.max(1);
         if count > MAX_COUNT {
@@ -289,7 +293,12 @@ impl Cells for Api {
                     (key, 1) => Some(key.to_string()),
                     (key, _) => Some(format!("{key}/{index}")),
                 };
-                let req = CreateRequest { spec: spec.clone(), project: project.clone(), idem_key };
+                let req = CreateRequest {
+                    spec: spec.clone(),
+                    project: project.clone(),
+                    idem_key,
+                    anyway,
+                };
                 // On its own task, so the cell is still made if the caller goes away, and a
                 // retry with the same key finds it.
                 let task = tokio::spawn({

@@ -15,7 +15,7 @@ use hive_proto::v1::cells_server::Cells;
 use hive_scout::project_id;
 use hive_telemetry::{CounterVec, HistogramVec};
 use hive_types::{CellId, CellSpec, Error, Reason};
-use hive_waggle::{PlaceReq, Placer};
+use hive_waggle::{PlaceReq, Placement, Placer};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tonic::transport::Channel;
@@ -23,7 +23,7 @@ use tonic::{Request, Response, Status};
 
 use crate::nodes::Nodes;
 use crate::quota::Quotas;
-use crate::{Grant, PROJECT_HEADER};
+use crate::{ANYWAY_HEADER, Grant, PROJECT_HEADER};
 
 /// The most cells one create call may ask for.
 pub const MAX_COUNT: u32 = 32_768;
@@ -378,8 +378,13 @@ impl Batch {
         let mut left: Vec<u32> = (0..self.count).collect();
         let this = Arc::new(self);
         let mut exclude: Vec<u16> = Vec::new();
-        for attempt in 0..=RETRIES {
-            let last = attempt == RETRIES;
+        // A comb turns away a key it turned away for room lately, so a retry passes on to the
+        // node that took it. When every node in the key's order turned the cell away, some may
+        // have done so only for that, so the gate walks the order once more and they take it.
+        let mut anyway = false;
+        let mut attempt = 0;
+        loop {
+            let last = attempt == RETRIES && (anyway || !this.homed());
             let placement = {
                 let inner = &this.api.inner;
                 let snap = inner.nodes.snapshot();
@@ -393,18 +398,26 @@ impl Batch {
                     exclude: &exclude,
                 };
                 let now = inner.start.elapsed();
-                inner
-                    .placer
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .place(&snap.view, &req, now)
+                let mut placer = inner.placer.lock().unwrap_or_else(PoisonError::into_inner);
+                if this.homed() {
+                    // A keyed cell goes to the node its key hashes to, so a create sent again,
+                    // through this gate or another, finds the cell it made. A full node turns
+                    // the cell away, and the next try takes the next node in the key's order.
+                    let key = [this.project.as_bytes(), &[0], this.key.as_bytes()].concat();
+                    match placer.home(&snap.view, &req, &key, now) {
+                        Some(node) => Placement { nodes: vec![(node, 1)], unplaced: 0 },
+                        None => Placement { nodes: Vec::new(), unplaced: 1 },
+                    }
+                } else {
+                    placer.place(&snap.view, &req, now)
+                }
             };
             let mut sends = JoinSet::new();
             let mut at = 0;
             for (node, k) in placement.nodes {
                 let part = left[at..at + k as usize].to_vec();
                 at += k as usize;
-                sends.spawn(this.clone().send(node, part, last));
+                sends.spawn(this.clone().send(node, part, last, anyway));
             }
             let mut again = left.split_off(at);
             let unplaced = again.len();
@@ -424,7 +437,15 @@ impl Batch {
             if again.is_empty() {
                 return;
             }
-            if last || (unplaced == again.len() && exclude.is_empty()) {
+            let nowhere = unplaced == again.len() && exclude.is_empty();
+            if this.homed() && !anyway && !nowhere && (attempt == RETRIES || unplaced > 0) {
+                anyway = true;
+                attempt = 0;
+                exclude.clear();
+                left = again;
+                continue;
+            }
+            if last || nowhere {
                 // Nowhere had room, and asking again right away would find the same.
                 let e = Error::new(Reason::CapacityUnavailable, "no node has room for the cell");
                 for index in again {
@@ -434,19 +455,26 @@ impl Batch {
             }
             again.sort_unstable();
             left = again;
+            attempt += 1;
         }
     }
 
+    /// Whether the batch is one cell with a key and nothing to say where it should go, which
+    /// sends it to its key's home first.
+    fn homed(&self) -> bool {
+        self.count == 1 && !self.key.is_empty() && self.affinity.is_none()
+    }
+
     /// Creates the cells at batch indexes `part` on `node`, in calls a comb takes.
-    async fn send(self: Arc<Self>, node: u16, part: Vec<u32>, last: bool) -> Sent {
+    async fn send(self: Arc<Self>, node: u16, part: Vec<u32>, last: bool, anyway: bool) -> Sent {
         let mut again = Vec::new();
         for chunk in part.chunks(COMB_COUNT as usize) {
-            again.extend(self.send_chunk(node, chunk, last).await);
+            again.extend(self.send_chunk(node, chunk, last, anyway).await);
         }
         Sent { node, again }
     }
 
-    async fn send_chunk(&self, node: u16, chunk: &[u32], last: bool) -> Vec<u32> {
+    async fn send_chunk(&self, node: u16, chunk: &[u32], last: bool, anyway: bool) -> Vec<u32> {
         let count = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
         let key = match (self.key.as_str(), count) {
             ("", _) => String::new(),
@@ -462,12 +490,21 @@ impl Batch {
         };
         let call = async {
             let mut client = self.api.node(node)?;
-            client.create(out(&self.project, req)).await
+            let mut req = out(&self.project, req);
+            if anyway {
+                req.metadata_mut()
+                    .insert(ANYWAY_HEADER, tonic::metadata::MetadataValue::from_static("1"));
+            }
+            client.create(req).await
         };
         let mut stream = match call.await {
             Ok(r) => r.into_inner(),
-            // The comb never saw the call, so the cells can go elsewhere.
-            Err(s) if s.code() == tonic::Code::Unavailable && !last => return chunk.to_vec(),
+            // The comb may never have seen the call, so the cells can go elsewhere. Not a keyed
+            // cell: the call may have got there and only the answer been lost, and a cell made
+            // elsewhere would be a second one. Its caller tries again and finds it.
+            Err(s) if s.code() == tonic::Code::Unavailable && !last && !self.homed() => {
+                return chunk.to_vec();
+            }
             Err(s) => {
                 let e = on_node(node, &s);
                 for &index in chunk {

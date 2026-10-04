@@ -164,8 +164,8 @@ async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
         _ = term.recv() => None,
         _ = int.recv() => None,
         r = &mut server => Some(r),
-        // A comb that lost its lease has lost its node, and stops. Its cells keep running, and
-        // the next start registers again and fails them as lost.
+        // A comb that lost its lease has lost its node. Keeper says so to anyone who asks, so
+        // its cells stop with it rather than run on next to ones made again elsewhere.
         Ok(Err(e)) = &mut held => {
             lost = Some(e);
             None
@@ -181,6 +181,9 @@ async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
         }
     };
     let _ = std::fs::remove_file(&socket);
+    if lost.is_some() {
+        comb.lose().await;
+    }
     comb.shutdown().await;
     match lost {
         Some(e) => Err(std::io::Error::other(e)),

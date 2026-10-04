@@ -1443,6 +1443,14 @@ dependencies = [
 [[package]]
 name = "hive-sim"
 version = "0.0.16"
+dependencies = [
+ "hive-gate",
+ "hive-keeper",
+ "hive-rt",
+ "hive-scout",
+ "hive-types",
+ "hive-waggle",
+]
 
 [[package]]
 name = "hive-snap"

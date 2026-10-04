@@ -1,7 +1,7 @@
 //! The gate end to end: a scout in the same process, two made up combs on TCP that answer from
 //! memory, and a real client calling the gate.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,6 +32,10 @@ struct FakeComb {
     /// Cells each create call may still make before it says there is no room.
     room: Arc<Mutex<u32>>,
     cells: Arc<Mutex<BTreeMap<CellId, v1::Cell>>>,
+    /// The cell each single cell key made, checked before the room as a comb does.
+    keys: Arc<Mutex<HashMap<String, v1::Cell>>>,
+    /// The single cell keys turned away for room, turned away again unless the gate says not to.
+    turned: Arc<Mutex<HashSet<String>>>,
     seq: Arc<Mutex<u64>>,
     /// Files by path, with the user that wrote each.
     files: Arc<Mutex<BTreeMap<String, (bytes::Bytes, String)>>>,
@@ -96,11 +100,25 @@ impl Cells for FakeComb {
         req: Request<v1::CreateRequest>,
     ) -> Result<Response<Self::CreateStream>, Status> {
         let project = project(&req);
+        let anyway = req.metadata().contains_key(hive_gate::ANYWAY_HEADER);
         let req = req.into_inner();
         let mut events = Vec::new();
+        let key = (req.count <= 1 && !req.idempotency_key.is_empty())
+            .then(|| format!("{project}\0{}", req.idempotency_key));
+        if let Some(cell) = key.as_ref().and_then(|k| self.keys.lock().unwrap().get(k).cloned()) {
+            let ev =
+                v1::CreateEvent { index: 0, result: Some(v1::create_event::Result::Cell(cell)) };
+            return Ok(Response::new(Box::pin(futures::stream::iter([Ok(ev)]))));
+        }
+        let turned = key.as_ref().is_some_and(|k| self.turned.lock().unwrap().contains(k));
         for index in 0..req.count.max(1) {
             let mut room = self.room.lock().unwrap();
-            let result = if *room == 0 {
+            if *room == 0
+                && let Some(k) = &key
+            {
+                self.turned.lock().unwrap().insert(k.clone());
+            }
+            let result = if *room == 0 || (turned && !anyway) {
                 v1::create_event::Result::Error(v1::Error {
                     reason: "CAPACITY_UNAVAILABLE".into(),
                     message: "full".into(),
@@ -121,6 +139,9 @@ impl Cells for FakeComb {
                     ..Default::default()
                 };
                 self.cells.lock().unwrap().insert(id, cell.clone());
+                if let Some(k) = &key {
+                    self.keys.lock().unwrap().insert(k.clone(), cell.clone());
+                }
                 v1::create_event::Result::Cell(cell)
             };
             events.push(Ok(v1::CreateEvent { index, result: Some(result) }));
@@ -556,6 +577,13 @@ fn cell(e: &v1::CreateEvent) -> Option<&v1::Cell> {
     }
 }
 
+fn error(e: &v1::CreateEvent) -> Option<&v1::Error> {
+    match &e.result {
+        Some(v1::create_event::Result::Error(e)) => Some(e),
+        _ => None,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_without_a_good_key_is_turned_away() {
     let c = Cluster::new(100).await;
@@ -644,6 +672,79 @@ async fn cells_a_full_node_turns_away_go_to_the_other() {
     for e in &events {
         let Some(v1::create_event::Result::Error(err)) = &e.result else { panic!("{e:?}") };
         assert_eq!(err.reason, "CAPACITY_UNAVAILABLE");
+    }
+}
+
+async fn create_keyed(c: &Cluster, key: &str) -> v1::CreateEvent {
+    let req = v1::CreateRequest {
+        spec: Some(spec("k")),
+        count: 1,
+        idempotency_key: key.into(),
+        ..Default::default()
+    };
+    let mut s = c.cells().create(authed(req)).await.unwrap().into_inner();
+    let ev = s.message().await.unwrap().expect("one event");
+    assert!(s.message().await.unwrap().is_none());
+    ev
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keyed_create_sent_again_finds_its_cell() {
+    let c = Cluster::new(1000).await;
+    let mut first = Vec::new();
+    for i in 0..40 {
+        let ev = create_keyed(&c, &format!("task-{i}")).await;
+        first.push(cell(&ev).expect("a cell").clone());
+    }
+    let on = |n: &str| first.iter().filter(|c| c.node == n).count();
+    assert!(on("1") > 0 && on("2") > 0, "keys spread: {} and {}", on("1"), on("2"));
+    for (i, was) in first.iter().enumerate() {
+        let ev = create_keyed(&c, &format!("task-{i}")).await;
+        assert_eq!(cell(&ev).expect("a cell").id, was.id, "task-{i}");
+    }
+    let made: usize = c.combs.iter().map(|k| k.cells.lock().unwrap().len()).sum();
+    assert_eq!(made, 40);
+
+    // A full home turns new keys away and they go to the other node, while the keys it has
+    // still find their cells there.
+    *c.combs[0].room.lock().unwrap() = 0;
+    for i in 40..60 {
+        let ev = create_keyed(&c, &format!("task-{i}")).await;
+        assert_eq!(cell(&ev).expect("a cell").node, "2", "task-{i}");
+    }
+    for (i, was) in first.iter().enumerate() {
+        let ev = create_keyed(&c, &format!("task-{i}")).await;
+        assert_eq!(cell(&ev).expect("a cell").id, was.id, "task-{i}");
+    }
+
+    // With room again, the home turns away the keys it turned away before, so they still
+    // find their cells on the other node rather than making second ones.
+    *c.combs[0].room.lock().unwrap() = 1000;
+    let homed = c.combs[0].turned.lock().unwrap().len();
+    assert!(homed > 0, "some of the new keys are homed on node 1");
+    for i in 40..60 {
+        let ev = create_keyed(&c, &format!("task-{i}")).await;
+        assert_eq!(cell(&ev).expect("a cell").node, "2", "task-{i}");
+    }
+    let made: usize = c.combs.iter().map(|k| k.cells.lock().unwrap().len()).sum();
+    assert_eq!(made, 60);
+
+    // When both nodes are full they turn every new key away. Once node 1 has room it still
+    // turns them away at first, as it did before, and the gate asks again so it makes them.
+    *c.combs[0].room.lock().unwrap() = 0;
+    *c.combs[1].room.lock().unwrap() = 0;
+    for i in 0..10 {
+        let ev = create_keyed(&c, &format!("late-{i}")).await;
+        let e = error(&ev).expect("no room anywhere");
+        assert_eq!(e.reason, Reason::CapacityUnavailable.as_str(), "late-{i}");
+    }
+    *c.combs[0].room.lock().unwrap() = 1000;
+    for i in 0..10 {
+        let ev = create_keyed(&c, &format!("late-{i}")).await;
+        let made = cell(&ev).expect("a cell").clone();
+        assert_eq!(made.node, "1", "late-{i}");
+        let ev = create_keyed(&c, &format!("late-{i}")).await;
+        assert_eq!(cell(&ev).expect("a cell").id, made.id, "late-{i}");
     }
 }
 
