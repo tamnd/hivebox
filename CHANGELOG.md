@@ -5,6 +5,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 ## Unreleased
 
 - While the memory pressure brake is on, the comb pauses cells that have been idle for 30 s and reclaims paused cells' memory at once instead of after 10 minutes. Latency cells and cells whose idle action is to stop are left running. The wait is `density.pressure_idle`, and `density.psi_source` names the pressure file the brake reads.
+- `hive-nectar relayout IMAGE` stores a copy of each traced layer's data with the traced chunks first, and a lazy mount of the new image fetches the trace from that copy in a few long reads. On server3 against MinIO, the 160 traced chunks of a python image were in after 1.9 to 4.1 s from the relaid copy in 19 to 29 reads, against 3.5 to 5.5 s and 51 to 60 reads with the trace leading and 5.5 to 7.9 s and 56 to 60 reads in order.
 
 ## 0.0.18
 

@@ -7,6 +7,7 @@
 //! hive-nectar show IMAGE --store DIR
 //! hive-nectar fetch IMAGE --store DIR --cache DIR [--capacity BYTES]
 //! hive-nectar copy IMAGE --store DIR --to-s3 URL      # an image and its layers, to a bucket
+//! hive-nectar relayout IMAGE --store DIR [--work DIR]
 //! hive-nectar run IMAGE --store DIR --cache DIR --work DIR --cmd CMD [--mode MODE]
 //! ```
 //!
@@ -14,7 +15,11 @@
 //! then says how long the mount and the command took. It needs root. `--mode whole` fetches every
 //! blob before mounting, `lazy`, the default, mounts lazily over NBD with the image's prefetch
 //! traces leading the fill, and `trace` mounts lazily, records what the command read, stores it
-//! as prefetch traces and prints the name of the traced image.
+//! as prefetch traces and prints the name of the traced image. `run` also says how many reads
+//! the lazy fill made and how much it fetched by the time the command ended.
+//!
+//! `relayout` stores a copy of each traced layer's data with the traced chunks first and prints
+//! the name of the relaid image, whose lazy mounts fetch from the copies.
 //!
 //! Imports take `--mkfs PATH` for a `mkfs.erofs` that is not on the path, and `--chunk BYTES` for
 //! the layer chunk size. They remember built layers in `--work DIR`, which is `STORE/import` by
@@ -37,7 +42,7 @@ use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 
 const USAGE: &str = "usage: hive-nectar import-oci LAYOUT | import-tar TAR | show IMAGE | fetch IMAGE \
-                     | copy IMAGE | run IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] \
+                     | copy IMAGE | relayout IMAGE | run IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] \
                      [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace]";
 
 fn main() -> ExitCode {
@@ -166,7 +171,16 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
             let mut blobs: Vec<BlobId> = m
                 .layers
                 .iter()
-                .flat_map(|l| [Some(l.meta), Some(l.data), l.data_leaves, l.data_trace])
+                .flat_map(|l| {
+                    [
+                        Some(l.meta),
+                        Some(l.data),
+                        l.data_leaves,
+                        l.data_trace,
+                        l.data_relaid,
+                        l.data_order,
+                    ]
+                })
                 .flatten()
                 .collect();
             // The manifest goes last, so an image in the bucket always has all its layers.
@@ -184,6 +198,30 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 mib(sent),
                 sent as f64 / (1 << 20) as f64 / took.as_secs_f64()
             );
+            Ok(())
+        }
+        "relayout" => {
+            let id: BlobId = what.parse().map_err(|e| format!("{what}: {e}"))?;
+            let work = match (flags.get("work"), &store_dir) {
+                (Some(w), _) => PathBuf::from(w),
+                (None, Some(dir)) => dir.join("import"),
+                (None, None) => return Err("relayout in a bucket needs --work".into()),
+            };
+            std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+            let m = load_manifest(store, id).await.map_err(|e| format!("image {id}: {e}"))?;
+            let started = Instant::now();
+            let done = hive_nectar::relayout::put(store, &m, &work)
+                .await
+                .map_err(|e| format!("relayout: {e}"))?;
+            eprintln!(
+                "{} layers relaid in {:.2?}, {} traced chunks that were {} runs and are now {}",
+                done.layers,
+                started.elapsed(),
+                done.traced,
+                done.runs,
+                done.layers
+            );
+            println!("{}", done.id);
             Ok(())
         }
         #[cfg(target_os = "linux")]
@@ -213,9 +251,15 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 .await
                 .map_err(|e| format!("chroot: {e}"))?;
             let ran = started.elapsed() - mounted;
+            let (reads, fetched) = layers
+                .progress()
+                .iter()
+                .fold((0, 0), |(r, b), (_, p)| (r + p.requests, b + p.bytes));
             eprintln!(
-                "{mode}: mounted in {mounted:.2?}, ran in {ran:.2?}, {status}, {:.2?} in all",
-                started.elapsed()
+                "{mode}: mounted in {mounted:.2?}, ran in {ran:.2?}, {status}, {:.2?} in all, \
+                 {reads} reads and {} fetched lazily by then",
+                started.elapsed(),
+                mib(fetched)
             );
             drop(root);
             if mode == "trace" {

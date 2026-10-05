@@ -14,7 +14,10 @@
 //!   and an idmapped mount for the cells' id range.
 //!
 //! A blob can be filled lazily with [`Cache::lazy`], chunk by chunk as it is read, each chunk
-//! checked against the blob's [`Leaves`]. Chunk level dedup and the 3FS store come later.
+//! checked against the blob's [`Leaves`]. [`trace`] records what a run read so the next mount
+//! fills that first, and [`relayout`] stores a copy of each traced data blob with those chunks
+//! first so the fill fetches them in a few long reads. Chunk level dedup and the 3FS store come
+//! later.
 
 // Only the mount module has any, for loop device ioctls and `mount_setattr`.
 #![deny(unsafe_code)]
@@ -28,6 +31,7 @@ pub mod leaves;
 #[cfg(target_os = "linux")]
 pub mod mount;
 pub mod oci;
+pub mod relayout;
 pub mod s3;
 pub mod store;
 pub mod trace;
@@ -35,7 +39,7 @@ pub mod trace;
 pub use blob::{BadBlobId, BlobId};
 pub use cache::{Cache, Held};
 pub use image::{ImageConfig, LayerRef, Manifest};
-pub use lazy::Lazy;
+pub use lazy::{Lazy, Relaid};
 pub use leaves::Leaves;
 pub use s3::{S3Config, S3Store};
 pub use store::{BlobCaps, BlobStat, BlobStore, PosixStore, PutReceipt, ReadReq};

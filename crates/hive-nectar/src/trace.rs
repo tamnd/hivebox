@@ -4,7 +4,8 @@
 //!
 //! A trace is stored as a blob of its own, little endian `u32` chunk numbers, and the layer names
 //! it in [`crate::LayerRef::data_trace`]. Adding traces makes a new manifest, so the image gets a
-//! new name and the old one stays as it was.
+//! new name and the old one stays as it was. A layer given a new trace drops the relaid copy made
+//! for its old one, and [`crate::relayout`] can make another.
 
 use std::collections::HashMap;
 use std::io;
@@ -66,13 +67,18 @@ pub async fn put(
     for layer in &mut traced.layers {
         let Some(order) = traces.get(&layer.digest).filter(|o| !o.is_empty()) else { continue };
         layer.data_trace = Some(put_bytes(store, &to_bytes(order), work).await?);
+        (layer.data_relaid, layer.data_order) = (None, None);
     }
     // The manifest goes last, so an image in the store always has all its traces.
     let id = put_bytes(store, &traced.to_bytes(), work).await?;
     Ok((id, traced))
 }
 
-async fn put_bytes(store: &dyn BlobStore, bytes: &[u8], work: &Path) -> io::Result<BlobId> {
+pub(crate) async fn put_bytes(
+    store: &dyn BlobStore,
+    bytes: &[u8],
+    work: &Path,
+) -> io::Result<BlobId> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let id = BlobId::of(bytes);
     let path =

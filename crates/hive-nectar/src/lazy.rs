@@ -8,6 +8,11 @@
 //! [`Lazy::fill_rest`] fetches the rest in the background in big reads, in a given order first,
 //! so a prefetch trace can lead.
 //!
+//! A blob can also be filled from a [`Relaid`] copy, the same chunks stored in another order so a
+//! trace is one long run. Chunks are fetched from the copy in its order, checked against the
+//! leaves of the original, and written where the original has them, so what ends up in the cache
+//! is the original blob under its own name and nothing that reads it needs to know.
+//!
 //! A chunk is readable as soon as its bytes are written. The map that records it is written
 //! after the part file is synced, at most [`FLUSH_AFTER`] later and in one go for every chunk
 //! that came in meanwhile, so a read never waits on a disk sync and a crash still never leaves a
@@ -34,7 +39,7 @@ use crate::store::{BlobStore, ReadReq, blocking};
 
 /// Chunks a read fetches from its first missing one, 1 MiB, so a file read front to back costs
 /// one request a MiB rather than one a chunk.
-const DEMAND: u64 = 4;
+pub(crate) const DEMAND: u64 = 4;
 
 /// Background fetches in flight for one blob. Reads never queue behind them.
 const BACKGROUND: usize = 4;
@@ -48,6 +53,48 @@ pub const FLUSH_AFTER: Duration = Duration::from_millis(50);
 /// How a fetch ended, once it has.
 type Outcome = Option<Result<(), (io::ErrorKind, Arc<str>)>>;
 
+/// A copy of a blob in the store with its chunks in another order, as [`crate::relayout`] makes.
+/// Every chunk of the copy is whole: a short last chunk of the original is padded with zeros.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relaid {
+    /// The copy.
+    pub blob: BlobId,
+    /// The chunk of the original that each chunk of the copy holds.
+    pub order: Vec<u64>,
+}
+
+/// Where each chunk of a relaid blob is, both ways.
+struct Order {
+    from: BlobId,
+    /// The chunk of the copy that holds each chunk.
+    at: Vec<u64>,
+    /// The chunk each chunk of the copy holds.
+    of: Vec<u64>,
+}
+
+impl Order {
+    fn new(relaid: Relaid, size: u64) -> io::Result<Self> {
+        let chunks = size.div_ceil(CHUNK);
+        let bad = |why: &str| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the order of {} {why}", relaid.blob),
+            ))
+        };
+        if relaid.order.len() as u64 != chunks {
+            return bad("has the wrong length");
+        }
+        let mut at = vec![u64::MAX; relaid.order.len()];
+        for (p, &c) in relaid.order.iter().enumerate() {
+            match at.get_mut(usize::try_from(c).unwrap_or(usize::MAX)) {
+                Some(slot) if *slot == u64::MAX => *slot = p as u64,
+                _ => return bad("is not a reordering"),
+            }
+        }
+        Ok(Self { from: relaid.blob, at, of: relaid.order })
+    }
+}
+
 /// A blob in the cache that may still be arriving. Clones share one fill.
 #[derive(Clone, Debug)]
 pub struct Lazy {
@@ -60,6 +107,8 @@ pub(crate) struct Inner {
     chunks: u64,
     store: Arc<dyn BlobStore>,
     leaves: Option<Leaves>,
+    /// Where the chunks come from when not from `blob` itself.
+    order: Option<Order>,
     /// The part file while filling, which stays open across the rename at the end.
     file: File,
     map_file: Option<File>,
@@ -116,24 +165,32 @@ impl Fill {
         self.map.as_ref().is_none_or(|m| m.has(chunk))
     }
 
-    /// Claims the chunks from `start` that are neither in nor on their way, up to `end`.
-    fn claim(&mut self, start: u64, end: u64) -> (Run, watch::Receiver<Outcome>) {
-        let mut stop = start + 1;
-        while stop < end && !self.has(stop) && !self.flying.contains_key(&stop) {
-            stop += 1;
+    /// Claims `start` and the chunks stored after it that are neither in nor on their way, up to
+    /// `most` in all. `next` gives the chunk stored after a chunk.
+    fn claim(
+        &mut self,
+        start: u64,
+        most: u64,
+        next: impl Fn(u64) -> Option<u64>,
+    ) -> (Run, watch::Receiver<Outcome>) {
+        let mut chunks = vec![start];
+        while (chunks.len() as u64) < most {
+            match next(chunks[chunks.len() - 1]) {
+                Some(c) if !self.has(c) && !self.flying.contains_key(&c) => chunks.push(c),
+                _ => break,
+            }
         }
         let (tx, rx) = watch::channel(None);
-        for c in start..stop {
+        for &c in &chunks {
             self.flying.insert(c, rx.clone());
         }
-        (Run { start, end: stop, tx }, rx)
+        (Run { chunks, tx }, rx)
     }
 }
 
-/// Chunks `start..end`, being fetched by one request.
+/// Chunks stored one after another, being fetched by one request.
 struct Run {
-    start: u64,
-    end: u64,
+    chunks: Vec<u64>,
     tx: watch::Sender<Outcome>,
 }
 
@@ -171,6 +228,28 @@ impl Cache {
         size: u64,
         leaves: BlobId,
     ) -> io::Result<Lazy> {
+        self.lazy_from(store, blob, size, leaves, None).await
+    }
+
+    /// [`Cache::lazy`], fetching the chunks from `relaid` when given rather than from `blob`.
+    /// A fill of `blob` already under way goes on as it was.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Cache::lazy`], and `InvalidData` if the order is not a reordering of the
+    /// blob's chunks.
+    ///
+    /// # Panics
+    ///
+    /// Only if another thread panicked while holding the cache's lock.
+    pub async fn lazy_from(
+        self: &Arc<Self>,
+        store: Arc<dyn BlobStore>,
+        blob: BlobId,
+        size: u64,
+        leaves: BlobId,
+        relaid: Option<Relaid>,
+    ) -> io::Result<Lazy> {
         let (size, fill) = match self.pin(blob) {
             Some(v) => v,
             None => self.reserve(blob, size)?,
@@ -185,7 +264,7 @@ impl Cache {
         let made = if self.has(blob) {
             Inner::complete(store, held)
         } else {
-            match Inner::open(store, held, leaves).await {
+            match Inner::open(store, held, leaves, relaid).await {
                 Ok(inner) => Ok(inner),
                 Err((held, e)) => {
                     drop(held);
@@ -230,6 +309,7 @@ impl Inner {
             ideal: 1,
             store,
             leaves: None,
+            order: None,
             file,
             map_file: None,
             part_path: held.path.clone(),
@@ -246,8 +326,13 @@ impl Inner {
         store: Arc<dyn BlobStore>,
         held: Held,
         leaves_id: BlobId,
+        relaid: Option<Relaid>,
     ) -> Result<Self, (Held, io::Error)> {
         let (blob, size) = (held.blob, held.size);
+        let order = match relaid.map(|r| Order::new(r, size)).transpose() {
+            Ok(o) => o,
+            Err(e) => return Err((held, e)),
+        };
         let leaves = async {
             let len =
                 usize::try_from(size.div_ceil(CHUNK).max(1) * 32).map_err(io::Error::other)?;
@@ -285,6 +370,7 @@ impl Inner {
             ideal,
             store,
             leaves: Some(leaves),
+            order,
             file,
             map_file: Some(map_file),
             part_path,
@@ -308,15 +394,17 @@ impl Inner {
                 if f.has(c) {
                     c += 1;
                 } else if let Some(rx) = f.flying.get(&c) {
-                    waits.push(rx.clone());
+                    if !waits.last().is_some_and(|w: &watch::Receiver<_>| w.same_channel(rx)) {
+                        waits.push(rx.clone());
+                    }
                     c += 1;
                 } else {
                     // Read ahead a little past what was asked, but no further than the store
-                    // likes in one read.
-                    let limit =
-                        (c + DEMAND.max(end - c).min(self.ideal.max(DEMAND))).min(self.chunks);
-                    let (run, rx) = f.claim(c, limit);
-                    c = run.end;
+                    // likes in one read. In a relaid blob what is ahead is what the trace read
+                    // next.
+                    let most = DEMAND.max(end - c).min(self.ideal.max(DEMAND));
+                    let (run, rx) = f.claim(c, most, |c| self.after(c));
+                    c += 1;
                     waits.push(rx);
                     tokio::spawn(self.clone().fetch(run));
                 }
@@ -328,20 +416,28 @@ impl Inner {
         Ok(())
     }
 
+    /// The chunk stored after `c`, if there is one.
+    fn after(&self, c: u64) -> Option<u64> {
+        match &self.order {
+            None => Some(c + 1).filter(|&n| n < self.chunks),
+            Some(o) => o.of.get(usize::try_from(o.at[c as usize] + 1).ok()?).copied(),
+        }
+    }
+
     /// Fetches one run, checks it, writes it, and tells whoever waits on it.
     async fn fetch(self: Arc<Self>, run: Run) {
-        let got = self.fetch_run(run.start, run.end).await;
+        let got = self.fetch_run(&run.chunks).await;
         let last = {
             let mut f = self.fill.lock().expect("fill lock");
-            for c in run.start..run.end {
-                f.flying.remove(&c);
+            for c in &run.chunks {
+                f.flying.remove(c);
             }
             if got.is_ok() {
                 let map = f.map.as_mut().expect("a fill in progress has a map");
-                for c in run.start..run.end {
+                for &c in &run.chunks {
                     map.set(c);
                 }
-                f.missing -= run.end - run.start;
+                f.missing -= run.chunks.len() as u64;
                 if f.missing == 0 {
                     f.map = None;
                 } else if !f.flush_queued {
@@ -357,26 +453,53 @@ impl Inner {
         let _ = run.tx.send(Some(got.map_err(|e| (e.kind(), Arc::from(e.to_string())))));
     }
 
-    async fn fetch_run(self: &Arc<Self>, start: u64, end: u64) -> io::Result<()> {
+    async fn fetch_run(self: &Arc<Self>, chunks: &[u64]) -> io::Result<()> {
         let leaves = self.leaves.as_ref().expect("a fill in progress has leaves");
-        let offset = start * CHUNK;
-        let len =
-            usize::try_from((end * CHUNK).min(self.size) - offset).map_err(io::Error::other)?;
+        let (from, first) = match &self.order {
+            None => (self.blob, chunks[0]),
+            Some(o) => (o.from, o.at[chunks[0] as usize]),
+        };
+        let offset = first * CHUNK;
+        let mut end = (first + chunks.len() as u64) * CHUNK;
+        if self.order.is_none() {
+            end = end.min(self.size);
+        }
+        let len = usize::try_from(end - offset).map_err(io::Error::other)?;
         let req = vec![ReadReq { offset, buf: vec![0; len] }];
-        let buf = self.store.read_vectored(self.blob, req).await?.pop().expect("one read").buf;
+        let buf = self.store.read_vectored(from, req).await?.pop().expect("one read").buf;
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(len as u64, Ordering::Relaxed);
-        for (i, chunk) in buf.chunks(CHUNK as usize).enumerate() {
-            let c = start + i as u64;
-            if !leaves.check(c, chunk) {
+        // Only the last chunk can be short, and in a copy it is padded, so each chunk is at a
+        // whole number of chunks into the read.
+        let piece = |i: usize, c: u64| {
+            let at = i * CHUNK as usize;
+            buf.get(at..at + CHUNK.min(self.size - c * CHUNK) as usize).unwrap_or_default()
+        };
+        for (i, &c) in chunks.iter().enumerate() {
+            if !leaves.check(c, piece(i, c)) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("chunk {c} of {} from the store does not match its leaf", self.blob),
                 ));
             }
         }
-        let me = self.clone();
-        blocking(move || me.file.write_all_at(&buf, offset)).await
+        let (me, chunks) = (self.clone(), chunks.to_vec());
+        blocking(move || {
+            // Chunks that sit together in the original go in one write.
+            let mut i = 0;
+            while i < chunks.len() {
+                let mut j = i + 1;
+                while j < chunks.len() && chunks[j] == chunks[j - 1] + 1 {
+                    j += 1;
+                }
+                let last = chunks[j - 1];
+                let end = (j - 1) * CHUNK as usize + CHUNK.min(me.size - last * CHUNK) as usize;
+                me.file.write_all_at(&buf[i * CHUNK as usize..end], chunks[i] * CHUNK)?;
+                i = j;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Records every chunk that came in since the last flush, once their bytes are on disk.
@@ -507,7 +630,7 @@ impl Lazy {
                 if f.has(c) || f.flying.contains_key(&c) {
                     None
                 } else {
-                    let (run, rx) = f.claim(c, (c + inner.ideal).min(inner.chunks));
+                    let (run, rx) = f.claim(c, inner.ideal, |c| inner.after(c));
                     tokio::spawn(inner.clone().fetch(run));
                     Some(rx)
                 }
