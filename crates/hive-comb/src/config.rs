@@ -50,6 +50,9 @@ pub struct Config {
     pub netns_dir: Option<PathBuf>,
     /// Network namespaces kept ready, so a create does not wait on making one.
     pub netns_depth: usize,
+    /// The share of the last ten seconds cells may stall on memory before the node takes no new
+    /// ones, from 0 to 1. Admits come back under half of it. 0 turns the brake off.
+    pub psi_stop_admit: f64,
     /// Where the local API listens.
     pub api_socket: PathBuf,
     /// Where gates reach the API over TCP, if anywhere. Whoever can connect is trusted the way
@@ -210,6 +213,7 @@ impl Default for Config {
             cgroup_depth: 256,
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
             netns_depth: 400,
+            psi_stop_admit: 0.20,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             listen: None,
             metrics: None,
@@ -239,6 +243,9 @@ impl Config {
     /// [pools]
     /// cgroup_root = "/sys/fs/cgroup/hive.slice"
     /// netns_depth = 400
+    ///
+    /// [density]
+    /// psi_stop_admit = 0.20
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -314,6 +321,12 @@ impl Config {
         }
         set(&mut c.cgroup_depth, p.cgroup_depth);
         set(&mut c.netns_depth, p.netns_depth);
+        if let Some(v) = file.density.psi_stop_admit {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("density.psi_stop_admit = {v} is not a share from 0 to 1"));
+            }
+            c.psi_stop_admit = v;
+        }
         let l = file.lifecycle;
         for (field, value, name) in [
             (&mut c.create_deadline, l.create_deadline, "create_deadline"),
@@ -453,6 +466,7 @@ fn duration(s: &str) -> Option<Duration> {
 struct File {
     node: NodeFile,
     pools: PoolsFile,
+    density: DensityFile,
     lifecycle: LifecycleFile,
     backends: BackendsFile,
     images: ImagesFile,
@@ -533,6 +547,12 @@ struct PoolsFile {
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct DensityFile {
+    psi_stop_admit: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LifecycleFile {
     create_deadline: Option<String>,
     stop_grace: Option<String>,
@@ -569,6 +589,14 @@ mod tests {
         let c = Config::from_toml("").unwrap();
         assert_eq!(c.data_dir, Config::default().data_dir);
         assert_eq!(c.netns_depth, 400);
+        assert!((c.psi_stop_admit - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_pressure_limit_is_a_share() {
+        assert!(Config::from_toml("[density]\npsi_stop_admit = 0").is_ok());
+        let e = Config::from_toml("[density]\npsi_stop_admit = 20").unwrap_err();
+        assert!(e.contains("from 0 to 1"), "{e}");
     }
 
     #[test]
@@ -585,6 +613,9 @@ mod tests {
             [pools]
             cgroup_root = ""
             netns_depth = 16
+
+            [density]
+            psi_stop_admit = 0.35
 
             [lifecycle]
             create_deadline = "5s"
@@ -620,6 +651,7 @@ mod tests {
         assert_eq!(c.cgroup_root, None);
         assert_eq!(c.netns_dir, Config::default().netns_dir);
         assert_eq!(c.netns_depth, 16);
+        assert!((c.psi_stop_admit - 0.35).abs() < 1e-9);
         assert_eq!(c.create_deadline, Duration::from_secs(5));
         assert_eq!(c.stop_grace, Duration::from_millis(250));
         assert_eq!(c.keep_ended, Duration::from_secs(600));

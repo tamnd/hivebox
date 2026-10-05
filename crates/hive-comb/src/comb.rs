@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::net::Net;
 use crate::netns::Namespaces;
+use crate::pressure::Brake;
 use crate::record::{Record, SEQ_KEY, Seq, time};
 use crate::wal::Wal;
 use hive_cell::{DriverRegistry, RootfsPlan, Slot};
@@ -237,6 +238,13 @@ impl Comb {
                 eprintln!("hive-comb: removed {swept} cgroups no cell claims");
             }
             tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+        }
+        let inner = &comb.inner;
+        if inner.cfg.psi_stop_admit > 0.0 {
+            let brake =
+                Brake::new(inner.cfg.cgroup_root.as_deref(), inner.cfg.psi_stop_admit * 100.0);
+            let metrics = inner.metrics.clone();
+            tokio::spawn(brake.run(inner.admission.clone(), metrics, inner.shutdown.clone()));
         }
         Ok(comb)
     }

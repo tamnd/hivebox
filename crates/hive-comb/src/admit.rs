@@ -5,10 +5,12 @@
 //! with this one added, stays under the node's memory times the overcommit factor of this cell's
 //! class. So a latency cell only goes in while nothing is overcommitted, and a best effort cell
 //! can go in up to three times over, from `spec/08_node_agent.md`, section 5. Creates also wait
-//! for a per backend permit, which bounds how many are in flight at once.
+//! for a per backend permit, which bounds how many are in flight at once. While the node's cells
+//! stall on memory, the brake in `pressure.rs` holds every admit, whatever room is left.
 
 use hive_types::{Backend, CellSpec, Error, Qos, Reason};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -18,6 +20,7 @@ pub(crate) struct Admission {
     max_cells: usize,
     used: Mutex<Used>,
     creates: BTreeMap<Backend, Arc<Semaphore>>,
+    held: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -56,7 +59,13 @@ impl Admission {
         creates: &BTreeMap<Backend, usize>,
     ) -> Self {
         let creates = creates.iter().map(|(&b, &n)| (b, Arc::new(Semaphore::new(n)))).collect();
-        Self { mem_limit, max_cells, used: Mutex::new(Used::default()), creates }
+        Self {
+            mem_limit,
+            max_cells,
+            used: Mutex::new(Used::default()),
+            creates,
+            held: AtomicBool::new(false),
+        }
     }
 
     fn used(&self) -> std::sync::MutexGuard<'_, Used> {
@@ -65,6 +74,12 @@ impl Admission {
 
     /// Takes a share of the node for a cell with `spec`, or says why there is none.
     pub(crate) fn reserve(self: &Arc<Self>, spec: &CellSpec) -> Result<Reservation, Error> {
+        if self.held() {
+            return Err(Error::new(
+                Reason::CapacityUnavailable,
+                "the node's cells are stalling on memory, so it takes no new ones until that passes",
+            ));
+        }
         let mem = spec.resources.mem_bytes();
         let mut used = self.used();
         if used.cells >= self.max_cells {
@@ -103,6 +118,16 @@ impl Admission {
         used.mem += mem;
         used.cpu_milli += cpu_milli;
         Reservation { admission: self.clone(), mem, cpu_milli }
+    }
+
+    /// Holds every admit while `on`, or lets them through again.
+    pub(crate) fn hold(&self, on: bool) {
+        self.held.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether admits are held.
+    pub(crate) fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
     }
 
     /// Waits for a create permit for `backend`.
