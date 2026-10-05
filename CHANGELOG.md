@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-pollen`, the rollout worker. It reads tasks as lines of JSON, makes each task's sample cells in one batched call, keeps at most `--max-inflight` sample cells alive, runs a script of commands in each, checks each sample with `Verify.Run` and writes a trajectory with a reward (1, 0, or masked when hivebox failed) as a line of JSON as soon as the sample is done. On server3, 16 samples of swe-requests-2317 with three verifier runs each took 99.9 s with one cell in flight, 47.0 s with four and 34.9 s with eight, and all 48 rewards were right.
+
 ## 0.0.21
 
 A setup boost that lifts a cell's CPU quota until it is ready, and the first cut of the verifier service.

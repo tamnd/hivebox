@@ -1380,6 +1380,14 @@ dependencies = [
 [[package]]
 name = "hive-pollen"
 version = "0.0.21"
+dependencies = [
+ "futures",
+ "hive-proto",
+ "hive-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "hive-proto"
