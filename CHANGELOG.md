@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The comb has a memory pressure brake. Once its cells stall on memory more than 20% of the last ten seconds (`some avg10` in the cgroup's `memory.pressure`), it takes no new cells, tells scout it has no room, and asks the kernel for an eighth of the best effort slice's memory back every second. Admits come back once the stall falls under 10%. The limit is `density.psi_stop_admit`, and 0 turns the brake off. Pausing idle cells under pressure is not in yet.
+
 ## 0.0.17
 
 A deterministic cluster simulation, and the lease and keyed create bugs it found.

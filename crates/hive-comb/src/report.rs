@@ -83,6 +83,7 @@ struct Reporter {
 struct Sent {
     at: Instant,
     healthy: bool,
+    held: bool,
     cells: u32,
     mem_mib: u64,
 }
@@ -149,8 +150,8 @@ impl Reporter {
         }
     }
 
-    /// Whether a report should go now: a second passed, health changed, or cells or memory
-    /// moved by more than 5% of the node's room.
+    /// Whether a report should go now: a second passed, health changed, the pressure brake went
+    /// on or off, or cells or memory moved by more than 5% of the node's room.
     fn due(&self, comb: &Comb) -> bool {
         let Some(last) = self.last else { return true };
         if last.at.elapsed() >= EVERY {
@@ -162,6 +163,7 @@ impl Reporter {
         let max = inner.admission.max_cells() as u64;
         let moved = |a: u64, b: u64, whole: u64| a.abs_diff(b) as f64 > whole as f64 * URGENT_SHARE;
         !inner.shutdown.is_cancelled() != last.healthy
+            || inner.admission.held() != last.held
             || moved(u64::from(last.cells), usage.cells as u64, max)
             || moved(last.mem_mib, usage.mem >> 20, admit)
     }
@@ -189,7 +191,12 @@ impl Reporter {
             b
         });
         self.layers = layers;
-        self.last = Some(Sent { at: now, healthy, cells, mem_mib: mem_committed_mib });
+        let held = inner.admission.held();
+        self.last = Some(Sent { at: now, healthy, held, cells, mem_mib: mem_committed_mib });
+        // While the brake holds admits the node has no room, whatever its ceiling says, so the
+        // placer looks elsewhere and not at a node that would turn the create away.
+        let ceiling = inner.admission.ceiling_for(Qos::Standard) >> 20;
+        let mem_admit_mib = if held { mem_committed_mib.min(ceiling) } else { ceiling };
         NodeReport {
             node: inner.cfg.node,
             epoch: inner.cfg.epoch,
@@ -199,7 +206,7 @@ impl Reporter {
             backends: self.backends,
             cpu_milli: self.cpu_milli,
             cpu_committed_milli: usage.cpu_milli,
-            mem_admit_mib: inner.admission.ceiling_for(Qos::Standard) >> 20,
+            mem_admit_mib,
             mem_committed_mib,
             cells,
             max_cells: u32::try_from(inner.admission.max_cells()).unwrap_or(u32::MAX),

@@ -17,6 +17,7 @@ mod metrics;
 mod net;
 mod netns;
 mod pool;
+mod pressure;
 mod record;
 pub mod report;
 mod wal;

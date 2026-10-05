@@ -10,7 +10,7 @@
 //! the cell down, `release` gives back its share of the node and removes its directory, and
 //! `total` is all of it.
 
-use hive_telemetry::{CounterVec, HistogramVec, Registry};
+use hive_telemetry::{CounterVec, GaugeVec, HistogramVec, Registry};
 use hive_types::Backend;
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ pub struct Metrics {
     creates: CounterVec,
     stop_seconds: HistogramVec,
     exec_seconds: HistogramVec,
+    stall: GaugeVec,
+    reclaimed: CounterVec,
 }
 
 impl Default for Metrics {
@@ -47,6 +49,16 @@ impl Default for Metrics {
                 "hive_exec_seconds",
                 "Exec calls from the comb's side, from the request to the answer.",
                 &["op"],
+            ),
+            stall: registry.gauge(
+                "hive_memory_stall_basis_points",
+                "Share of the last 10 s in which a cell stalled on memory, in hundredths of a percent.",
+                &[],
+            ),
+            reclaimed: registry.counter(
+                "hive_memory_reclaimed_bytes_total",
+                "Memory the pressure brake took back from best effort cells.",
+                &[],
             ),
             registry,
         }
@@ -74,6 +86,14 @@ impl Metrics {
 
     pub(crate) fn exec(&self, op: &str, took: Duration) {
         self.exec_seconds.with(&[op]).observe_duration(took);
+    }
+
+    pub(crate) fn pressure(&self, avg10: f64) {
+        self.stall.with(&[]).set((avg10 * 100.0).round() as i64);
+    }
+
+    pub(crate) fn reclaimed(&self, bytes: u64) {
+        self.reclaimed.with(&[]).add(bytes);
     }
 }
 

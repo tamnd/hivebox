@@ -31,7 +31,9 @@ message NodeReport {
   // CPU on the node and CPU given to its cells, in thousandths of a core.
   uint64 cpu_milli = 7;
   uint64 cpu_committed_milli = 8;
-  // The memory it admits standard cells up to and the memory given to its cells, in MiB.
+  // The memory it admits standard cells up to and the memory given to its cells, in MiB. While its
+  // cells stall on memory the comb takes no new ones, and says so by sending the committed memory
+  // as the ceiling.
   uint64 mem_admit_mib = 9;
   uint64 mem_committed_mib = 10;
   // Cells on it now and the most it takes.
