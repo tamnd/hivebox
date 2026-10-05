@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- A setup boost for cells. `burst_until_ready` on a cell spec, `hivectl create --boost`, gives the cell `[density] setup_boost` (default 4) times its CPU quota until the caller marks it ready with `UpdatePolicy` (`hivectl ready`, `Cell.ready()`) or the boost runs out. On server3 at load 85, a stdlib compile with four workers in a half core cell went from a median of 9.5 s to 4.6 s with it. `UpdatePolicy` is served for `ready` only so far.
+
 ## 0.0.20
 
 Core scheduling cookies per CPU class, and `Qos` in the SDK so the cpu-qos bench can set a cell's class.

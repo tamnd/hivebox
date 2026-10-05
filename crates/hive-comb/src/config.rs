@@ -63,6 +63,9 @@ pub struct Config {
     /// Gives each CPU class a core scheduling cookie of its own, so the two threads of a core never
     /// run cells of different classes at once. It does nothing on a host without SMT.
     pub core_scheduling: bool,
+    /// A cell that asks for a setup boost runs on this many times its CPU quota until it is ready
+    /// or its boost runs out. One or zero turns the boost off.
+    pub setup_boost: u32,
     /// Where the local API listens.
     pub api_socket: PathBuf,
     /// Where gates reach the API over TCP, if anywhere. Whoever can connect is trusted the way
@@ -227,6 +230,7 @@ impl Default for Config {
             psi_source: None,
             pressure_idle: Duration::from_secs(30),
             core_scheduling: true,
+            setup_boost: 4,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             listen: None,
             metrics: None,
@@ -261,6 +265,7 @@ impl Config {
     /// psi_stop_admit = 0.20
     /// pressure_idle = "30s"
     /// core_scheduling = true
+    /// setup_boost = 4
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -351,6 +356,7 @@ impl Config {
             })?;
         }
         set(&mut c.core_scheduling, file.density.core_scheduling);
+        set(&mut c.setup_boost, file.density.setup_boost);
         let l = file.lifecycle;
         for (field, value, name) in [
             (&mut c.create_deadline, l.create_deadline, "create_deadline"),
@@ -576,6 +582,7 @@ struct DensityFile {
     psi_source: Option<PathBuf>,
     pressure_idle: Option<String>,
     core_scheduling: Option<bool>,
+    setup_boost: Option<u32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -620,6 +627,7 @@ mod tests {
         assert_eq!(c.psi_source, None);
         assert_eq!(c.pressure_idle, Duration::from_secs(30));
         assert!(c.core_scheduling);
+        assert_eq!(c.setup_boost, 4);
     }
 
     #[test]
@@ -651,6 +659,7 @@ mod tests {
             psi_source = "/proc/pressure/memory"
             pressure_idle = "2m"
             core_scheduling = false
+            setup_boost = 8
 
             [lifecycle]
             create_deadline = "5s"
@@ -690,6 +699,7 @@ mod tests {
         assert_eq!(c.psi_source, Some(PathBuf::from("/proc/pressure/memory")));
         assert_eq!(c.pressure_idle, Duration::from_secs(120));
         assert!(!c.core_scheduling);
+        assert_eq!(c.setup_boost, 8);
         assert_eq!(c.create_deadline, Duration::from_secs(5));
         assert_eq!(c.stop_grace, Duration::from_millis(250));
         assert_eq!(c.keep_ended, Duration::from_secs(600));

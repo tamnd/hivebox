@@ -17,9 +17,11 @@ usage: hivectl [--socket PATH | --endpoint URL] [--project NAME] COMMAND
 Cells:
   create IMAGE [-n COUNT] [-l KEY=VALUE]... [--mem MIB] [--cpu MILLICORES]
          [--net PROFILE] [--ttl DURATION] [--idle DURATION] [--on-idle pause|stop] [--key KEY]
+         [--boost DURATION]
   ls [-l KEY=VALUE]... [--state STATE]...
   get ID
   extend ID [--ttl DURATION] [--idle DURATION]     the TTL counts from now
+  ready ID                                         ends the setup boost
   pause|resume|stop ID... | -l KEY=VALUE...
   watch [ID | -l KEY=VALUE...]
 
@@ -150,6 +152,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "ls" => ls(&client, &args).await,
         "get" => get(&client, &args).await,
         "extend" => extend(&client, &args).await,
+        "ready" => ready(&client, &args).await,
         "pause" | "resume" | "stop" => bulk(&client, &command, &args).await,
         "watch" => watch(&client, &args).await,
         "run" => run(&client, &args).await,
@@ -183,6 +186,7 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
         "--idle",
         "--on-idle",
         "--key",
+        "--boost",
     ])?;
     let [image] = exactly(args, 1, "an image")? else { unreachable!() };
     let mut spec = CellSpec::new(Source::Image(image.clone()), Backend::Container);
@@ -201,6 +205,7 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
     }
     spec.hard_ttl = args.one(&["--ttl"]).map(duration).transpose()?;
     spec.idle_ttl = args.one(&["--idle"]).map(duration).transpose()?;
+    spec.burst_until_ready = args.one(&["--boost"]).map(duration).transpose()?;
     spec.idle_action = match args.one(&["--on-idle"]) {
         None | Some("pause") => IdleAction::Pause,
         Some("stop") => IdleAction::Stop,
@@ -260,6 +265,13 @@ async fn extend(client: &Client, args: &Args) -> Result<i32, String> {
         return Err("extend needs --ttl or --idle".into());
     }
     client.extend_ttl(id, hard, idle).await.map_err(err)?;
+    Ok(0)
+}
+
+async fn ready(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&[])?;
+    let [id] = exactly(args, 1, "a cell id")? else { unreachable!() };
+    client.ready(id).await.map_err(err)?;
     Ok(0)
 }
 

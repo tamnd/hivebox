@@ -267,6 +267,18 @@ impl Client {
         Ok(Cell::new(self.clone(), c))
     }
 
+    /// Tells the node the cell's setup is done, so its setup boost ends and it drops to its steady
+    /// CPU quota. A cell without a boost is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// The cell is not found or has ended.
+    pub async fn ready(&self, id: &str) -> Result<Cell, Error> {
+        let r = v1::UpdatePolicyRequest { id: id.to_string(), ready: true, ..Default::default() };
+        let c = self.cells().update_policy(self.req(r)).await.map_err(from_status)?.into_inner();
+        Ok(Cell::new(self.clone(), c))
+    }
+
     /// The changes of state of what `sel` picks, starting with each cell's current state. A
     /// watch by id ends once the cell has ended.
     ///
@@ -446,6 +458,16 @@ impl Cell {
     /// The cell has ended.
     pub async fn extend(&mut self, hard: Duration) -> Result<(), Error> {
         self.info = self.client.extend_ttl(&self.info.id, Some(hard), None).await?.info;
+        Ok(())
+    }
+
+    /// Ends the cell's setup boost, once whatever it installs or builds first is done.
+    ///
+    /// # Errors
+    ///
+    /// The cell has ended.
+    pub async fn ready(&mut self) -> Result<(), Error> {
+        self.info = self.client.ready(&self.info.id).await?.info;
         Ok(())
     }
 

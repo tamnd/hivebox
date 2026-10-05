@@ -255,6 +255,11 @@ pub struct CellSpec {
     pub limits: Limits,
     /// False means a container runs inside a shield VM.
     pub trusted_image: bool,
+    /// How long from its start the cell may run on the node's setup boost, a higher CPU quota for
+    /// the install and build before the real work. Marking the cell ready ends it sooner. `None`
+    /// means no boost.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub burst_until_ready: Option<Duration>,
 }
 
 impl CellSpec {
@@ -274,6 +279,7 @@ impl CellSpec {
             env: BTreeMap::new(),
             limits: Limits::default(),
             trusted_image: false,
+            burst_until_ready: None,
         }
     }
 
@@ -300,9 +306,15 @@ impl CellSpec {
         if !is_name(&self.network_profile) {
             return Err(SpecError::NetworkProfile);
         }
+        if self.burst_until_ready.is_some_and(|d| d.is_zero() || d > MAX_BOOST) {
+            return Err(SpecError::Boost);
+        }
         Ok(())
     }
 }
+
+/// Longest setup boost a cell may ask for. Setup that takes longer is the real work.
+pub const MAX_BOOST: Duration = Duration::from_secs(3600);
 
 /// Most labels on one cell. Labels are indexed on every node, so they are not free.
 pub const MAX_LABELS: usize = 64;
@@ -330,6 +342,8 @@ pub enum SpecError {
     Limits,
     /// A network profile name that is not a short name.
     NetworkProfile,
+    /// A setup boost of zero or longer than [`MAX_BOOST`].
+    Boost,
 }
 
 impl fmt::Display for SpecError {
@@ -341,6 +355,9 @@ impl fmt::Display for SpecError {
             Self::Env(k) => write!(f, "environment variable {k:?} cannot be set"),
             Self::Limits => f.write_str("output and wall time limits must be above zero"),
             Self::NetworkProfile => f.write_str("the network profile is not a valid name"),
+            Self::Boost => {
+                write!(f, "burst_until_ready must be above zero and at most {MAX_BOOST:?}")
+            }
         }
     }
 }
@@ -392,6 +409,17 @@ mod tests {
             s.labels.insert(format!("k{i}"), String::new());
         }
         assert_eq!(s.validate(), Err(SpecError::TooManyLabels));
+    }
+
+    #[test]
+    fn a_setup_boost_is_bounded() {
+        let mut s = spec();
+        s.burst_until_ready = Some(Duration::from_secs(120));
+        assert_eq!(s.validate(), Ok(()));
+        s.burst_until_ready = Some(Duration::ZERO);
+        assert_eq!(s.validate(), Err(SpecError::Boost));
+        s.burst_until_ready = Some(MAX_BOOST + Duration::from_secs(1));
+        assert_eq!(s.validate(), Err(SpecError::Boost));
     }
 
     #[test]

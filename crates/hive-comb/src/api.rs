@@ -447,9 +447,21 @@ impl Cells for Api {
 
     async fn update_policy(
         &self,
-        _: Request<v1::UpdatePolicyRequest>,
+        req: Request<v1::UpdatePolicyRequest>,
     ) -> Result<Response<v1::Cell>, Status> {
-        Err(Status::unimplemented("UpdatePolicy is not built yet"))
+        let project = project(&req)?;
+        let req = req.into_inner();
+        if !req.network_profile.is_empty() || req.limits.is_some() {
+            return Err(Status::unimplemented(
+                "UpdatePolicy can only mark a cell ready so far, not change its network or limits",
+            ));
+        }
+        let id = parse_id(&req.id)?;
+        let mut info = self.owned(&project, id).map_err(status)?;
+        if req.ready {
+            info = self.comb.ready(id).await.map_err(status)?;
+        }
+        Ok(Response::new(cell_to_v1(&info)))
     }
 
     async fn expose_port(

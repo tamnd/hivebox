@@ -104,7 +104,8 @@ A comb in standalone mode serves Cells, Exec and Files itself, on a Unix socket 
 - `Pause`, `Resume` and `Stop` by labels pick only the cells the call can act on (running, paused and not yet ended), so `matched` counts those.
 - `Exec.Signal` reaches processes started with `Exec.Start` on the same comb. `user` is a uid or `uid:gid`.
 - `ExtendTtl` sets the hard TTL to run out a given time from now and replaces the idle TTL, leaving either alone when it is unset.
-- Not served yet: `UpdatePolicy`, `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
+- `UpdatePolicy` only takes `ready` so far, which ends the cell's setup boost. A network profile or limits in it get `UNIMPLEMENTED`.
+- Not served yet: `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
 
 ## 2. Error model
 

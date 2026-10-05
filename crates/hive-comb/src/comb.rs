@@ -548,6 +548,18 @@ impl Comb {
         Ok(cell.info())
     }
 
+    /// Ends a live cell's setup boost, so it drops to its steady CPU quota. A cell without one is
+    /// left as it is.
+    pub async fn ready(&self, id: CellId) -> Result<CellInfo, Error> {
+        let cell = self.inner.find(id)?;
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::Ready { done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        wait.await.map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        Ok(cell.info())
+    }
+
     /// The guest agent client for a running cell, for exec and file calls. A paused cell is
     /// resumed first, since a request is what wakes it, waiting at most `resume_timeout`.
     pub async fn drone(&self, id: CellId) -> Result<Client, Error> {
