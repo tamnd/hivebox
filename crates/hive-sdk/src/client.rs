@@ -8,6 +8,7 @@ use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::files_client::FilesClient;
+use hive_proto::v1::verify_client::VerifyClient;
 use hive_types::{CellSpec, Reason};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -277,6 +278,20 @@ impl Client {
         let r = v1::UpdatePolicyRequest { id: id.to_string(), ready: true, ..Default::default() };
         let c = self.cells().update_policy(self.req(r)).await.map_err(from_status)?.into_inner();
         Ok(Cell::new(self.clone(), c))
+    }
+
+    /// Checks a subject cell's changes to a git checkout in a fresh cell with no network, as
+    /// `spec/11_rl_integration.md` section 5 tells. A verdict comes back even when hivebox
+    /// failed partway, with the failure in its `error`.
+    ///
+    /// # Errors
+    ///
+    /// The request is malformed, or the subject is not found.
+    pub async fn verify(&self, req: v1::VerifyRequest) -> Result<v1::VerifyResult, Error> {
+        let mut c = VerifyClient::new(self.channel.clone())
+            .max_decoding_message_size(MAX_ANSWER)
+            .max_encoding_message_size(MAX_ANSWER);
+        Ok(c.run(self.req(req)).await.map_err(from_status)?.into_inner())
     }
 
     /// The changes of state of what `sel` picks, starting with each cell's current state. A

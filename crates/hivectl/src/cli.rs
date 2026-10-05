@@ -29,6 +29,12 @@ Commands:
   run ID [-e KEY=VALUE]... [--cwd DIR] [--timeout DURATION] [--user UID[:GID]] [-i] -- ARGV...
   sh ID SCRIPT...
 
+Verifying:
+  verify IMAGE [--subject ID] --workdir DIR [--protect GLOB]... [--file PATH=LOCAL]...
+         [--repeats N] [--timeout DURATION] [--mem MIB] [--cpu MILLICORES] -- ARGV...
+         takes the subject's changes to the git checkout in DIR, minus protected paths, and
+         runs ARGV on them in a fresh cell of IMAGE with no network
+
 Files:
   cat ID PATH
   cp SRC DST          one of them is ID:PATH, the other a local file or - for stdin or stdout
@@ -36,7 +42,7 @@ Files:
   rm ID PATH [-r]
 
 The socket is $HIVE_SOCKET, or /run/hivebox/comb.sock. The project is $HIVE_PROJECT, or local.
-Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out.
+Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out. `verify` exits 0 when every run passed, 1 when one failed, and 2 when hivebox could not tell.
 ";
 
 /// A command line split into flags and the rest.
@@ -161,6 +167,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "cp" => cp(&client, &args).await,
         "files" => files(&client, &args).await,
         "rm" => rm(&client, &args).await,
+        "verify" => verify(&client, &args).await,
         _ => Err(format!("{command} is not a command. Try hivectl help.")),
     }
 }
@@ -273,6 +280,72 @@ async fn ready(client: &Client, args: &Args) -> Result<i32, String> {
     let [id] = exactly(args, 1, "a cell id")? else { unreachable!() };
     client.ready(id).await.map_err(err)?;
     Ok(0)
+}
+
+async fn verify(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&[
+        "--subject",
+        "--workdir",
+        "--protect",
+        "--file",
+        "--repeats",
+        "--timeout",
+        "--mem",
+        "--cpu",
+    ])?;
+    let Some((image, argv)) = args.rest.split_first().filter(|(_, a)| !a.is_empty()) else {
+        return Err("verify needs an image and a command".into());
+    };
+    let number = |flag: &str| -> Result<Option<u32>, String> {
+        args.one(&[flag])
+            .map(|v| v.parse().map_err(|_| format!("{flag} {v} is not a number")))
+            .transpose()
+    };
+    let mut spec = CellSpec::new(Source::Image(image.clone()), Backend::Container);
+    spec.resources = Resources {
+        mem_mib: number("--mem")?.unwrap_or(Resources::DEFAULT.mem_mib),
+        vcpu_milli: number("--cpu")?.unwrap_or(Resources::DEFAULT.vcpu_milli),
+        ..Resources::DEFAULT
+    };
+    let mut files = std::collections::HashMap::new();
+    for (path, local) in pairs(&args.all(&["--file"]))? {
+        let data = std::fs::read(&local).map_err(|e| format!("{local}: {e}"))?;
+        files.insert(path, data.into());
+    }
+    let req = v1::VerifyRequest {
+        subject_cell_id: args.one(&["--subject"]).unwrap_or_default().to_string(),
+        verifier: Some(hive_proto::convert::spec_to_v1(&spec)),
+        argv: argv.to_vec(),
+        timeout: args
+            .one(&["--timeout"])
+            .map(duration)
+            .transpose()?
+            .map(hive_proto::convert::duration_to_v1),
+        workdir: args.one(&["--workdir"]).unwrap_or_default().to_string(),
+        protected_paths: args.all(&["--protect"]).into_iter().map(String::from).collect(),
+        files,
+        repeats: number("--repeats")?.unwrap_or(1),
+    };
+    let r = client.verify(req).await.map_err(err)?;
+    std::io::stdout().write_all(&r.output).map_err(|e| e.to_string())?;
+    let repeats = number("--repeats")?.unwrap_or(1).max(1);
+    for p in &r.tampered {
+        eprintln!("hivectl: left out a change to protected {p}");
+    }
+    let mut scores: Vec<_> = r.scores.iter().collect();
+    scores.sort_by(|a, b| a.0.cmp(b.0));
+    let scores: Vec<String> = scores.into_iter().map(|(k, v)| format!("{k}={v:.0}")).collect();
+    eprintln!("hivectl: {}", scores.join(" "));
+    if let Some(e) = &r.error {
+        eprintln!("hivectl: {}: {}", e.reason, e.message);
+        if e.is_infra_error {
+            return Ok(2);
+        }
+    }
+    let verdict = if r.passed { "passed" } else { "failed" };
+    let flaky = if r.flaky { ", flaky" } else { "" };
+    eprintln!("hivectl: {verdict}, {} of {repeats} runs{flaky}", r.runs_passed);
+    Ok(i32::from(!r.passed))
 }
 
 async fn get(client: &Client, args: &Args) -> Result<i32, String> {

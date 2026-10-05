@@ -5,24 +5,52 @@ package hivebox.v1;
 import "google/protobuf/duration.proto";
 import "hivebox/v1/types.proto";
 
-// Draft: lands with the RL integration in M2.
 service Verify {
   // Runs a verifier in a fresh cell against the changes of a subject cell, so the policy under training never sees the verifier.
   rpc Run(VerifyRequest) returns (VerifyResult);
 }
 
 message VerifyRequest {
+  // The cell whose changes are checked. Empty runs the verifier on the image as it is, which is
+  // how a gold patch or a flaky test is checked.
   string subject_cell_id = 1;
+  // The verifier cell. It gets no network, whatever the spec says.
   CellSpec verifier = 2;
+  // The command, run in `workdir`.
   repeated string argv = 3;
+  // For each run of the command. The node default when unset.
   google.protobuf.Duration timeout = 4;
+  // The git checkout the subject changed and the verifier runs in. The diff is taken against its
+  // HEAD, new files included and ignored files left out.
+  string workdir = 5;
+  // Paths, relative to `workdir`, the subject may not change, like tests/** or **/conftest.py.
+  // A star matches within one path segment and a double star any number of segments. Changes to
+  // them are left out and reported in `tampered`.
+  repeated string protected_paths = 6;
+  // Files written into the verifier cell after the changes, such as hidden tests, by path. A
+  // relative path is under `workdir`.
+  map<string, bytes> files = 7;
+  // How many times to run the command. 1 when zero.
+  uint32 repeats = 8;
 }
 
 message VerifyResult {
+  // Every run of the command exited with 0.
   bool passed = 1;
+  // The exit code of the last run, or -1 when a signal or the timeout ended it.
   int32 exit_code = 2;
+  // The end of the last run's stdout and then stderr.
   bytes output = 3;
-  // Extra numbers the verifier printed, like tests passed and failed.
+  // Extra numbers: tests passed, failed, errors and skipped as pytest's summary line has them,
+  // the diff's size, and how long each step took in milliseconds.
   map<string, double> scores = 4;
+  // Why the verification could not be done, if it could not. An infra reason means hivebox
+  // failed and the result says nothing about the subject.
   Error error = 5;
+  // The protected paths the subject changed.
+  repeated string tampered = 6;
+  // The runs did not all agree.
+  bool flaky = 7;
+  // Runs that exited with 0.
+  uint32 runs_passed = 8;
 }

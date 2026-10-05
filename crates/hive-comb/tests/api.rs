@@ -11,6 +11,7 @@ use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::files_client::FilesClient;
+use hive_proto::v1::verify_client::VerifyClient;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 
@@ -43,6 +44,10 @@ impl Served {
 
     fn files(&self) -> FilesClient<Channel> {
         FilesClient::new(self.channel.clone())
+    }
+
+    fn verify(&self) -> VerifyClient<Channel> {
+        VerifyClient::new(self.channel.clone())
     }
 }
 
@@ -447,6 +452,120 @@ async fn files_are_written_read_listed_watched_and_removed() {
     rm.recursive = true;
     files.remove(req("p", rm)).await.unwrap();
     assert!(!dir.join("sub").exists());
+    api.stop.cancel();
+}
+
+/// Runs git in `dir` and fails the test if it fails.
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "safe.directory=*"])
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let repo = s.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("lib.py"), "x = 1\n").unwrap();
+    std::fs::write(repo.join("test_lib.py"), "assert True\n").unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let subject = create(&mut api.cells(), "p", 1, v1_spec("python", &[])).await.remove(0);
+    let base = v1::VerifyRequest {
+        subject_cell_id: subject.id.clone(),
+        verifier: Some(v1_spec("python", &[])),
+        workdir: repo.to_str().unwrap().into(),
+        // The hidden files and what the commands leave behind are in the subject's checkout too,
+        // since the fake's cells share one filesystem.
+        protected_paths: vec!["test_*.py".into(), "hidden/**".into(), "flip".into()],
+        ..Default::default()
+    };
+    let sh = |script: &str| vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()];
+    let mut verify = api.verify();
+
+    // Bad requests make nothing.
+    let e = verify.run(req("p", base.clone())).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::InvalidArgument, "no command");
+    let r = v1::VerifyRequest { argv: sh("true"), repeats: 17, ..base.clone() };
+    assert_eq!(reason(&verify.run(req("p", r)).await.unwrap_err()), Reason::InvalidArgument);
+    let r = v1::VerifyRequest { argv: sh("true"), workdir: String::new(), ..base.clone() };
+    assert_eq!(reason(&verify.run(req("p", r)).await.unwrap_err()), Reason::InvalidArgument);
+    let r = v1::VerifyRequest { argv: sh("true"), ..base.clone() };
+    assert_eq!(reason(&verify.run(req("q", r)).await.unwrap_err()), Reason::CellNotFound);
+    assert_eq!(fake.live(), 1);
+
+    // A change to a protected file is left out and reported, and hidden files land in the
+    // workdir before the command runs.
+    std::fs::write(repo.join("test_lib.py"), "assert False\n").unwrap();
+    let r = v1::VerifyRequest {
+        argv: sh("cat hidden/check.txt && echo '=== 3 passed in 0.01s ==='"),
+        files: [("hidden/check.txt".to_owned(), "ok\n".into())].into(),
+        repeats: 2,
+        ..base.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.error.is_none(), "{:?}", got.error);
+    assert!(got.passed && !got.flaky);
+    assert_eq!(got.runs_passed, 2);
+    assert_eq!(got.tampered, ["test_lib.py"]);
+    assert!(got.output.starts_with(b"ok\n"));
+    assert_eq!(got.scores["diff_bytes"], 0.0);
+    assert_eq!(got.scores["tests_passed"], 3.0);
+    for step in ["diff_ms", "create_ms", "apply_ms", "run_ms"] {
+        assert!(got.scores.contains_key(step), "{step}");
+    }
+
+    // Runs that disagree are flaky, and a verdict that is not all passes fails.
+    let r = v1::VerifyRequest {
+        argv: sh("test -e flip && exit 3; touch flip"),
+        repeats: 2,
+        ..base.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(!got.passed && got.flaky);
+    assert_eq!((got.runs_passed, got.exit_code), (1, 3));
+
+    // The fake's cells share one filesystem, so the verifier sees the subject's change already
+    // made and the diff does not apply. That is the cell's doing, not hivebox's.
+    std::fs::write(repo.join("lib.py"), "x = 2\n").unwrap();
+    let r = v1::VerifyRequest { argv: sh("true"), ..base.clone() };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    let e = got.error.unwrap();
+    assert!(!got.passed);
+    assert_eq!(e.reason, "FILE_ERROR");
+    assert!(!e.is_infra_error);
+    assert!(got.scores["diff_bytes"] > 0.0);
+
+    // So is a workdir that is not a git checkout.
+    let r = v1::VerifyRequest {
+        argv: sh("true"),
+        workdir: s.0.to_str().unwrap().into(),
+        ..base.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert_eq!(got.error.unwrap().reason, "FILE_ERROR");
+
+    // Without a subject the image is verified as it is.
+    let r = v1::VerifyRequest {
+        subject_cell_id: String::new(),
+        workdir: String::new(),
+        argv: sh("echo plain"),
+        ..base.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.passed);
+    assert_eq!(&got.output[..], b"plain\n");
+    // Every verifier cell is gone, and the subject is still there.
+    assert_eq!(fake.live(), 1);
     api.stop.cancel();
 }
 
