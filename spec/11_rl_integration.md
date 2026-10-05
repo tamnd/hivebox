@@ -29,6 +29,18 @@ pollen:
 - The worker is async by default. Trajectories stream back as they finish (AReaL, slime, and Kimi-style partial rollout), and the trainer decides how much staleness to accept.
 - The worker applies backpressure. It enforces `max_inflight_cells` per trainer to match GPU inference throughput and avoid idle sandboxes. DSec found that the rollout, not the sandbox, is usually the bottleneck.
 
+What is in now: the `hive-pollen` binary and library. It reads tasks as lines of JSON (task id, image, instruction, `n_samples`, workdir, cell size, labels, limits on turns, wall time and each command's time, the policy and the verify settings) and writes one trajectory per sample as a line of JSON as soon as the sample is done. It makes each task's sample cells in one `create_many` call, labelled with the task and given a hard TTL of the wall limit plus 15 minutes, keeps at most `--max-inflight` sample cells alive, runs the agent's commands in the workdir with `HIVE_INSTRUCTION` set, checks each sample with `Verify.Run` in a cell of its own and stops the cell. The reward is 1 when every verifier run passed and no protected path was changed, 0 otherwise, and masked when hivebox failed the sample. The only policy so far is a script of shell commands per sample, which covers an agent harness that runs inside the cell (P2) and replays of recorded turns or patches. Prefetch, an agent loop that calls a model, token counts and keeping cells paused for resampling are still to come.
+
+On server3 at a load average of 45 to 70, with two tasks of eight samples on the swe-requests-2317 image, the verifier as in §5 (a hidden test plus 32 of the task's tests, three runs), and four scripts per task that do nothing, apply the gold fix, apply it and edit `test_requests.py`, and apply a wrong fix, every one of the 48 trajectories got the right reward: 1 for the gold fix, 0 for the rest, with the edit reported as tampered. Throughput and times:
+
+| sample cells in flight | 16 samples took | trajectories a minute | create, median | verify, median |
+|---|---|---|---|---|
+| 1 | 99.9 s | 9.6 | 260 ms | 5.3 s |
+| 4 | 47.0 s | 20.4 | 496 ms | 9.9 s |
+| 8 | 34.9 s | 27.5 | 888 ms | 14.7 s |
+
+The verifier is most of each sample's time, and it slows down as more run at once on the 8 core host, so the gain from 4 to 8 is smaller than from 1 to 4.
+
 ## 3. Trainer adapters
 
 | Framework | Integration point | Notes |
