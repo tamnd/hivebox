@@ -279,6 +279,8 @@ pub fn config(dir: &Path) -> Config {
         cgroup_root: None,
         netns_dir: None,
         network: Network { guard: false, ..Network::default() },
+        // The machine's own memory pressure would hold admits on a loaded test host.
+        psi_stop_admit: 0.0,
         ..Config::default()
     }
 }

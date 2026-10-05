@@ -331,6 +331,68 @@ async fn paused_cells_are_reclaimed_then_stopped_and_ttls_extend() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn idle_cells_pause_while_the_node_is_short_of_memory() {
+    let s = Scratch::new();
+    let psi = s.0.join("memory.pressure");
+    let pressure = |avg10: f64| {
+        let text = format!(
+            "some avg10={avg10:.2} avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"
+        );
+        std::fs::write(&psi, text).unwrap();
+    };
+    pressure(0.0);
+    let fake = Arc::new(Fake::default());
+    let cfg = Config {
+        psi_stop_admit: 0.20,
+        psi_source: Some(psi.clone()),
+        pressure_idle: Duration::from_millis(500),
+        ..config(&s.0)
+    };
+    let comb = open(cfg, &fake).await;
+    let idle = comb.create(request(spec("python"))).await.unwrap().id;
+    let mut warm = spec("python");
+    warm.qos = Qos::Latency;
+    let warm = comb.create(request(warm)).await.unwrap().id;
+    let mut stops = spec("python");
+    stops.idle_action = IdleAction::Stop;
+    let stops = comb.create(request(stops)).await.unwrap().id;
+    let busy = comb.create(request(spec("python"))).await.unwrap().id;
+
+    // With no pressure an idle cell is left alone.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(comb.get(idle).unwrap().status.state, CellState::Running);
+
+    pressure(35.0);
+    let until = Instant::now() + Duration::from_secs(10);
+    while !fake.with(idle, |g| g.reclaimed) {
+        assert!(Instant::now() < until, "the idle cell was not paused and reclaimed");
+        echo(&comb, busy, "busy").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(comb.get(idle).unwrap().status.state, CellState::Paused);
+    // A latency cell, a cell that would be stopped rather than paused, and a cell in use all run.
+    for id in [warm, stops, busy] {
+        assert_eq!(comb.get(id).unwrap().status.state, CellState::Running, "{id}");
+    }
+    let text = comb.metrics().registry().render();
+    assert!(text.contains("hive_pressure_pauses_total 1"), "{text}");
+    let e = comb.create(request(spec("python"))).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+
+    // Once the pressure is gone the node takes cells again, and idle ones stay running.
+    pressure(1.0);
+    let until = Instant::now() + Duration::from_secs(10);
+    while comb.create(request(spec("python"))).await.is_err() {
+        assert!(Instant::now() < until, "admits never came back");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(echo(&comb, idle, "awake").await, "awake\n");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(comb.get(idle).unwrap().status.state, CellState::Running);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pause_and_resume_by_hand() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());

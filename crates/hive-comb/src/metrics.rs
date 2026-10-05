@@ -24,6 +24,7 @@ pub struct Metrics {
     exec_seconds: HistogramVec,
     stall: GaugeVec,
     reclaimed: CounterVec,
+    squeezed: CounterVec,
 }
 
 impl Default for Metrics {
@@ -60,6 +61,11 @@ impl Default for Metrics {
                 "Memory the pressure brake took back from best effort cells.",
                 &[],
             ),
+            squeezed: registry.counter(
+                "hive_pressure_pauses_total",
+                "Idle cells the pressure brake paused.",
+                &[],
+            ),
             registry,
         }
     }
@@ -94,6 +100,10 @@ impl Metrics {
 
     pub(crate) fn reclaimed(&self, bytes: u64) {
         self.reclaimed.with(&[]).add(bytes);
+    }
+
+    pub(crate) fn squeezed(&self) {
+        self.squeezed.with(&[]).inc();
     }
 }
 

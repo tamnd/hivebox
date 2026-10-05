@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- While the memory pressure brake is on, the comb pauses cells that have been idle for 30 s and reclaims paused cells' memory at once instead of after 10 minutes. Latency cells and cells whose idle action is to stop are left running. The wait is `density.pressure_idle`, and `density.psi_source` names the pressure file the brake reads.
+
 ## 0.0.18
 
 The first two pieces of M2: a memory pressure brake on the comb, and a userfaultfd page server with trace prefetch.
