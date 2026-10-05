@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.21
+
+A setup boost that lifts a cell's CPU quota until it is ready, and the first cut of the verifier service.
+
 - A setup boost for cells. `burst_until_ready` on a cell spec, `hivectl create --boost`, gives the cell `[density] setup_boost` (default 4) times its CPU quota until the caller marks it ready with `UpdatePolicy` (`hivectl ready`, `Cell.ready()`) or the boost runs out. On server3 at load 85, a stdlib compile with four workers in a half core cell went from a median of 9.5 s to 4.6 s with it. `UpdatePolicy` is served for `ready` only so far.
 - `Verify.Run` on the comb, `hivectl verify` and `Client.verify()`. It takes a subject cell's git diff, leaves out and reports changes to protected paths, applies the rest in a fresh cell with no network, adds hidden files and runs the tests as many times as asked. On server3 with the swe-requests-2317 image, the unfixed subject failed, the gold fix passed and edits to protected test files were caught, at a median of 6.1 s per verify for three test runs.
 
