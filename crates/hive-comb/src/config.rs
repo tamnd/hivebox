@@ -53,6 +53,13 @@ pub struct Config {
     /// The share of the last ten seconds cells may stall on memory before the node takes no new
     /// ones, from 0 to 1. Admits come back under half of it. 0 turns the brake off.
     pub psi_stop_admit: f64,
+    /// The pressure file the brake reads. `None` reads `memory.pressure` of `cgroup_root`, which
+    /// counts only cells, or the machine's `/proc/pressure/memory` when there is no cgroup root.
+    pub psi_source: Option<PathBuf>,
+    /// While the brake is on, a running cell idle this long is paused, if its idle action is to
+    /// pause and it is not in the latency class, and paused cells have their memory reclaimed at
+    /// once instead of after `reclaim_after`. Zero leaves cells alone.
+    pub pressure_idle: Duration,
     /// Where the local API listens.
     pub api_socket: PathBuf,
     /// Where gates reach the API over TCP, if anywhere. Whoever can connect is trusted the way
@@ -214,6 +221,8 @@ impl Default for Config {
             netns_dir: Some(PathBuf::from("/run/hivebox/netns")),
             netns_depth: 400,
             psi_stop_admit: 0.20,
+            psi_source: None,
+            pressure_idle: Duration::from_secs(30),
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             listen: None,
             metrics: None,
@@ -246,6 +255,7 @@ impl Config {
     ///
     /// [density]
     /// psi_stop_admit = 0.20
+    /// pressure_idle = "30s"
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -326,6 +336,14 @@ impl Config {
                 return Err(format!("density.psi_stop_admit = {v} is not a share from 0 to 1"));
             }
             c.psi_stop_admit = v;
+        }
+        if let Some(path) = file.density.psi_source {
+            c.psi_source = (!path.as_os_str().is_empty()).then_some(path);
+        }
+        if let Some(v) = file.density.pressure_idle {
+            c.pressure_idle = duration(&v).ok_or_else(|| {
+                format!("density.pressure_idle = {v:?} is not a duration like 500ms, 30s or 10m")
+            })?;
         }
         let l = file.lifecycle;
         for (field, value, name) in [
@@ -549,6 +567,8 @@ struct PoolsFile {
 #[serde(default, deny_unknown_fields)]
 struct DensityFile {
     psi_stop_admit: Option<f64>,
+    psi_source: Option<PathBuf>,
+    pressure_idle: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -590,6 +610,8 @@ mod tests {
         assert_eq!(c.data_dir, Config::default().data_dir);
         assert_eq!(c.netns_depth, 400);
         assert!((c.psi_stop_admit - 0.20).abs() < 1e-9);
+        assert_eq!(c.psi_source, None);
+        assert_eq!(c.pressure_idle, Duration::from_secs(30));
     }
 
     #[test]
@@ -597,6 +619,8 @@ mod tests {
         assert!(Config::from_toml("[density]\npsi_stop_admit = 0").is_ok());
         let e = Config::from_toml("[density]\npsi_stop_admit = 20").unwrap_err();
         assert!(e.contains("from 0 to 1"), "{e}");
+        let e = Config::from_toml("[density]\npressure_idle = \"soon\"").unwrap_err();
+        assert!(e.contains("density.pressure_idle"), "{e}");
     }
 
     #[test]
@@ -616,6 +640,8 @@ mod tests {
 
             [density]
             psi_stop_admit = 0.35
+            psi_source = "/proc/pressure/memory"
+            pressure_idle = "2m"
 
             [lifecycle]
             create_deadline = "5s"
@@ -652,6 +678,8 @@ mod tests {
         assert_eq!(c.netns_dir, Config::default().netns_dir);
         assert_eq!(c.netns_depth, 16);
         assert!((c.psi_stop_admit - 0.35).abs() < 1e-9);
+        assert_eq!(c.psi_source, Some(PathBuf::from("/proc/pressure/memory")));
+        assert_eq!(c.pressure_idle, Duration::from_secs(120));
         assert_eq!(c.create_deadline, Duration::from_secs(5));
         assert_eq!(c.stop_grace, Duration::from_millis(250));
         assert_eq!(c.keep_ended, Duration::from_secs(600));

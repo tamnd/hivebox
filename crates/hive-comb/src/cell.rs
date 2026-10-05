@@ -11,7 +11,7 @@ use crate::record::{Handle, Record, now_ms, time};
 use hive_cell::{CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, Slot};
 use hive_drone::Client;
 use hive_guard::wire::Veth;
-use hive_types::{Cause, CellId, CellSpec, CellState, Error, IdleAction, Reason};
+use hive_types::{Cause, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason};
 use prost::Message;
 use std::io;
 use std::path::PathBuf;
@@ -490,6 +490,7 @@ impl Actor {
 
     /// Serves a live cell until it ends.
     async fn serve(&mut self) {
+        let mut pressure = self.inner.pressure.subscribe();
         loop {
             let drone = self.cell.drone.read().unwrap_or_else(PoisonError::into_inner).clone();
             let lost = async {
@@ -538,6 +539,8 @@ impl Actor {
                         return;
                     }
                 }
+                // The brake went on or off, which moves the timers.
+                Ok(()) = pressure.changed() => {}
                 () = wake => {
                     let (_, what) = timer.expect("only wakes with a timer");
                     match what {
@@ -553,6 +556,23 @@ impl Actor {
                                 continue;
                             }
                             self.reclaim().await;
+                        }
+                        Timer::Squeeze => {
+                            if !*self.inner.pressure.borrow()
+                                || self.next_timer().is_some_and(|(at, _)| at > Instant::now())
+                            {
+                                continue;
+                            }
+                            if self.pause().await.is_ok() {
+                                self.inner.metrics.squeezed();
+                            } else {
+                                // Counts as use, so a pause that failed waits its turn again
+                                // instead of being tried in a loop.
+                                self.cell.touch();
+                            }
+                            if self.cell.state().is_terminal() {
+                                return;
+                            }
                         }
                         Timer::Idle => {
                             // The cell was used while the timer slept, so it is not idle after all.
@@ -581,20 +601,35 @@ impl Actor {
         let ttls = self.cell.ttls();
         let hard = ttls.hard.map(|ttl| (at(self.cell.created + ttl), Timer::Hard));
         let cfg = &self.inner.cfg;
-        let (idle, reclaim, pause_ttl) = match (self.cell.state(), ttls.idle) {
-            (CellState::Running, Some(ttl)) => {
+        let pressed = *self.inner.pressure.borrow();
+        let (idle, squeeze, reclaim, pause_ttl) = match self.cell.state() {
+            CellState::Running => {
                 let last = time(self.cell.last_active_ms.load(Ordering::Relaxed));
-                (Some((at(last + ttl), Timer::Idle)), None, None)
+                let idle = ttls.idle.map(|ttl| (at(last + ttl), Timer::Idle));
+                // Under pressure an idle cell is paused early, but only one a request would
+                // resume anyway, and never a latency cell, which pays for being kept warm.
+                let squeeze = (pressed
+                    && !cfg.pressure_idle.is_zero()
+                    && self.cell.spec.idle_action == IdleAction::Pause
+                    && self.cell.spec.qos != Qos::Latency
+                    && self.driver.caps().pause)
+                    .then(|| (at(last + cfg.pressure_idle), Timer::Squeeze));
+                (idle, squeeze, None, None)
             }
-            (CellState::Paused, _) => {
+            CellState::Paused => {
                 let since = self.cell.status.borrow().changed;
+                let wait = if pressed && !cfg.pressure_idle.is_zero() {
+                    Duration::ZERO
+                } else {
+                    cfg.reclaim_after
+                };
                 let reclaim = (!self.reclaimed && self.driver.caps().pause)
-                    .then(|| (at(since + cfg.reclaim_after), Timer::Reclaim));
-                (None, reclaim, Some((at(since + cfg.pause_ttl), Timer::PauseTtl)))
+                    .then(|| (at(since + wait), Timer::Reclaim));
+                (None, None, reclaim, Some((at(since + cfg.pause_ttl), Timer::PauseTtl)))
             }
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         };
-        [hard, idle, reclaim, pause_ttl].into_iter().flatten().min_by_key(|(at, _)| *at)
+        [hard, idle, squeeze, reclaim, pause_ttl].into_iter().flatten().min_by_key(|(at, _)| *at)
     }
 
     /// Swaps a paused cell's memory out. A failed reclaim leaves the cell frozen as it was, and is
@@ -835,6 +870,8 @@ impl Actor {
 enum Timer {
     Hard,
     Idle,
+    /// Idle for `pressure_idle` while the brake is on.
+    Squeeze,
     Reclaim,
     PauseTtl,
 }

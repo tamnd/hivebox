@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 const SHARDS: usize = 64;
@@ -88,6 +88,8 @@ pub(crate) struct Inner {
     pub(crate) netns: Option<Arc<Namespaces>>,
     images: Option<Nectar>,
     pub(crate) metrics: Metrics,
+    /// Whether the pressure brake is on, which pauses idle cells and reclaims paused ones early.
+    pub(crate) pressure: watch::Sender<bool>,
     pub(crate) shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
     idem: Mutex<HashMap<(String, String), CellId>>,
     turned: Mutex<Turned>,
@@ -204,6 +206,7 @@ impl Comb {
             netns,
             images,
             metrics: Metrics::default(),
+            pressure: watch::Sender::new(false),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
             turned: Mutex::default(),
@@ -241,10 +244,17 @@ impl Comb {
         }
         let inner = &comb.inner;
         if inner.cfg.psi_stop_admit > 0.0 {
-            let brake =
-                Brake::new(inner.cfg.cgroup_root.as_deref(), inner.cfg.psi_stop_admit * 100.0);
-            let metrics = inner.metrics.clone();
-            tokio::spawn(brake.run(inner.admission.clone(), metrics, inner.shutdown.clone()));
+            let brake = Brake::new(
+                inner.cfg.psi_source.as_deref(),
+                inner.cfg.cgroup_root.as_deref(),
+                inner.cfg.psi_stop_admit * 100.0,
+            );
+            tokio::spawn(brake.run(
+                inner.admission.clone(),
+                inner.pressure.clone(),
+                inner.metrics.clone(),
+                inner.shutdown.clone(),
+            ));
         }
         Ok(comb)
     }

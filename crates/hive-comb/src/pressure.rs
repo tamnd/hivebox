@@ -6,10 +6,14 @@
 //! effort slice, so the cells already running get the memory and not newcomers. Admits come back
 //! once the stall falls under half the limit, so a node sitting near the line does not flap.
 //!
+//! While the brake is on, each cell's actor also pauses its cell once it has been idle for
+//! `pressure_idle`, and reclaims a paused cell's memory at once. That part lives with the cell's
+//! other timers in `cell.rs`, and the brake only tells it through a watch.
+//!
 //! With cgroups on, the brake reads `memory.pressure` of the comb's own root, which only counts
 //! stalls of cells. A host can be short of memory because of something else while the cells barely
 //! notice, and then there is nothing to brake for. Without cgroups it reads the whole machine's
-//! `/proc/pressure/memory`.
+//! `/proc/pressure/memory`. `psi_source` in the config names another file.
 
 use crate::admit::Admission;
 use crate::metrics::Metrics;
@@ -17,6 +21,7 @@ use hive_cell::cgroup;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// How often the brake looks. The kernel updates `avg10` every two seconds.
@@ -35,25 +40,23 @@ pub(crate) struct Brake {
 }
 
 impl Brake {
-    /// A brake that goes on past `limit` percent, reading the cells' pressure under `cgroup_root`
-    /// or the machine's when there is none.
-    pub(crate) fn new(cgroup_root: Option<&Path>, limit: f64) -> Self {
-        match cgroup_root {
-            Some(root) => Self {
-                source: root.join("memory.pressure"),
-                besteffort: Some(root.join("besteffort.slice")),
-                limit,
-            },
-            None => {
-                Self { source: PathBuf::from("/proc/pressure/memory"), besteffort: None, limit }
-            }
-        }
+    /// A brake that goes on past `limit` percent. It reads `source`, or with none the cells'
+    /// pressure under `cgroup_root`, or the machine's when there is no root either.
+    pub(crate) fn new(source: Option<&Path>, cgroup_root: Option<&Path>, limit: f64) -> Self {
+        let source = match (source, cgroup_root) {
+            (Some(s), _) => s.to_path_buf(),
+            (None, Some(root)) => root.join("memory.pressure"),
+            (None, None) => PathBuf::from("/proc/pressure/memory"),
+        };
+        Self { source, besteffort: cgroup_root.map(|r| r.join("besteffort.slice")), limit }
     }
 
-    /// Looks every second until `stop`, holding admits in `admission` while the brake is on.
+    /// Looks every second until `stop`, holding admits in `admission` while the brake is on and
+    /// saying whether it is in `pressure`.
     pub(crate) async fn run(
         self,
         admission: Arc<Admission>,
+        pressure: watch::Sender<bool>,
         metrics: Metrics,
         stop: CancellationToken,
     ) {
@@ -80,6 +83,7 @@ impl Brake {
             on = next(on, avg10, self.limit);
             if on != was {
                 admission.hold(on);
+                pressure.send_replace(on);
                 let what = if on { "takes no new cells" } else { "takes new cells again" };
                 eprintln!(
                     "hive-comb: cells stalled on memory {avg10:.1}% of the last 10 s, the node {what}"
@@ -170,7 +174,14 @@ mod tests {
         let brake = Brake { source: file.clone(), besteffort: None, limit: 20.0 };
         let stop = CancellationToken::new();
         let metrics = Metrics::default();
-        let task = tokio::spawn(brake.run(admission.clone(), metrics.clone(), stop.clone()));
+        let pressure = watch::Sender::new(false);
+        let mut told = pressure.subscribe();
+        let task = tokio::spawn(brake.run(
+            admission.clone(),
+            pressure.clone(),
+            metrics.clone(),
+            stop.clone(),
+        ));
         let spec = CellSpec::new(Source::Image("x".into()), Backend::Container);
         let wait_for = async |held: bool| {
             for _ in 0..50 {
@@ -184,6 +195,7 @@ mod tests {
         let before = admission.reserve(&spec).unwrap();
         std::fs::write(&file, stalled(35.0)).unwrap();
         wait_for(true).await;
+        assert!(*told.borrow_and_update(), "the cells are told too");
         let e = admission.reserve(&spec).unwrap_err();
         assert_eq!(e.reason, Reason::CapacityUnavailable);
         assert!(e.message.contains("stalling on memory"), "{e}");
@@ -194,6 +206,7 @@ mod tests {
         assert!(admission.held(), "10% is half the limit, which still holds");
         std::fs::write(&file, stalled(4.0)).unwrap();
         wait_for(false).await;
+        assert!(!*told.borrow_and_update());
         drop(before);
         admission.reserve(&spec).unwrap();
         let text = metrics.registry().render();
@@ -216,8 +229,10 @@ mod tests {
         let admission =
             Arc::new(Admission::new(1 << 36, 100, &BTreeMap::from([(Backend::Container, 2)])));
         let stop = CancellationToken::new();
-        let brake = Brake::new(Some(&tree.0), 20.0);
-        let task = tokio::spawn(brake.run(admission.clone(), Metrics::default(), stop.clone()));
+        let brake = Brake::new(None, Some(&tree.0), 20.0);
+        let pressure = watch::Sender::new(false);
+        let task =
+            tokio::spawn(brake.run(admission.clone(), pressure, Metrics::default(), stop.clone()));
         let started = std::time::Instant::now();
         let mut hog = std::process::Command::new("sh")
             .arg("-c")

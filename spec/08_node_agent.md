@@ -72,6 +72,8 @@ Inputs are per-cell `memory.stat`, PSI (`memory.pressure`), node MemAvailable an
 
 The emergency brake reads `memory.pressure` of the comb's cgroup root, so it counts only stalls of cells, and falls back to `/proc/pressure/memory` when the comb runs without cgroups. It looks once a second, and while it is on it asks for an eighth of the best effort slice's memory back through `memory.reclaim` on every look. Admits come back once `some avg10` falls under half the limit, so a node near the line does not flap. While admits are held, the comb's NodeReport gives its committed memory as `mem_admit_mib`, so waggle sees no room on it.
 
+While the brake is on, a running cell idle for `pressure_idle` (30 s by default) is paused, and a paused cell's memory is reclaimed at once instead of after `reclaim_after`. Only cells whose idle action is to pause are paused this way, since a request resumes them anyway, and latency cells are never paused for pressure. Snapshot-kill under pressure is not in yet.
+
 OOM policy: each cell has `memory.max` and `memory.oom.group=1`. Comb sets `oom_score_adj` so best-effort cells die first. An OOM moves the cell to `STOPPED(oom)`, which is not an infra error.
 
 ## 6. CPU QoS
