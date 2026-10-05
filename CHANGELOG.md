@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.18
+
+The first two pieces of M2: a memory pressure brake on the comb, and a userfaultfd page server with trace prefetch.
+
 - `hive-uffd` serves a restored VM's memory. It takes Firecracker's region list and userfaultfd over a socket, answers faults from the snapshot's memory file, gives zero pages for memory the guest gave back, and records the order pages were first touched. Later restores prefetch that trace before the VM asks, in copies of up to 2 MiB. `examples/restore.rs` measures it.
 - The comb has a memory pressure brake. Once its cells stall on memory more than 20% of the last ten seconds (`some avg10` in the cgroup's `memory.pressure`), it takes no new cells, tells scout it has no room, and asks the kernel for an eighth of the best effort slice's memory back every second. Admits come back once the stall falls under 10%. The limit is `density.psi_stop_admit`, and 0 turns the brake off. Pausing idle cells under pressure is not in yet.
 
