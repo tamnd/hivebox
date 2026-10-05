@@ -90,6 +90,7 @@ OOM policy: each cell has `memory.max` and `memory.oom.group=1`. Comb sets `oom_
 - On SMT hosts, core scheduling (`PR_SCHED_CORE`) is applied per trust domain. Untrusted containers get cookies per project, so sibling threads never co-run different tenants. This also removes cross-HT side channels. DSec reduced latency inflation from 45.2% to 17.3% with SCHED_IDLE plus core scheduling.
 - microVM vCPU threads are placed in the cell cgroup. VMM and IO threads go in the same cgroup so they are accounted.
 - An optional `sched_ext` policy (v2) can do burst-aware scheduling.
+- What is in now: the comb makes one core scheduling cookie per class at start, each held by a thread of its own, and pushes the class's cookie to every process in a new cell's cgroup right after the backend starts it and before the drone answers. What the cell starts later inherits it. The kernel refuses cookies on a host without SMT, and the comb then logs that and runs without them. `[density] core_scheduling = false` turns it off. Cookies per project for untrusted containers wait for the shield VM work.
 
 ## 7. Disk and I/O limits
 

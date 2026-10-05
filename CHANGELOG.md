@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- On a host with SMT, the comb gives every cell a core scheduling cookie for its CPU class, so the two threads of a core never run a latency cell next to a best effort one. On a host without SMT it says so at start and runs as before. The SDK now exports `Qos` and `IdleAction`, so callers can set a cell's class.
+
 ## 0.0.19
 
 Two more pieces of M2: the pressure brake now pauses and reclaims idle cells, and traced layers can be relaid so a lazy mount fetches the trace in a few long reads.
