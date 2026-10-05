@@ -28,6 +28,16 @@ pub struct LayerRef {
     /// a blob of little endian `u32` chunk numbers. A lazy mount fills these first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_trace: Option<BlobId>,
+    /// A copy of the data blob with the traced chunks first, in the order the trace read them,
+    /// and the rest after them in order, so a lazy mount fetches what a run reads first in a few
+    /// long reads. [`crate::relayout`] makes it. The data blob stays as it was, and is what a
+    /// whole fetch gets and what the cache keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_relaid: Option<BlobId>,
+    /// Which chunk of the data blob each chunk of `data_relaid` is, as a blob of little endian
+    /// `u32` chunk numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_order: Option<BlobId>,
     /// The OCI digest of the uncompressed tar it came from, when it came from one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_id: Option<String>,

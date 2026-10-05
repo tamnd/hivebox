@@ -110,6 +110,7 @@ pub trait BlobStore: Send + Sync + 'static {
 
 - On the first successful run of an image (or during `hive-imaged verify`), record the ordered chunk-access list from the filler demand log.
 - `hive-imaged relayout` rewrites the data blob so trace chunks are contiguous in first-access order. Prefetch then becomes 1-3 large sequential 3FS reads. DADI reports that trace-replay prefetch removes ~95% of the cold/warm gap.
+- What is in now: `hive-nectar relayout IMAGE` (the command will move to `hive-imaged`) stores, for each traced layer, a copy of the data blob with the traced chunks first in trace order and every other chunk after them in order, plus the order itself as a list of the original chunk each copy chunk holds. The short last chunk is padded to a whole chunk in the copy so it can move with the trace. The original data blob stays, so whole mode and older nodes are unchanged. A lazy mount fetches long runs from the copy, checks each chunk against the original leaves and writes it at its own offset, so the cache still ends up holding the original blob. Setting a new trace drops the copy, and running relayout again skips layers that already have one.
 - The trace is stored as `TraceRef` in the manifest. The node issues it as one batched `read_vectored` at admit time, before the runtime boots.
 
 ## 6. Rootfs assembly per backend

@@ -23,7 +23,7 @@ use tokio::sync::OnceCell;
 
 use crate::lazy::Progress;
 use crate::store::blocking;
-use crate::{BlobId, BlobStore, Cache, Held, LayerRef, Lazy, Manifest};
+use crate::{BlobId, BlobStore, Cache, Held, LayerRef, Lazy, Manifest, Relaid};
 
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags, fsconfig_create,
@@ -448,23 +448,41 @@ impl Layers {
             .clone();
         let got = cell
             .get_or_try_init(|| async {
-                let meta = self.cache.get(&**store, layer.meta).await?;
+                // A relaid copy's order comes in alongside the metadata. Without one, or if it
+                // cannot be read, the data is filled from the data blob itself.
+                let relaid = async {
+                    let (Some(blob), Some(order)) = (layer.data_relaid, layer.data_order) else {
+                        return None;
+                    };
+                    if !self.lazy || layer.data_size == 0 {
+                        return None;
+                    }
+                    let order = crate::trace::load(&**store, order).await.ok()?;
+                    Some(Relaid { blob, order })
+                };
+                let (meta, relaid) = tokio::join!(self.cache.get(&**store, layer.meta), relaid);
+                let meta = meta?;
                 let data = match layer.data_leaves {
                     _ if layer.data_size == 0 => Data::None,
                     Some(leaves) if self.lazy => {
+                        let first = relaid.as_ref().map(|r| r.order.clone());
                         let lazy = self
                             .cache
-                            .lazy(store.clone(), layer.data, layer.data_size, leaves)
+                            .lazy_from(store.clone(), layer.data, layer.data_size, leaves, relaid)
                             .await?;
                         let device = hive_blockd::Device::attach(Arc::new(lazy.clone())).await?;
                         let (filler, from, trace) = (lazy.clone(), store.clone(), layer.data_trace);
                         let fill = Filling(tokio::spawn(async move {
-                            // The trace leads the fill. Without one, or if it cannot be read, the
-                            // fill goes in order. A failed fill leaves the chunks it missed to be
-                            // fetched on demand.
-                            let first = match trace {
-                                Some(t) => crate::trace::load(&*from, t).await.unwrap_or_default(),
-                                None => Vec::new(),
+                            // A relaid copy is filled in its own order. Otherwise the trace leads
+                            // the fill, and without one, or if it cannot be read, the fill goes in
+                            // order. A failed fill leaves the chunks it missed to be fetched on
+                            // demand.
+                            let first = match (first, trace) {
+                                (Some(order), _) => order,
+                                (None, Some(t)) => {
+                                    crate::trace::load(&*from, t).await.unwrap_or_default()
+                                }
+                                (None, None) => Vec::new(),
                             };
                             let _ = filler.fill_rest(&first).await;
                         }));
