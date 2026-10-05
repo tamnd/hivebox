@@ -95,7 +95,7 @@ message RunResult    { int32 exit_code = 1; bytes stdout = 2; bytes stderr = 3; 
 
 ### 1.2 Local API
 
-A comb in standalone mode serves Cells, Exec and Files itself, on a Unix socket (`/run/hivebox/comb.sock` by default, mode 0600), so one node is usable with no gate in front of it. The calls and messages are the same as through a gate, with these differences:
+A comb in standalone mode serves Cells, Exec, Files and Verify itself, on a Unix socket (`/run/hivebox/comb.sock` by default, mode 0600), so one node is usable with no gate in front of it. The calls and messages are the same as through a gate, with these differences:
 
 - There is no auth. Whoever can open the socket is trusted, the same as with the Docker socket. The caller names its project in the `x-hive-project` header, `local` when it names none, and sees only that project's cells.
 - Files goes to the drone in the cell. `Diff` and `Apply` with a patch are not served yet, and `Apply` with a tar unpacks it under the path it names.
@@ -105,6 +105,7 @@ A comb in standalone mode serves Cells, Exec and Files itself, on a Unix socket 
 - `Exec.Signal` reaches processes started with `Exec.Start` on the same comb. `user` is a uid or `uid:gid`.
 - `ExtendTtl` sets the hard TTL to run out a given time from now and replaces the idle TTL, leaving either alone when it is unset.
 - `UpdatePolicy` only takes `ready` so far, which ends the cell's setup boost. A network profile or limits in it get `UNIMPLEMENTED`.
+- `Verify.Run` checks a subject cell's changes in a new cell on the same comb, as section 5 of `11_rl_integration.md` tells. The gate does not route it yet.
 - Not served yet: `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
 
 ## 2. Error model
