@@ -1474,6 +1474,11 @@ dependencies = [
 [[package]]
 name = "hive-uffd"
 version = "0.0.17"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hive-waggle"
