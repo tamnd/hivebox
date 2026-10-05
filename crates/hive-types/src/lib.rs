@@ -14,6 +14,7 @@ mod state;
 pub use error::{Cause, Code, Error, Reason};
 pub use id::{CellId, ParseCellIdError};
 pub use spec::{
-    Backend, CellSpec, IdleAction, Limits, MAX_LABELS, Qos, Resources, Source, SpecError, is_name,
+    Backend, CellSpec, IdleAction, Limits, MAX_BOOST, MAX_LABELS, Qos, Resources, Source,
+    SpecError, is_name,
 };
 pub use state::CellState;

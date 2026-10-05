@@ -183,6 +183,7 @@ pub fn spec_from_v1(mut v: v1::CellSpec) -> Result<CellSpec, Error> {
         };
     }
     spec.trusted_image = v.trusted_image;
+    spec.burst_until_ready = duration_from_v1(v.burst_until_ready, "burst_until_ready")?;
     spec.validate().map_err(|e| invalid(e.to_string()))?;
     Ok(spec)
 }
@@ -223,6 +224,7 @@ pub fn spec_to_v1(s: &CellSpec) -> v1::CellSpec {
         }),
         trusted_image: s.trusted_image,
         checkpoint: None,
+        burst_until_ready: s.burst_until_ready.map(duration_to_v1),
     }
 }
 
@@ -314,6 +316,7 @@ mod tests {
         s.env.insert("PYTHONUNBUFFERED".into(), "1".into());
         s.network_profile = "mirrors".into();
         s.trusted_image = true;
+        s.burst_until_ready = Some(Duration::from_secs(90));
         assert_eq!(spec_from_v1(spec_to_v1(&s)).unwrap(), s);
     }
 

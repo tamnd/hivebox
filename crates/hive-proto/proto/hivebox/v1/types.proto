@@ -113,6 +113,10 @@ message CellSpec {
   // False means a container runs inside a shield VM.
   bool trusted_image = 14;
   CheckpointPolicy checkpoint = 15;
+  // Runs the cell on a higher CPU quota from its start for at most this long, for the install and
+  // build that come before the real work. UpdatePolicy with ready set ends it sooner. Unset means
+  // no boost.
+  google.protobuf.Duration burst_until_ready = 16;
 }
 
 message Cell {

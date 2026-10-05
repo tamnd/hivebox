@@ -702,6 +702,51 @@ async fn cells_live_in_cgroups_of_their_own() {
     comb.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setup_boost_lifts_the_cpu_quota_until_the_cell_is_ready() {
+    let Some(tree) = Tree::new() else { return };
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let cfg = Config { cgroup_root: Some(tree.0.clone()), cgroup_depth: 4, ..config(&s.0) };
+    let comb = open(cfg.clone(), &fake).await;
+    let boosted = |d: Duration| {
+        let mut s = spec("python");
+        s.resources.vcpu_milli = 500;
+        s.burst_until_ready = Some(d);
+        s
+    };
+    let cpu_max = |leaf: &Path| std::fs::read_to_string(leaf.join("cpu.max")).unwrap();
+
+    // Four times the quota until the caller says the setup is done.
+    let a = comb.create(request(boosted(Duration::from_secs(3600)))).await.unwrap().id;
+    let leaf = cgroup_of(worker(&fake, a));
+    assert_eq!(cpu_max(&leaf).trim(), "200000 100000");
+    comb.ready(a).await.unwrap();
+    assert_eq!(cpu_max(&leaf).trim(), "50000 100000");
+    // Ready twice is fine, and a comb that starts over does not put the boost back.
+    comb.ready(a).await.unwrap();
+    comb.shutdown().await;
+    drop(comb);
+    let comb = open(cfg, &fake).await;
+    reaches(&comb, a, CellState::Running).await;
+    assert_eq!(comb.get(a).unwrap().spec.burst_until_ready, None);
+    assert_eq!(cpu_max(&leaf).trim(), "50000 100000");
+
+    // Or until the boost runs out.
+    let b = comb.create(request(boosted(Duration::from_millis(300)))).await.unwrap().id;
+    let leaf_b = cgroup_of(worker(&fake, b));
+    let until = Instant::now() + Duration::from_secs(10);
+    while cpu_max(&leaf_b).trim() != "50000 100000" {
+        assert!(Instant::now() < until, "still {}", cpu_max(&leaf_b).trim());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for id in [a, b] {
+        comb.stop(id, None).await.unwrap();
+        killed(&fake, id).await;
+    }
+    comb.shutdown().await;
+}
+
 /// The network namespace a process is in, as the inode `stat` gives for a namespace file.
 fn netns_of(pid: u32) -> u64 {
     let link = std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();

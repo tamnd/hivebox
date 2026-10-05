@@ -8,7 +8,7 @@
 use crate::admit::Reservation;
 use crate::comb::Inner;
 use crate::record::{Handle, Record, now_ms, time};
-use hive_cell::{CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, Slot};
+use hive_cell::{CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, Slot, cgroup};
 use hive_drone::Client;
 use hive_guard::wire::Veth;
 use hive_types::{Cause, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason};
@@ -75,6 +75,10 @@ pub(crate) enum Cmd {
     ExtendTtl {
         hard: Option<Duration>,
         idle: Option<Duration>,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// The setup is done, so the setup boost ends.
+    Ready {
         done: oneshot::Sender<Result<(), Error>>,
     },
 }
@@ -194,6 +198,8 @@ pub(crate) struct Actor {
     veth: Option<Veth>,
     /// Whether the paused cell's memory has been reclaimed, so the reclaim timer is done.
     reclaimed: bool,
+    /// When the setup boost ends, while the cell has one.
+    boost_until: Option<SystemTime>,
 }
 
 impl Actor {
@@ -217,6 +223,7 @@ impl Actor {
             netns: None,
             veth: None,
             reclaimed: false,
+            boost_until: None,
         }
     }
 
@@ -389,7 +396,14 @@ impl Actor {
         std::fs::create_dir_all(&dir).map_err(|e| io_error("making the cell directory", &e))?;
         let mut cgroup = PathBuf::new();
         if let Some(pool) = self.inner.cgroups.clone() {
-            let (qos, r) = (self.cell.spec.qos, self.cell.spec.resources);
+            let (qos, mut r) = (self.cell.spec.qos, self.cell.spec.resources);
+            let factor = self.inner.cfg.setup_boost;
+            if let Some(d) = self.cell.spec.burst_until_ready.filter(|_| factor > 1) {
+                // The leaf is set to the boosted quota from the start, which costs nothing over
+                // setting the steady one.
+                r.vcpu_milli = r.vcpu_milli.saturating_mul(factor);
+                self.boost_until = Some(self.cell.created + d);
+            }
             let taken = tokio::task::spawn_blocking(move || pool.take(qos, &r))
                 .await
                 .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
@@ -480,6 +494,11 @@ impl Actor {
                 return false;
             }
         }
+        // The boost is back on until its time is up. A cell whose time is up drops to its steady
+        // quota at once, in case the last comb ended before it could do that.
+        if self.cgroup.is_some() {
+            self.boost_until = self.cell.spec.burst_until_ready.map(|d| self.cell.created + d);
+        }
         if state == CellState::Paused {
             // A frozen guest agent cannot answer, so the channel waits for the resume.
             return true;
@@ -542,6 +561,9 @@ impl Actor {
                     Some(Cmd::ExtendTtl { hard, idle, done }) => {
                         let _ = done.send(self.extend_ttl(hard, idle).await);
                     }
+                    Some(Cmd::Ready { done }) => {
+                        let _ = done.send(self.ready().await);
+                    }
                     None => return,
                 },
                 () = lost => {
@@ -555,6 +577,7 @@ impl Actor {
                     let (_, what) = timer.expect("only wakes with a timer");
                     match what {
                         Timer::Hard => return self.stop(Cause::HardTtl, self.inner.cfg.stop_grace).await,
+                        Timer::Boost => self.end_boost(),
                         Timer::PauseTtl => {
                             if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
                                 continue;
@@ -639,7 +662,11 @@ impl Actor {
             }
             _ => (None, None, None, None),
         };
-        [hard, idle, squeeze, reclaim, pause_ttl].into_iter().flatten().min_by_key(|(at, _)| *at)
+        let boost = self.boost_until.map(|t| (at(t), Timer::Boost));
+        [hard, idle, squeeze, reclaim, pause_ttl, boost]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, _)| *at)
     }
 
     /// Swaps a paused cell's memory out. A failed reclaim leaves the cell frozen as it was, and is
@@ -678,6 +705,36 @@ impl Actor {
         // Counts as use, so a cell given a longer idle TTL is not paused on the old clock.
         self.cell.touch();
         Ok(())
+    }
+
+    /// Drops the cell to its steady CPU quota if it is on the setup boost.
+    fn end_boost(&mut self) {
+        if self.boost_until.take().is_none() {
+            return;
+        }
+        let Some(dir) = &self.cgroup else { return };
+        let steady = cgroup::cpu_max(self.cell.spec.resources.vcpu_milli);
+        if let Err(e) = cgroup::write(dir, "cpu.max", &steady) {
+            eprintln!("hive-comb: {} keeps its setup boost: {e}", self.cell.id);
+        }
+    }
+
+    /// Ends the setup boost and writes that down, so a comb that starts over does not put it back.
+    async fn ready(&mut self) -> Result<(), Error> {
+        let state = self.cell.state();
+        if state.is_terminal() {
+            return Err(not_running(state));
+        }
+        if self.boost_until.is_none() {
+            return Ok(());
+        }
+        self.end_boost();
+        if let Some(spec) = &mut self.record.spec {
+            spec.burst_until_ready = None;
+        }
+        let message = self.cell.status.borrow().message.clone();
+        let cause = self.cell.status.borrow().cause;
+        self.commit(state, cause, &message).await
     }
 
     /// The guest agent's connection dropped. Returns whether the cell lives on.
@@ -863,7 +920,12 @@ impl Actor {
                 () = &mut sleep => break,
                 cmd = self.rx.recv() => match cmd {
                     Some(Cmd::Stop { done, .. }) => { let _ = done.send(()); }
-                    Some(Cmd::Pause { done } | Cmd::Resume { done } | Cmd::ExtendTtl { done, .. }) => {
+                    Some(
+                        Cmd::Pause { done }
+                        | Cmd::Resume { done }
+                        | Cmd::ExtendTtl { done, .. }
+                        | Cmd::Ready { done },
+                    ) => {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     None => return,
@@ -879,6 +941,8 @@ impl Actor {
 #[derive(Clone, Copy, Debug)]
 enum Timer {
     Hard,
+    /// The setup boost is over.
+    Boost,
     Idle,
     /// Idle for `pressure_idle` while the brake is on.
     Squeeze,

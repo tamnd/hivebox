@@ -92,6 +92,8 @@ message UpdatePolicyRequest {
   string network_profile = 2;
   // Unchanged when unset.
   Limits limits = 3;
+  // Ends the setup boost now, so the cell drops to its steady CPU quota.
+  bool ready = 4;
 }
 
 message ExposePortRequest {
