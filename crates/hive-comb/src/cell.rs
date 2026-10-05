@@ -362,6 +362,16 @@ impl Actor {
         let handle = self.handle.as_mut().expect("set just above");
         driver.start(handle).await?;
         lap("start");
+        if let (Some(core), Some(cgroup)) = (&inner.core, &self.cgroup) {
+            // Before the drone answers, so nothing has run in the cell yet that could fork
+            // without the cookie.
+            if let Err(e) = core.give(self.cell.spec.qos, cgroup).await {
+                eprintln!(
+                    "hive-comb: {} runs without its core scheduling cookie: {e}",
+                    self.cell.id
+                );
+            }
+        }
         let client = tokio::select! {
             c = connect(&handle.channel, &secret, None) => c?,
             e = died(&*driver, handle) => return Err(e),

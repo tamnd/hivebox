@@ -8,4 +8,6 @@ mod client;
 
 pub use client::*;
 pub use hive_proto::v1;
-pub use hive_types::{Backend, CellId, CellSpec, CellState, Error, Reason, Resources, Source};
+pub use hive_types::{
+    Backend, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason, Resources, Source,
+};

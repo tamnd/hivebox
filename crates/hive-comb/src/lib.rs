@@ -12,6 +12,7 @@ mod cell;
 mod cgroups;
 mod comb;
 mod config;
+mod core_sched;
 pub mod lease;
 mod metrics;
 mod net;

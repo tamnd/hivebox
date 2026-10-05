@@ -60,6 +60,9 @@ pub struct Config {
     /// pause and it is not in the latency class, and paused cells have their memory reclaimed at
     /// once instead of after `reclaim_after`. Zero leaves cells alone.
     pub pressure_idle: Duration,
+    /// Gives each CPU class a core scheduling cookie of its own, so the two threads of a core never
+    /// run cells of different classes at once. It does nothing on a host without SMT.
+    pub core_scheduling: bool,
     /// Where the local API listens.
     pub api_socket: PathBuf,
     /// Where gates reach the API over TCP, if anywhere. Whoever can connect is trusted the way
@@ -223,6 +226,7 @@ impl Default for Config {
             psi_stop_admit: 0.20,
             psi_source: None,
             pressure_idle: Duration::from_secs(30),
+            core_scheduling: true,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             listen: None,
             metrics: None,
@@ -256,6 +260,7 @@ impl Config {
     /// [density]
     /// psi_stop_admit = 0.20
     /// pressure_idle = "30s"
+    /// core_scheduling = true
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -345,6 +350,7 @@ impl Config {
                 format!("density.pressure_idle = {v:?} is not a duration like 500ms, 30s or 10m")
             })?;
         }
+        set(&mut c.core_scheduling, file.density.core_scheduling);
         let l = file.lifecycle;
         for (field, value, name) in [
             (&mut c.create_deadline, l.create_deadline, "create_deadline"),
@@ -569,6 +575,7 @@ struct DensityFile {
     psi_stop_admit: Option<f64>,
     psi_source: Option<PathBuf>,
     pressure_idle: Option<String>,
+    core_scheduling: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -612,6 +619,7 @@ mod tests {
         assert!((c.psi_stop_admit - 0.20).abs() < 1e-9);
         assert_eq!(c.psi_source, None);
         assert_eq!(c.pressure_idle, Duration::from_secs(30));
+        assert!(c.core_scheduling);
     }
 
     #[test]
@@ -642,6 +650,7 @@ mod tests {
             psi_stop_admit = 0.35
             psi_source = "/proc/pressure/memory"
             pressure_idle = "2m"
+            core_scheduling = false
 
             [lifecycle]
             create_deadline = "5s"
@@ -680,6 +689,7 @@ mod tests {
         assert!((c.psi_stop_admit - 0.35).abs() < 1e-9);
         assert_eq!(c.psi_source, Some(PathBuf::from("/proc/pressure/memory")));
         assert_eq!(c.pressure_idle, Duration::from_secs(120));
+        assert!(!c.core_scheduling);
         assert_eq!(c.create_deadline, Duration::from_secs(5));
         assert_eq!(c.stop_grace, Duration::from_millis(250));
         assert_eq!(c.keep_ended, Duration::from_secs(600));

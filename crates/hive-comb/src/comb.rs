@@ -4,6 +4,7 @@ use crate::admit::{self, Admission};
 use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
+use crate::core_sched::CoreSched;
 use crate::metrics::Metrics;
 use crate::net::Net;
 use crate::netns::Namespaces;
@@ -85,6 +86,8 @@ pub(crate) struct Inner {
     pub(crate) admission: Arc<Admission>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) cgroups: Option<Arc<Cgroups>>,
+    /// The core scheduling cookies, when the host takes them and the cells have cgroups.
+    pub(crate) core: Option<CoreSched>,
     pub(crate) netns: Option<Arc<Namespaces>>,
     images: Option<Nectar>,
     pub(crate) metrics: Metrics,
@@ -177,6 +180,13 @@ impl Comb {
             })?)),
             None => None,
         };
+        let core = (cfg.core_scheduling && cgroups.is_some())
+            .then(|| {
+                CoreSched::new()
+                    .map_err(|e| eprintln!("hive-comb: cells run without core scheduling: {e}"))
+                    .ok()
+            })
+            .flatten();
         let netns = match &cfg.netns_dir {
             Some(dir) => {
                 let net = cfg.network.guard.then(|| Net::open(&cfg.network)).and_then(|n| {
@@ -203,6 +213,7 @@ impl Comb {
             admission,
             shutdown: CancellationToken::new(),
             cgroups,
+            core,
             netns,
             images,
             metrics: Metrics::default(),
