@@ -1,6 +1,6 @@
-//! The local API: the `hivebox.v1` Cells, Exec, Files, Verify and Llm services on a Unix socket, for
-//! standalone mode, where no gate sits in front of the comb, and on TCP for gates when
-//! `node.listen` is set.
+//! The local API: the `hivebox.v1` Cells, Exec, Files, Verify, Llm and Snapshots services on a Unix
+//! socket, for standalone mode, where no gate sits in front of the comb, and on TCP for gates
+//! when `node.listen` is set.
 //!
 //! Whoever can open the socket is trusted, the way whoever can open the Docker socket is. The
 //! socket is made with mode 0600, so that is root unless the operator hands it on. The TCP port
@@ -19,6 +19,7 @@ use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_server::{Exec, ExecServer};
 use hive_proto::v1::files_server::{Files, FilesServer};
 use hive_proto::v1::llm_server::LlmServer;
+use hive_proto::v1::snapshots_server::SnapshotsServer;
 use hive_proto::v1::verify_server::VerifyServer;
 use hive_types::{CellId, CellState, Error, Reason, is_name};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -36,6 +37,7 @@ use tonic::server::NamedService;
 use tonic::{Request, Response, Status, Streaming};
 
 mod llm;
+mod snapshots;
 mod verify;
 
 /// The header that names the caller's project.
@@ -137,6 +139,7 @@ struct Router {
     files: FilesServer<Api>,
     verify: VerifyServer<Api>,
     llm: LlmServer<Api>,
+    snapshots: SnapshotsServer<Api>,
 }
 
 impl Router {
@@ -146,7 +149,8 @@ impl Router {
             exec: ExecServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             files: FilesServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             verify: VerifyServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
-            llm: LlmServer::new(api),
+            llm: LlmServer::new(api.clone()),
+            snapshots: SnapshotsServer::new(api),
         }
     }
 }
@@ -175,6 +179,9 @@ where
             Some(<FilesServer<Api> as NamedService>::NAME) => Box::pin(self.files.call(req)),
             Some(<VerifyServer<Api> as NamedService>::NAME) => Box::pin(self.verify.call(req)),
             Some(<LlmServer<Api> as NamedService>::NAME) => Box::pin(self.llm.call(req)),
+            Some(<SnapshotsServer<Api> as NamedService>::NAME) => {
+                Box::pin(self.snapshots.call(req))
+            }
             _ => {
                 let status = Status::unimplemented(format!("no service at {}", req.uri().path()));
                 Box::pin(async move { Ok(status.into_http()) })

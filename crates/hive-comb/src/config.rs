@@ -195,6 +195,9 @@ pub struct Images {
     /// Whether layers are mounted before their data is in, filled as they are read. It needs the
     /// `nbd` module.
     pub lazy: bool,
+    /// The `mkfs.erofs` that builds snapshot layers, 1.7 or newer. Snapshots are off on a node
+    /// where it cannot be run.
+    pub mkfs: PathBuf,
 }
 
 impl Default for Images {
@@ -205,6 +208,7 @@ impl Default for Images {
             cache_bytes: 64 << 30,
             layers_dir: PathBuf::from("/run/hivebox/layers"),
             lazy: false,
+            mkfs: PathBuf::from("mkfs.erofs"),
         }
     }
 }
@@ -342,6 +346,7 @@ impl Config {
     /// cache_dir = "/var/lib/hivebox/cache"
     /// cache_bytes = 68719476736
     /// lazy = false
+    /// mkfs = "/usr/bin/mkfs.erofs"
     ///
     /// [scout]
     /// endpoint = "http://10.0.0.5:7410"
@@ -456,6 +461,7 @@ impl Config {
         set(&mut c.images.cache_bytes, i.cache_bytes);
         set(&mut c.images.layers_dir, i.layers_dir);
         set(&mut c.images.lazy, i.lazy);
+        set(&mut c.images.mkfs, i.mkfs);
         let w = file.network;
         set(&mut c.network.guard, w.guard);
         set(&mut c.network.pin_dir, w.pin_dir);
@@ -638,6 +644,7 @@ struct ImagesFile {
     cache_bytes: Option<u64>,
     layers_dir: Option<PathBuf>,
     lazy: Option<bool>,
+    mkfs: Option<PathBuf>,
 }
 
 #[derive(Default, Deserialize)]

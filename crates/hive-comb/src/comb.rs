@@ -15,8 +15,11 @@ use crate::wal::Wal;
 use hive_cell::{DriverRegistry, RootfsPlan, Slot};
 use hive_drone::Client;
 use hive_guard::Profile;
+use hive_nectar::cas::Cuts;
+use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
 use hive_nectar::mount::{IdMap, Layers};
-use hive_nectar::oci::load_manifest;
+use hive_nectar::oci::{Commit, Importer, Staged, load_manifest};
+use hive_nectar::upper::{Scrub, SecretsFound, Shift};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 use hive_proto::convert;
 use hive_rt::{OsRng, Rng};
@@ -24,7 +27,7 @@ use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Sou
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -103,15 +106,17 @@ pub(crate) struct Inner {
     events: broadcast::Sender<CellEvent>,
 }
 
-fn at(what: &str, path: &std::path::Path) -> impl FnOnce(io::Error) -> io::Error {
+fn at(what: &str, path: &Path) -> impl FnOnce(io::Error) -> io::Error {
     let what = format!("{what} {}", path.display());
     move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
-/// Images from a `hive-nectar` store, and the layers of them this node has mounted.
+/// Images from a `hive-nectar` store, the layers of them this node has mounted, and what builds
+/// the layers of snapshots, when `mkfs.erofs` is there.
 struct Nectar {
     store: Arc<dyn BlobStore>,
     layers: Layers,
+    importer: Option<Importer>,
 }
 
 impl std::fmt::Debug for Nectar {
@@ -143,7 +148,14 @@ impl Nectar {
         if i.lazy {
             layers = layers.lazily();
         }
-        Ok(Some(Self { store, layers }))
+        // Snapshot layers are kept as chunks, so snapshots of one cell share what they have in
+        // common in the store.
+        let importer = Mkfs::new(&i.mkfs, DEFAULT_CHUNK_SIZE)
+            .and_then(|m| Importer::new(m, cfg.data_dir.join("build")))
+            .map(|i| i.chunked(Cuts::default()))
+            .map_err(|e| eprintln!("hive-comb: snapshots are off: {e}"))
+            .ok();
+        Ok(Some(Self { store, layers, importer }))
     }
 }
 
@@ -419,7 +431,7 @@ impl Comb {
                 "pick a backend, auto is not supported yet",
             ));
         }
-        image_name(&req.spec)?;
+        source(&req.spec)?;
         inner.profile(&req.spec.network_profile)?;
         let driver = inner.drivers.get(req.spec.backend).cloned().ok_or_else(|| {
             Error::new(
@@ -577,6 +589,65 @@ impl Comb {
         }
         wait.await.map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
         Ok(cell.info())
+    }
+
+    /// Takes a disk snapshot of a live container cell. The cell is frozen while what it wrote is
+    /// read out, and thawed before that is built into a layer if it was running. Returns the
+    /// snapshot's id, which is the id of an image in the store: the cell's image with one more
+    /// layer.
+    pub async fn snapshot(&self, id: CellId, scrub: Option<Scrub>) -> Result<BlobId, Error> {
+        let cell = self.inner.find(id)?;
+        let started = Instant::now();
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::Snapshot { scrub, done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        let staged = wait
+            .await
+            .map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        let built = Instant::now();
+        let snap = self.inner.finish(staged).await?;
+        self.inner.metrics.snapshot("build", built.elapsed());
+        self.inner.metrics.snapshot("total", started.elapsed());
+        Ok(snap)
+    }
+
+    /// Names a scrubbed snapshot `name` in `project`, so the project's cells can start from it by
+    /// that name. Committing a name again moves it.
+    pub async fn commit(&self, project: &str, snapshot: BlobId, name: &str) -> Result<(), Error> {
+        let name = image_name(name)?;
+        let Some(nectar) = &self.inner.images else {
+            return Err(Error::new(Reason::PolicyDenied, "this node has no image store"));
+        };
+        let m = load_manifest(&*nectar.store, snapshot).await.map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => {
+                Error::new(Reason::InvalidArgument, format!("no snapshot {snapshot} in the store"))
+            }
+            _ => Error::new(Reason::Internal, format!("snapshot {snapshot}: {e}")),
+        })?;
+        if m.provenance.is_none_or(|p| p.scrubbed.is_none()) {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                "only a scrubbed snapshot can be committed, so take it with scrub on",
+            ));
+        }
+        let dir = self.inner.committed(project);
+        let path = dir.join(name);
+        let [a, b, c, d, e, f, g, h, ..] = random();
+        let tag = u64::from_le_bytes([a, b, c, d, e, f, g, h]);
+        let written = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)?;
+            // Written aside and moved into place, so a cell made meanwhile reads the old id or the
+            // new one, never half of one.
+            let aside = dir.join(format!(".commit.{tag:016x}"));
+            std::fs::write(&aside, format!("{snapshot}\n"))?;
+            std::fs::rename(&aside, &path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&aside);
+            })
+        })
+        .await
+        .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+        written.map_err(|e| Error::new(Reason::InvalidArgument, format!("committing {name}: {e}")))
     }
 
     /// The guest agent client for a running cell, for exec and file calls. A paused cell is
@@ -741,32 +812,54 @@ impl Inner {
         self.cfg.data_dir.join("cells").join(id.to_string())
     }
 
-    /// Where a cell's root filesystem comes from. An image or template name is looked up in
-    /// `data_dir/images`, where a directory is an unpacked root filesystem and a file holds the id
-    /// of an image in the store, whose layers are fetched and mounted the first time a cell needs
+    /// Where a cell's root filesystem comes from, and the id of its image when that is in the
+    /// store. An image or template name is looked up first in the project's committed images,
+    /// then in `data_dir/images`, where a directory is an unpacked root filesystem and a file
+    /// holds the id of an image in the store. A snapshot is the id of an image in the store. The
+    /// layers of an image from the store are fetched and mounted the first time a cell needs
     /// them.
-    pub(crate) async fn rootfs(&self, spec: &CellSpec, slot: &Slot) -> Result<RootfsPlan, Error> {
-        let name = image_name(spec)?;
-        let path = self.cfg.data_dir.join("images").join(name);
+    pub(crate) async fn rootfs(
+        &self,
+        spec: &CellSpec,
+        project: &str,
+        slot: &Slot,
+    ) -> Result<(RootfsPlan, Option<BlobId>), Error> {
         let upper = slot.dir.join("upper");
-        let missing = || Error::new(Reason::ImageUnavailable, format!("no image named {name}"));
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_dir() => return Ok(RootfsPlan { lowers: vec![path], upper }),
-            Ok(m) if m.is_file() => {}
-            _ => return Err(missing()),
-        }
+        let (what, id) = match source(spec)? {
+            Wanted::Snapshot(id) => (format!("snapshot {id}"), id),
+            Wanted::Name(name) => {
+                let mut path = self.committed(project).join(name);
+                if !path.is_file() {
+                    path = self.cfg.data_dir.join("images").join(name);
+                }
+                let missing =
+                    || Error::new(Reason::ImageUnavailable, format!("no image named {name}"));
+                match std::fs::metadata(&path) {
+                    Ok(m) if m.is_dir() => {
+                        return Ok((RootfsPlan { lowers: vec![path], upper }, None));
+                    }
+                    Ok(m) if m.is_file() => {}
+                    _ => return Err(missing()),
+                }
+                let unavailable =
+                    |e: String| Error::new(Reason::ImageUnavailable, format!("image {name}: {e}"));
+                let text = tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| unavailable(e.to_string()))?;
+                let id = text
+                    .trim()
+                    .parse()
+                    .map_err(|e: hive_nectar::BadBlobId| unavailable(e.to_string()))?;
+                (format!("image {name}"), id)
+            }
+        };
         let Some(nectar) = &self.images else {
             return Err(Error::new(
                 Reason::ImageUnavailable,
-                format!("{name} is in an image store, and this node has none set up"),
+                format!("{what} is in an image store, and this node has none set up"),
             ));
         };
-        let unavailable =
-            |e: String| Error::new(Reason::ImageUnavailable, format!("image {name}: {e}"));
-        let text =
-            tokio::fs::read_to_string(&path).await.map_err(|e| unavailable(e.to_string()))?;
-        let id: BlobId =
-            text.trim().parse().map_err(|e: hive_nectar::BadBlobId| unavailable(e.to_string()))?;
+        let unavailable = |e: String| Error::new(Reason::ImageUnavailable, format!("{what}: {e}"));
         let manifest =
             load_manifest(&*nectar.store, id).await.map_err(|e| unavailable(e.to_string()))?;
         let lowers = nectar
@@ -774,7 +867,58 @@ impl Inner {
             .mount(&nectar.store, &manifest)
             .await
             .map_err(|e| unavailable(e.to_string()))?;
-        Ok(RootfsPlan { lowers, upper })
+        Ok((RootfsPlan { lowers, upper }, Some(id)))
+    }
+
+    /// Where `project` keeps the ids of the images it committed, one file for each name.
+    fn committed(&self, project: &str) -> PathBuf {
+        self.cfg.data_dir.join("projects").join(project_dir(project)).join("images")
+    }
+
+    /// Reads what a container cell wrote in `upper` into a layer tar, to go on top of `base`,
+    /// saying it came `from` the cell. The cell must hold still only until this returns. With
+    /// `scrub`, secrets found outside its allowed paths refuse it.
+    pub(crate) async fn stage(
+        &self,
+        upper: &Path,
+        base: BlobId,
+        scrub: Option<Scrub>,
+        from: String,
+    ) -> Result<Staged, Error> {
+        let (importer, store) = self.importer()?;
+        let c = &self.cfg.container;
+        let how = Commit {
+            upper: upper.to_owned(),
+            base,
+            shift: Some(Shift { base: c.uid_base, count: c.uid_count }),
+            scrub,
+            from,
+        };
+        importer.stage(&**store, how).await.map_err(|e| {
+            match e.get_ref().and_then(|e| e.downcast_ref::<SecretsFound>()) {
+                Some(found) => Error::new(Reason::PolicyDenied, found.to_string()),
+                None => Error::new(Reason::Internal, format!("taking the snapshot: {e}")),
+            }
+        })
+    }
+
+    /// Builds a staged snapshot into its layer and stores the image. Returns the image's id.
+    async fn finish(&self, staged: Staged) -> Result<BlobId, Error> {
+        let (importer, store) = self.importer()?;
+        match importer.finish(&**store, staged).await {
+            Ok(done) => Ok(done.id),
+            Err(e) => Err(Error::new(Reason::Internal, format!("taking the snapshot: {e}"))),
+        }
+    }
+
+    fn importer(&self) -> Result<(&Importer, &Arc<dyn BlobStore>), Error> {
+        match &self.images {
+            Some(Nectar { importer: Some(i), store, .. }) => Ok((i, store)),
+            _ => Err(Error::new(
+                Reason::PolicyDenied,
+                "this node cannot take snapshots, as it has no image store or no mkfs.erofs",
+            )),
+        }
     }
 
     async fn next_id(&self) -> Result<CellId, Error> {
@@ -813,18 +957,40 @@ async fn wait_started(cell: &Cell) -> Result<CellInfo, Error> {
     Ok(cell.info())
 }
 
-/// The image a cell starts from, if its name is one the comb can look up.
-fn image_name(spec: &CellSpec) -> Result<&str, Error> {
-    let name = match &spec.source {
-        Source::Image(n) | Source::Template(n) => n,
-        Source::Snapshot(_) => {
-            return Err(Error::new(Reason::InvalidArgument, "snapshots are not supported yet"));
-        }
-    };
+/// What a cell starts from.
+enum Wanted<'a> {
+    /// An image or template, by name.
+    Name(&'a str),
+    /// A snapshot, which is the id of an image in the store.
+    Snapshot(BlobId),
+}
+
+/// What a cell starts from, if it is something the comb can look up.
+fn source(spec: &CellSpec) -> Result<Wanted<'_>, Error> {
+    match &spec.source {
+        Source::Image(n) | Source::Template(n) => image_name(n).map(Wanted::Name),
+        Source::Snapshot(id) => id.parse().map(Wanted::Snapshot).map_err(|_| {
+            Error::new(Reason::InvalidArgument, format!("{id:?} is not a snapshot id"))
+        }),
+    }
+}
+
+/// `name` if it is an image name, which is a relative path with nothing that climbs out.
+pub(crate) fn image_name(name: &str) -> Result<&str, Error> {
     if !is_name(name) || name.split('/').any(|p| p.is_empty() || p == "." || p == "..") {
         return Err(Error::new(Reason::InvalidArgument, format!("{name:?} is not an image name")));
     }
     Ok(name)
+}
+
+/// A project's name as one path component. A `/` is written `%2F`, and so is a leading dot, so
+/// `.` and `..` are plain names too. Names have no `%`, so no two projects get the same one.
+fn project_dir(project: &str) -> String {
+    let mut dir = project.replace('/', "%2F");
+    if dir.starts_with('.') {
+        dir.replace_range(..1, "%2E");
+    }
+    dir
 }
 
 fn not_found(id: CellId) -> Error {

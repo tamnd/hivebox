@@ -28,7 +28,9 @@ if _version_not_supported:
 
 
 class SnapshotsStub:
-    """Draft: lands with the snapshot work in M1 and M2. The shape is here so clients can plan for it.
+    """Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
+    image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
+    same store can start cells from it. Fork, Delete and the other kinds are not in yet.
     """
 
     def __init__(self, channel):
@@ -65,17 +67,20 @@ class SnapshotsStub:
 
 
 class SnapshotsServicer:
-    """Draft: lands with the snapshot work in M1 and M2. The shape is here so clients can plan for it.
+    """Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
+    image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
+    same store can start cells from it. Fork, Delete and the other kinds are not in yet.
     """
 
     def Snapshot(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Freezes the cell while its writes are read, and thaws it after if it was running.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Restore(self, request, context):
-        """Starts count cells from one snapshot.
+        """Starts count cells from one snapshot, the same as Cells.Create with the snapshot as source.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -89,7 +94,7 @@ class SnapshotsServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Commit(self, request, context):
-        """Turns a snapshot into an image that can be used as a source.
+        """Names a scrubbed snapshot, so the project's cells can use the name as their image.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -138,7 +143,9 @@ def add_SnapshotsServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class Snapshots:
-    """Draft: lands with the snapshot work in M1 and M2. The shape is here so clients can plan for it.
+    """Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
+    image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
+    same store can start cells from it. Fork, Delete and the other kinds are not in yet.
     """
 
     @staticmethod

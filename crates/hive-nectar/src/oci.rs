@@ -102,6 +102,27 @@ pub struct Committed {
     pub stored: u64,
 }
 
+/// A commit whose upper has been read into a layer tar, waiting for [`Importer::finish`]. The
+/// tar is removed when it is dropped.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct Staged {
+    tar: PathBuf,
+    base: Manifest,
+    parent: BlobId,
+    from: String,
+    /// What went into the tar.
+    pub written: Written,
+    diff_id: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tar);
+    }
+}
+
 /// Builds layers with one `mkfs.erofs` into one store, using `work` for scratch space and for
 /// remembering what it built.
 #[derive(Debug)]
@@ -222,7 +243,7 @@ impl Importer {
 
     /// Commits what a container cell changed: the upper directory `how.upper`, scrubbed unless
     /// `how.scrub` is unset, as a new layer on top of the image `how.base`, and stores the new
-    /// manifest with a [`Provenance`].
+    /// manifest with a [`Provenance`]. It is [`Importer::stage`] and then [`Importer::finish`].
     ///
     /// # Errors
     ///
@@ -231,6 +252,18 @@ impl Importer {
     /// `PermissionDenied` and a [`SecretsFound`] that lists them.
     #[cfg(target_os = "linux")]
     pub async fn commit(&self, store: &dyn BlobStore, how: Commit) -> io::Result<Committed> {
+        let staged = self.stage(store, how).await?;
+        self.finish(store, staged).await
+    }
+
+    /// The part of a commit that reads the upper: it is written out as a layer tar, so the cell
+    /// only has to hold still until this returns, and the build can run while it goes on.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Importer::commit`], but for the build and the store.
+    #[cfg(target_os = "linux")]
+    pub async fn stage(&self, store: &dyn BlobStore, how: Commit) -> io::Result<Staged> {
         let base = load_manifest(store, how.base).await?;
         let tar = self.work.join("build").join(format!(
             "commit.{}.{}.tar",
@@ -246,36 +279,49 @@ impl Importer {
             Ok((written, format!("sha256:{:x}", out.sha.finalize())))
         })
         .await;
-        let result = async {
-            let (written, diff_id) = made?;
-            if !written.found.is_empty() {
-                let found = SecretsFound(written.found.clone());
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, found));
+        let (written, diff_id) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tar).await;
+                return Err(e);
             }
-            let src = Source { tar: tar.clone(), digest: None, diff_id: Some(diff_id) };
-            let (layer, _, stored) = self.layer(store, src).await?;
-            let mut layers = base.layers;
-            layers.push(layer);
-            let at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let manifest = Manifest {
-                layers,
-                config: base.config,
-                source: base.source,
-                provenance: Some(Provenance {
-                    parent: how.base,
-                    from: how.from,
-                    at,
-                    scrubbed: written.scrubbed.clone(),
-                }),
-            };
-            let id = self.put_manifest(store, &manifest).await?;
-            Ok(Committed { id, manifest, written, stored })
+        };
+        let staged = Staged { tar, base, parent: how.base, from: how.from, written, diff_id };
+        if !staged.written.found.is_empty() {
+            let found = SecretsFound(staged.written.found.clone());
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, found));
         }
-        .await;
-        let _ = tokio::fs::remove_file(&tar).await;
-        result
+        Ok(staged)
+    }
+
+    /// Builds a staged commit into its layer and stores the new manifest.
+    ///
+    /// # Errors
+    ///
+    /// The build or the store fails.
+    #[cfg(target_os = "linux")]
+    pub async fn finish(&self, store: &dyn BlobStore, staged: Staged) -> io::Result<Committed> {
+        let src =
+            Source { tar: staged.tar.clone(), digest: None, diff_id: Some(staged.diff_id.clone()) };
+        let (layer, _, stored) = self.layer(store, src).await?;
+        let mut layers = staged.base.layers.clone();
+        layers.push(layer);
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let manifest = Manifest {
+            layers,
+            config: staged.base.config.clone(),
+            source: staged.base.source.clone(),
+            provenance: Some(Provenance {
+                parent: staged.parent,
+                from: staged.from.clone(),
+                at,
+                scrubbed: staged.written.scrubbed.clone(),
+            }),
+        };
+        let id = self.put_manifest(store, &manifest).await?;
+        Ok(Committed { id, manifest, written: staged.written.clone(), stored })
     }
 
     /// Builds one layer, or finds it built before, and puts its blobs in the store. Says whether

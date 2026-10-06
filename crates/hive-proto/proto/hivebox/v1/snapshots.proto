@@ -5,14 +5,17 @@ package hivebox.v1;
 import "hivebox/v1/cells.proto";
 import "hivebox/v1/types.proto";
 
-// Draft: lands with the snapshot work in M1 and M2. The shape is here so clients can plan for it.
+// Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
+// image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
+// same store can start cells from it. Fork, Delete and the other kinds are not in yet.
 service Snapshots {
+  // Freezes the cell while its writes are read, and thaws it after if it was running.
   rpc Snapshot(SnapshotRequest) returns (SnapshotRef);
-  // Starts count cells from one snapshot.
+  // Starts count cells from one snapshot, the same as Cells.Create with the snapshot as source.
   rpc Restore(RestoreRequest) returns (stream CreateEvent);
   // Copies a running cell count times, at most 16.
   rpc Fork(ForkRequest) returns (stream CreateEvent);
-  // Turns a snapshot into an image that can be used as a source.
+  // Names a scrubbed snapshot, so the project's cells can use the name as their image.
   rpc Commit(CommitRequest) returns (ImageRef);
   rpc Delete(SnapshotRef) returns (Empty);
 }
@@ -26,14 +29,24 @@ enum SnapshotKind {
 
 message SnapshotRequest {
   string cell_id = 1;
+  // Only disk snapshots for now. Unspecified means disk.
   SnapshotKind kind = 2;
+  // Not kept yet, so a request with labels is refused.
   map<string, string> labels = 3;
+  // Leaves out histories and credential files and takes passwords out of .git/config, and
+  // refuses the snapshot if a key or token is found anywhere else. Only a scrubbed snapshot can
+  // be committed.
+  bool scrub = 4;
+  // Paths, relative to the cell's root, where scrubbing lets keys and tokens stay, like test
+  // fixtures.
+  repeated string allow = 5;
 }
 
 message RestoreRequest {
   SnapshotRef snapshot = 1;
   uint32 count = 2;
-  // Overrides applied on top of the snapshot's own spec. The source is ignored.
+  // The spec of the new cells. Its source is replaced by the snapshot, and its backend must be
+  // the container one.
   CellSpec spec = 3;
   string idempotency_key = 4;
 }
@@ -47,5 +60,7 @@ message ForkRequest {
 
 message CommitRequest {
   SnapshotRef snapshot = 1;
+  // The image name, seen only by the caller's project, where it comes before the node's own
+  // images. Committing a name again moves it to the new snapshot.
   string name = 2;
 }

@@ -89,3 +89,10 @@ async def test_verify_wants_argv_as_a_list():
     with pytest.raises(hivebox.InvalidArgument):
         await hive.verify("pytest -q", verifier=hivebox.Spec(image="i"), workdir="/w")
     await hive.close()
+
+
+async def test_allowed_paths_need_scrubbing():
+    hive = hivebox.AsyncHive("http://gate:7401")
+    with pytest.raises(hivebox.InvalidArgument):
+        await hive.snapshot("c-1", allow=["tests"])
+    await hive.close()

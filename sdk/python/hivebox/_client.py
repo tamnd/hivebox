@@ -21,6 +21,8 @@ from .v1 import (
     files_pb2_grpc,
     llm_pb2,
     llm_pb2_grpc,
+    snapshots_pb2,
+    snapshots_pb2_grpc,
     types_pb2,
     verify_pb2,
     verify_pb2_grpc,
@@ -292,6 +294,7 @@ class AsyncHive:
         self._files = files_pb2_grpc.FilesStub(self._channel)
         self._verify = verify_pb2_grpc.VerifyStub(self._channel)
         self._llm = llm_pb2_grpc.LlmStub(self._channel)
+        self._snapshots = snapshots_pb2_grpc.SnapshotsStub(self._channel)
         self.cells = Cells(self)
         self.llm = Llm(self)
 
@@ -328,6 +331,24 @@ class AsyncHive:
             timeout=_seconds(timeout),
         )
         return VerifyResult._from(await self._call(self._verify.Run, req))
+
+    async def snapshot(self, cell: Cell | str, *, scrub: bool = False, allow: Iterable[str] = ()) -> str:
+        """Takes a disk snapshot of a container cell and returns its id. A running cell is frozen
+        while its changes are sealed. With `scrub`, secrets are taken out first, and a file that
+        still holds one fails the snapshot unless it is under a path in `allow`. Make cells from
+        it with Spec(snapshot=id)."""
+        allow = list(allow)
+        if allow and not scrub:
+            raise _errors.InvalidArgument("allow only means something with scrub on")
+        cell_id = cell.id if isinstance(cell, Cell) else cell
+        req = snapshots_pb2.SnapshotRequest(cell_id=cell_id, kind=snapshots_pb2.SNAPSHOT_KIND_DISK, scrub=scrub, allow=allow)
+        return (await self._call(self._snapshots.Snapshot, req)).id
+
+    async def commit(self, snapshot: str, name: str) -> None:
+        """Names a scrubbed snapshot as the image `name` in the project, so Spec(image=name)
+        makes cells from it. Committing a name again moves it."""
+        req = snapshots_pb2.CommitRequest(snapshot=types_pb2.SnapshotRef(id=snapshot), name=name)
+        await self._call(self._snapshots.Commit, req)
 
     async def _call(self, method, request, *, retry: bool = False, timeout: float | None = None):
         """One unary call. With `retry`, a failure that was hivebox's is tried again, since
@@ -540,6 +561,10 @@ class Cell:
 
     async def stop(self) -> None:
         _one(await self._hive.cells.stop(self.id))
+
+    async def snapshot(self, *, scrub: bool = False, allow: Iterable[str] = ()) -> str:
+        """Takes a disk snapshot of the cell, as AsyncHive.snapshot does."""
+        return await self._hive.snapshot(self, scrub=scrub, allow=allow)
 
     async def run(self, cmd: str | Sequence[str], *, timeout: float | str | None = None, stdin: bytes = b"",
                   env: Mapping[str, str] | None = None, cwd: str = "", user: str = "", max_output_bytes: int = 0) -> RunResult:

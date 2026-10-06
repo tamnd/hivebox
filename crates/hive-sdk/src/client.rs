@@ -8,6 +8,7 @@ use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::files_client::FilesClient;
+use hive_proto::v1::snapshots_client::SnapshotsClient;
 use hive_proto::v1::verify_client::VerifyClient;
 use hive_types::{CellSpec, Reason};
 use std::collections::BTreeMap;
@@ -294,6 +295,43 @@ impl Client {
         Ok(c.run(self.req(req)).await.map_err(from_status)?.into_inner())
     }
 
+    /// Takes a disk snapshot of the container cell `id` and returns its id. A running cell is
+    /// frozen while its changes are sealed. With `scrub`, secrets are taken out first, and a
+    /// file that still holds one fails the snapshot unless it is under a path in `allow`. To
+    /// restore it, make cells with [`Source::Snapshot`](hive_types::Source::Snapshot).
+    ///
+    /// # Errors
+    ///
+    /// The cell is not running or paused, is not a container, or the node cannot take
+    /// snapshots. With `scrub`, a secret was found outside `allow`.
+    pub async fn snapshot(&self, id: &str, scrub: bool, allow: &[String]) -> Result<String, Error> {
+        let r = v1::SnapshotRequest {
+            cell_id: id.to_string(),
+            kind: v1::SnapshotKind::Disk.into(),
+            scrub,
+            allow: allow.to_vec(),
+            ..Default::default()
+        };
+        let mut c = SnapshotsClient::new(self.channel.clone());
+        Ok(c.snapshot(self.req(r)).await.map_err(from_status)?.into_inner().id)
+    }
+
+    /// Names the scrubbed snapshot `snapshot` as the image `name` in the project, so cells can
+    /// be made from it by name. Committing again under the same name moves it.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot is not in the store, was not scrubbed, or the name is not a plain name.
+    pub async fn commit(&self, snapshot: &str, name: &str) -> Result<(), Error> {
+        let r = v1::CommitRequest {
+            snapshot: Some(v1::SnapshotRef { id: snapshot.to_string() }),
+            name: name.to_string(),
+        };
+        let mut c = SnapshotsClient::new(self.channel.clone());
+        c.commit(self.req(r)).await.map_err(from_status)?;
+        Ok(())
+    }
+
     /// The changes of state of what `sel` picks, starting with each cell's current state. A
     /// watch by id ends once the cell has ended.
     ///
@@ -511,6 +549,15 @@ impl Cell {
     /// The cell could not be stopped.
     pub async fn stop(&self) -> Result<(), Error> {
         one(self.client.stop(&self.sel()).await?)
+    }
+
+    /// Takes a disk snapshot of the cell, as [`Client::snapshot`] does.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot could not be taken.
+    pub async fn snapshot(&self, scrub: bool, allow: &[String]) -> Result<String, Error> {
+        self.client.snapshot(self.id(), scrub, allow).await
     }
 
     /// Runs `cmd` and waits for it to end.

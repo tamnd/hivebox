@@ -25,6 +25,12 @@ Cells:
   pause|resume|stop ID... | -l KEY=VALUE...
   watch [ID | -l KEY=VALUE...]
 
+Snapshots:
+  snapshot ID [--scrub] [--allow PATH]...          prints the snapshot id. With --scrub,
+         secrets are taken out, and one left outside an allowed path fails it
+  commit SNAPSHOT NAME                             names a scrubbed snapshot as an image
+  create snapshot:SNAPSHOT ...                     makes cells from a snapshot
+
 Commands:
   run ID [-e KEY=VALUE]... [--cwd DIR] [--timeout DURATION] [--user UID[:GID]] [-i] -- ARGV...
   sh ID SCRIPT...
@@ -53,7 +59,7 @@ pub struct Args {
 }
 
 /// Flags that stand alone. Every other flag takes a value.
-const SWITCHES: &[&str] = &["-i", "-r", "--all", "-h", "--help"];
+const SWITCHES: &[&str] = &["-i", "-r", "--all", "--scrub", "-h", "--help"];
 
 impl Args {
     /// Splits `args`.
@@ -168,6 +174,8 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "files" => files(&client, &args).await,
         "rm" => rm(&client, &args).await,
         "verify" => verify(&client, &args).await,
+        "snapshot" => snapshot(&client, &args).await,
+        "commit" => commit(&client, &args).await,
         _ => Err(format!("{command} is not a command. Try hivectl help.")),
     }
 }
@@ -196,7 +204,11 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
         "--boost",
     ])?;
     let [image] = exactly(args, 1, "an image")? else { unreachable!() };
-    let mut spec = CellSpec::new(Source::Image(image.clone()), Backend::Container);
+    let source = match image.strip_prefix("snapshot:") {
+        Some(id) => Source::Snapshot(id.to_string()),
+        None => Source::Image(image.clone()),
+    };
+    let mut spec = CellSpec::new(source, Backend::Container);
     let number = |flag: &str| -> Result<Option<u32>, String> {
         args.one(&[flag])
             .map(|v| v.parse().map_err(|_| format!("{flag} {v} is not a number")))
@@ -232,6 +244,22 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
         }
     }
     Ok(i32::from(failed > 0))
+}
+
+async fn snapshot(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&["--scrub", "--allow"])?;
+    let [id] = exactly(args, 1, "a cell id")? else { unreachable!() };
+    let allow: Vec<String> = args.all(&["--allow"]).into_iter().map(String::from).collect();
+    let snap = client.snapshot(id, args.has("--scrub"), &allow).await.map_err(err)?;
+    println!("{snap}");
+    Ok(0)
+}
+
+async fn commit(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&[])?;
+    let [snap, name] = exactly(args, 2, "a snapshot id and a name")? else { unreachable!() };
+    client.commit(snap, name).await.map_err(err)?;
+    Ok(0)
 }
 
 async fn ls(client: &Client, args: &Args) -> Result<i32, String> {
@@ -744,6 +772,10 @@ mod tests {
         assert!(Args::parse(["ls".to_string(), "-l".to_string()]).is_err());
         assert!(args("ls --nope 1").check(&["-l"]).is_err());
         assert!(pairs(&["=1"]).is_err());
+        let a = args("snapshot abc --scrub --allow tests --allow=fixtures");
+        assert_eq!(a.rest, ["snapshot", "abc"]);
+        assert!(a.has("--scrub"));
+        assert_eq!(a.all(&["--allow"]), ["tests", "fixtures"]);
     }
 
     #[test]

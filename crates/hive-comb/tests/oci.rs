@@ -3,6 +3,7 @@
 //! Needs root, cgroup v2, a static drone in `HIVE_OCI_DRONE`, and an image: either one made by
 //! `hive-oci import` in `HIVE_OCI_IMAGE`, or a `hive-nectar` store in `HIVE_NECTAR_STORE` and the id
 //! of an image in it in `HIVE_NECTAR_IMAGE`. Passes without doing anything when one is missing.
+//! The snapshot test also needs the store and `mkfs.erofs` in `HIVE_MKFS_EROFS`.
 
 #![cfg(target_os = "linux")]
 
@@ -12,6 +13,7 @@ use bytes::Bytes;
 use common::*;
 use hive_comb::Llm;
 use hive_comb::api::Api;
+use hive_nectar::upper::Scrub;
 use hive_proto::v1;
 use hive_proto::v1::llm_server::Llm as _;
 use http_body_util::{BodyExt, Full};
@@ -101,6 +103,7 @@ impl Node {
                     store: Some(store.into()),
                     cache_dir: scratch.0.join("cache"),
                     layers_dir: scratch.0.join("layers"),
+                    mkfs: std::env::var_os("HIVE_MKFS_EROFS").map_or(images.mkfs, PathBuf::from),
                     ..images
                 };
             }
@@ -337,6 +340,122 @@ async fn a_paused_cell_is_reclaimed_and_then_stopped() {
     };
     assert_eq!((ended.state, ended.cause), (CellState::Stopped, Some(Cause::Idle)));
     assert!(t.elapsed() >= Duration::from_secs(3), "stopped after {:.2?}", t.elapsed());
+    node.comb.shutdown().await;
+}
+
+/// A cell made from snapshot `snap` of another.
+async fn restore(comb: &Comb, snap: hive_nectar::BlobId) -> CellId {
+    let mut s = spec("python");
+    s.source = Source::Snapshot(snap.to_string());
+    comb.create(request(s)).await.unwrap().id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
+    if std::env::var_os("HIVE_NECTAR_STORE").is_none()
+        || std::env::var_os("HIVE_MKFS_EROFS").is_none()
+    {
+        eprintln!("skipped: set HIVE_NECTAR_STORE and HIVE_MKFS_EROFS to run it");
+        return;
+    }
+    let Some(mut node) = Node::new(4).await else { return };
+    let store = hive_nectar::PosixStore::open(node.cfg.images.store.clone().unwrap()).unwrap();
+    let id = node.comb.create(request(spec("python"))).await.unwrap().id;
+    let pem = r"-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----\n";
+    let work = format!(
+        "mkdir -p /srv/app/tests && echo one > /root/note && echo 'print(1)' > /srv/app/main.py \
+         && printf '%b' '{pem}' > /srv/app/tests/key.pem && echo 'export TOKEN=x' > /root/.bash_history \
+         && rm /etc/issue && head -c 32M /dev/urandom > /srv/app/blob"
+    );
+    sh(&node.comb, id, &work).await;
+    sh(&node.comb, id, "sleep 3600 >/dev/null 2>&1 &").await;
+
+    // A running cell is frozen only while its changes are read out, and goes on as it was. Execs
+    // sent back to back meanwhile show how long it stood still.
+    let ended = std::sync::atomic::AtomicBool::new(false);
+    let t = Instant::now();
+    let (first, (worst, execs)) = tokio::join!(
+        async {
+            let snap = node.comb.snapshot(id, None).await.unwrap();
+            ended.store(true, Ordering::Relaxed);
+            snap
+        },
+        async {
+            let (mut worst, mut n) = (Duration::ZERO, 0);
+            while !ended.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                sh(&node.comb, id, "true").await;
+                (worst, n) = (worst.max(t.elapsed()), n + 1);
+            }
+            (worst, n)
+        }
+    );
+    let took = t.elapsed();
+    assert_eq!(sh(&node.comb, id, "cat /proc/[0-9]*/comm | grep -c ^sleep$").await, "1\n");
+    assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Running);
+    let m = hive_nectar::oci::load_manifest(&store, first).await.unwrap();
+    let top = m.layers.last().unwrap();
+    let text = node.comb.metrics().registry().render();
+    let stage = |name: &str| {
+        let line = format!("hive_snapshot_seconds_sum{{stage=\"{name}\"}} ");
+        let v = text.lines().find_map(|l| l.strip_prefix(line.as_str())).unwrap();
+        Duration::from_secs_f64(v.parse().unwrap())
+    };
+    println!(
+        "snapshot of a 32 MiB write in {took:.2?}: frozen {:.2?} while it was read out, then \
+         {:.2?} to build; {execs} execs meanwhile, the slowest in {worst:.2?}; new layer {} KiB \
+         of metadata and {} KiB of data",
+        stage("read"),
+        stage("build"),
+        top.meta_size >> 10,
+        top.data_size >> 10
+    );
+    assert!(m.provenance.as_ref().is_some_and(|p| p.scrubbed.is_none()));
+
+    let copy = restore(&node.comb, first).await;
+    let seen = "cat /root/note /srv/app/main.py; test -e /etc/issue || echo gone; \
+                head -c 14 /srv/app/tests/key.pem; echo; python3 -c 'print(6 * 7)'";
+    let want = "one\nprint(1)\ngone\n-----BEGIN RSA\n42\n";
+    assert_eq!(sh(&node.comb, copy, seen).await, want);
+
+    // A restored cell snapshots on top of its snapshot, and the record keeps that over a restart.
+    sh(&node.comb, copy, "echo three > /root/third").await;
+    node.restart().await;
+    let chained = node.comb.snapshot(copy, None).await.unwrap();
+    let again = restore(&node.comb, chained).await;
+    assert_eq!(sh(&node.comb, again, "cat /root/note /root/third").await, "one\nthree\n");
+    assert_eq!(
+        hive_nectar::oci::load_manifest(&store, chained).await.unwrap().layers.len(),
+        m.layers.len() + 1
+    );
+
+    // A paused cell stays paused.
+    node.comb.pause(id).await.unwrap();
+    node.comb.snapshot(id, None).await.unwrap();
+    assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Paused);
+
+    // Scrubbing refuses the key until its directory is allowed, and only that commits.
+    let e = node.comb.snapshot(id, Some(Scrub::default())).await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied, "{e}");
+    assert!(e.message.contains("srv/app/tests/key.pem:1"), "{e}");
+    assert!(!e.message.contains("MIIB"), "{e}");
+    let e = node.comb.commit("p", first, "mine").await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied, "{e}");
+    let allow = Scrub { allow: vec!["srv/app/tests".into()] };
+    let clean = node.comb.snapshot(id, Some(allow)).await.unwrap();
+    assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Paused);
+    let e = node.comb.commit("p", clean, "../mine").await.unwrap_err();
+    assert_eq!(e.reason, Reason::InvalidArgument, "{e}");
+    node.comb.commit("p", clean, "mine").await.unwrap();
+    let named = node.comb.create(request(spec("mine"))).await.unwrap().id;
+    let seen = "cat /root/note; test -e /root/.bash_history || echo gone; head -c 14 /srv/app/tests/key.pem";
+    assert_eq!(sh(&node.comb, named, seen).await, "one\ngone\n-----BEGIN RSA");
+
+    for c in [id, copy, again, named] {
+        node.comb.stop(c, None).await.unwrap();
+    }
+    let e = node.comb.snapshot(id, None).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CellNotRunning, "{e}");
     node.comb.shutdown().await;
 }
 
