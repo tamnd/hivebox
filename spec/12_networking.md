@@ -67,7 +67,7 @@ Built-in profiles:
 
 - `none`: DNS only returns NXDOMAIN. This is the RL rollout default.
 - `mirrors`: package mirrors via VIP only.
-- `llm`: `mirrors` plus the LLM gateway.
+- `llm`: `mirrors` plus the LLM gateway on `169.254.77.81:80`. The DNS proxy answers `llm.hive.internal` with that address for these cells and NXDOMAIN for the rest. Those answers do not count against the cell's query rate, as an agent that opens a connection per call looks the name up each time.
 - `build`: `mirrors` plus github, the registries and a curated domain list.
 - `open`: the internet except RFC1918, metadata, and cluster ranges. It needs project permission.
 

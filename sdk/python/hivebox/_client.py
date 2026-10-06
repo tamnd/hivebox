@@ -19,6 +19,8 @@ from .v1 import (
     exec_pb2_grpc,
     files_pb2,
     files_pb2_grpc,
+    llm_pb2,
+    llm_pb2_grpc,
     types_pb2,
     verify_pb2,
     verify_pb2_grpc,
@@ -162,6 +164,49 @@ class VerifyResult:
 
 
 @dataclass
+class Choice:
+    """One choice of an LLM call: the tokens the engine sampled and their log probabilities.
+    `prompt_ids` is set only for a completions call with several prompts, when the choice's
+    prompt is not the turn's."""
+
+    index: int
+    output_ids: list[int]
+    logprobs: list[float]
+    finish_reason: str
+    prompt_ids: list[int]
+
+
+@dataclass
+class Turn:
+    """One call a cell made to the LLM gateway, with the tokens as the engine saw them. `seq`
+    is its place among the rollout's calls, and `status` the engine's HTTP status, or 502 and
+    504 when the engine could not be reached or took too long."""
+
+    cell_id: str
+    rollout_id: str
+    seq: int
+    path: str
+    model: str
+    status: int
+    stream: bool
+    started: float
+    took: float
+    prompt_ids: list[int]
+    choices: list[Choice]
+    prompt_tokens: int
+    completion_tokens: int
+    error: str
+
+    @classmethod
+    def _from(cls, t) -> Turn:
+        choices = [Choice(c.index, list(c.output_ids), list(c.logprobs), c.finish_reason, list(c.prompt_ids))
+                   for c in t.choices]
+        return cls(t.cell_id, t.rollout_id, t.seq, t.path, t.model, t.status, t.stream,
+                   t.started.ToNanoseconds() / 1e9, t.took.ToNanoseconds() / 1e9, list(t.prompt_ids), choices,
+                   t.prompt_tokens, t.completion_tokens, t.error)
+
+
+@dataclass
 class SessionResult:
     """How a command in a session ended, with stdout and stderr together."""
 
@@ -246,7 +291,9 @@ class AsyncHive:
         self._exec = exec_pb2_grpc.ExecStub(self._channel)
         self._files = files_pb2_grpc.FilesStub(self._channel)
         self._verify = verify_pb2_grpc.VerifyStub(self._channel)
+        self._llm = llm_pb2_grpc.LlmStub(self._channel)
         self.cells = Cells(self)
+        self.llm = Llm(self)
 
     async def close(self) -> None:
         await self._channel.close()
@@ -293,6 +340,45 @@ class AsyncHive:
                 if not (retry and err.is_infra_error) or attempt == _TRIES - 1:
                     raise err from None
             await asyncio.sleep(0.05 * 4**attempt)
+
+
+class Llm:
+    """The node's LLM gateway, which cells with the `llm` network profile reach at
+    http://llm.hive.internal. It sends their calls to the project's inference engine with the
+    engine's key and keeps the token ids of each call, by the cell's `rollout_id` label."""
+
+    def __init__(self, hive: AsyncHive):
+        self._hive = hive
+        # Turns the gateway dropped for the project to stay within its memory, as of the last
+        # call to `turns`.
+        self.dropped = 0
+
+    async def route(self, upstream: str, api_key: str = "") -> None:
+        """Sends the project's calls to the engine at `upstream`, a plain HTTP base URL like
+        http://10.0.0.5:30000, with `api_key` as its bearer token. An empty `upstream` goes back
+        to the node's own route."""
+        await self._hive._call(self._hive._llm.SetRoute, llm_pb2.LlmRoute(upstream=upstream, api_key=api_key), retry=True)
+
+    async def hold(self, *, retry_after: float | str = 5, ttl: float | str = "10m", drain: float | str = 0) -> int:
+        """Answers the project's new calls with 503 and Retry-After, as while the engine loads new
+        weights, until `release` or for `ttl`. Waits up to `drain` for the calls in flight to end,
+        and returns how many are left."""
+        req = llm_pb2.LlmHoldRequest(retry_after=_seconds(retry_after), ttl=_seconds(ttl), drain=_seconds(drain))
+        return (await self._hive._call(self._hive._llm.Hold, req, retry=True)).in_flight
+
+    async def release(self) -> int:
+        """Ends the hold, and returns the calls in flight."""
+        req = llm_pb2.LlmHoldRequest(release=True)
+        return (await self._hive._call(self._hive._llm.Hold, req, retry=True)).in_flight
+
+    async def turns(self, rollout_id: str = "", *, cell: Cell | str | None = None, take: bool = False) -> list[Turn]:
+        """The calls of a rollout, or of a cell, or of a cell in a rollout, in the order they
+        were made. With `take` they are removed, so the next call does not return them again."""
+        cell_id = cell.id if isinstance(cell, Cell) else (cell or "")
+        req = llm_pb2.LlmTurnsRequest(rollout_id=rollout_id, cell_id=cell_id, take=take)
+        r = await self._hive._call(self._hive._llm.Turns, req, retry=not take)
+        self.dropped = r.dropped
+        return [Turn._from(t) for t in r.turns]
 
 
 class Cells:

@@ -422,9 +422,7 @@ impl Actor {
             if let (Some(veth), Some(net), Some(profile)) =
                 (&self.veth, self.inner.netns.as_ref().and_then(|p| p.net()), profile)
             {
-                // The low bits of the sequence number are unique among every cell the node has at
-                // once, and never go back to one that just ended.
-                net.assign(veth, self.cell.id.seq() as u32, profile)
+                net.assign(veth, self.cell.id, profile)
                     .map_err(|e| io_error("putting the cell on its interface", &e))?;
                 nameserver = self.inner.netns.as_ref().and_then(|p| p.nameserver());
             }
@@ -451,7 +449,7 @@ impl Actor {
             self.handle.as_ref().map(|h| h.cgroup.clone()).filter(|c| !c.as_os_str().is_empty());
         self.netns = self.handle.as_ref().and_then(|h| h.netns.clone());
         if let (Some(ns), Some(pool)) = (&self.netns, &self.inner.netns) {
-            self.veth = pool.recover(ns);
+            self.veth = pool.recover(ns, self.cell.id);
         }
         let state = self.record.cell_state().unwrap_or(CellState::Failed);
         if state.is_terminal() {

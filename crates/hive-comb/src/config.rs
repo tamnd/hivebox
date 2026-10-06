@@ -124,6 +124,41 @@ pub struct Network {
     /// `pypi.org` or `*.pythonhosted.org`. A cell reaches the proxy and whatever it resolved for
     /// it, and nothing else.
     pub profiles: BTreeMap<String, Vec<String>>,
+    /// The LLM gateway for cells with the `llm` profile.
+    pub llm: Llm,
+}
+
+/// The LLM gateway, from `spec/11_rl_integration.md`, section 6.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Llm {
+    /// Where calls go for a project the trainer set no route for, such as
+    /// `http://10.0.0.5:30000`. `None` answers them with 503 until it does.
+    pub upstream: Option<String>,
+    /// A file with the key sent to `upstream` as a bearer token.
+    pub api_key_file: Option<PathBuf>,
+    /// The cell label that names a call's rollout.
+    pub label: String,
+    /// Asks the engine for the log probability of each token as well, and takes it out of the
+    /// answer when the cell did not ask for it.
+    pub logprobs: bool,
+    /// Memory for the calls the trainer has not taken yet. Past it the rollout changed longest
+    /// ago is dropped.
+    pub keep_bytes: u64,
+    /// Longest a call may take, from sending it to the end of the answer.
+    pub timeout: Duration,
+}
+
+impl Default for Llm {
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            api_key_file: None,
+            label: "rollout_id".into(),
+            logprobs: false,
+            keep_bytes: 256 << 20,
+            timeout: Duration::from_secs(600),
+        }
+    }
 }
 
 impl Default for Network {
@@ -134,6 +169,7 @@ impl Default for Network {
             pin_dir: PathBuf::from("/sys/fs/bpf/hive/guard-v1"),
             upstream: Vec::new(),
             profiles: BTreeMap::new(),
+            llm: Llm::default(),
         }
     }
 }
@@ -288,6 +324,14 @@ impl Config {
     /// [network.profiles.pypi]
     /// domains = ["pypi.org", "*.pythonhosted.org"]
     ///
+    /// [network.llm]
+    /// upstream = "http://10.0.0.5:30000"
+    /// api_key_file = "/etc/hivebox/llm.key"
+    /// label = "rollout_id"
+    /// logprobs = true
+    /// keep_mib = 256
+    /// timeout = "10m"
+    ///
     /// [images]
     /// store = "/srv/hivebox/store"
     /// cache_dir = "/var/lib/hivebox/cache"
@@ -424,6 +468,28 @@ impl Config {
                 .map_err(|e| format!("network.profiles.{name}.domains: {e}"))?;
             c.network.profiles.insert(name, p.domains);
         }
+        let l = w.llm;
+        if let Some(up) = &l.upstream {
+            crate::llm::Route::new(up, None)
+                .map_err(|e| format!("network.llm.upstream = {up:?}: {e}"))?;
+        }
+        c.network.llm.upstream = l.upstream;
+        c.network.llm.api_key_file = l.api_key_file;
+        if let Some(label) = l.label {
+            if !hive_types::is_name(&label) {
+                return Err(format!("network.llm.label = {label:?} is not a label key"));
+            }
+            c.network.llm.label = label;
+        }
+        set(&mut c.network.llm.logprobs, l.logprobs);
+        if let Some(mib) = l.keep_mib {
+            c.network.llm.keep_bytes = mib << 20;
+        }
+        if let Some(v) = l.timeout {
+            c.network.llm.timeout = duration(&v)
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| format!("network.llm.timeout = {v:?} is not a time like 10m"))?;
+        }
         let s = file.scout;
         let advertise = match (s.advertise.clone(), c.listen) {
             (Some(a), _) => Ok(a),
@@ -527,6 +593,18 @@ struct NetworkFile {
     pin_dir: Option<PathBuf>,
     upstream: Vec<String>,
     profiles: BTreeMap<String, ProfileFile>,
+    llm: LlmFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LlmFile {
+    upstream: Option<String>,
+    api_key_file: Option<PathBuf>,
+    label: Option<String>,
+    logprobs: Option<bool>,
+    keep_mib: Option<u64>,
+    timeout: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -684,6 +762,12 @@ mod tests {
 
             [network.profiles.pypi]
             domains = ["pypi.org", "*.pythonhosted.org"]
+
+            [network.llm]
+            upstream = "http://10.0.0.5:30000/"
+            label = "step"
+            logprobs = true
+            keep_mib = 64
             "#,
         )
         .unwrap();
@@ -720,6 +804,10 @@ mod tests {
             ["1.1.1.1:53".parse().unwrap(), "[2606:4700::1111]:53".parse().unwrap()]
         );
         assert_eq!(c.network.profiles["pypi"], ["pypi.org", "*.pythonhosted.org"]);
+        let llm = &c.network.llm;
+        assert_eq!(llm.upstream.as_deref(), Some("http://10.0.0.5:30000/"));
+        assert_eq!((llm.label.as_str(), llm.logprobs, llm.keep_bytes), ("step", true, 64 << 20));
+        assert_eq!(llm.timeout, Duration::from_secs(600));
         assert_eq!(c.scout, None);
     }
 
@@ -752,6 +840,10 @@ mod tests {
             ("[keeper]\nmembers = [\"http://10.0.0.1:7430\"]", "not host:port"),
             ("[keeper]\nmembers = [\"a:1\"]\nname = \"two words\"", "not a name"),
             ("[keeper]\nname = \"node-7\"", "needs keeper.members"),
+            ("[network.llm]\nupstream = \"https://e:1\"", "plain HTTP"),
+            ("[network.llm]\nupstream = \"10.0.0.5:30000\"", "network.llm.upstream"),
+            ("[network.llm]\nlabel = \"a b\"", "not a label key"),
+            ("[network.llm]\ntimeout = \"0s\"", "network.llm.timeout"),
             ("[node]\nlisten = \"0.0.0.0:7400\"\n[keeper]\nmembers = [\"a:1\"]", "scout.advertise"),
         ] {
             let e = Config::from_toml(text).unwrap_err();

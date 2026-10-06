@@ -95,6 +95,28 @@ slime.install(swe, slime.Grader(mem_mib=2048, cpu_milli=2000, repeats=1))
 
 `install` swaps `swe.run_evaluation`, which `generate.py` calls, and keeps slime's grader for swepro and SWE-bench tasks. The client comes from `$HIVE_ENDPOINT` and `$HIVE_TOKEN`. When hivebox cannot do the check, `run_evaluation` raises `HiveError`, and `generate` aborts the sample so it is left out of training. The result is still `(reward, applied_cleanly)`, with the verdict in `.verdict` for the test counts and timings. One difference: slime runs the tests as its `agent` user, and the verifier runs them as the cell's default user.
 
+## LLM route
+
+Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.
+
+```python
+await hive.llm.route("http://10.0.0.5:30000", api_key=key)
+cells = await asyncio.gather(*[
+    hive.cells.create(Spec(image="swe-requests", backend="container", network_profile="llm", labels={"rollout_id": f"r{i}"}))
+    for i in range(16)
+])
+# ... the agents run ...
+for turn in await hive.llm.turns("r3", take=True):
+    print(turn.seq, len(turn.prompt_ids), turn.choices[0].output_ids, turn.choices[0].logprobs)
+
+# Around a weight sync:
+left = await hive.llm.hold(retry_after=2, drain=60)
+await load_new_weights()
+await hive.llm.release()
+```
+
+For chat and completions calls the gateway asks the engine for `return_token_ids`, as vLLM takes it, and for log probabilities too when the node sets `[network.llm] logprobs`, then takes whatever the cell did not ask for out of the answer, streamed or not. `turns` gives a rollout's calls in order, or one cell's with `cell=`, and `take=True` removes them. When the gateway runs out of the memory it keeps turns in, it drops the rollout changed longest ago and counts the calls in `hive.llm.dropped`. `hold` answers new calls with 503 and Retry-After, which OpenAI's clients wait out, and waits up to `drain` for the calls in flight, returning how many are left. The hold ends with `release`, or by itself after `ttl` (10 minutes unless set).
+
 ## Development
 
 The stubs in `hivebox/v1` are made from the protos in `crates/hive-proto/proto` by `generate.sh`, and are checked in so installing needs no protoc.

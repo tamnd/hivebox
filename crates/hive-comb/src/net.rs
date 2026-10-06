@@ -4,12 +4,14 @@
 //! made, so a create costs a map write and no netlink.
 //!
 //! The DNS proxy runs here too, on the guard's DNS address, and answers each cell by the profile
-//! it was made with.
+//! it was made with. It answers `llm.hive.internal` itself, with the LLM gateway's address, for
+//! cells with the `llm` profile.
 
-use hive_guard::dns::{self, Cells, Policy, Proxy, Settings};
+use hive_guard::dns::{self, Cells, Host, Policy, Proxy, Settings};
 use hive_guard::link::Netlink;
 use hive_guard::wire::{self, Veth};
-use hive_guard::{CellNet, DNS_VIP, DnsAllow, Guard, Profile, Rule};
+use hive_guard::{CellNet, DNS_VIP, DnsAllow, Guard, LLM_HOST, LLM_VIP, Profile, Rule};
+use hive_types::CellId;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -53,11 +55,12 @@ impl Net {
         let mut guard = Guard::open(&cfg.pin_dir)?;
         let mut profiles = HashMap::new();
         let mut policies = HashMap::new();
-        for p in [Profile::NONE, Profile::MIRRORS] {
+        for (name, p) in
+            [("none", Profile::NONE), ("mirrors", Profile::MIRRORS), ("llm", Profile::LLM)]
+        {
             guard.set_profile(p, &p.builtin_rules())?;
+            profiles.insert(name.to_string(), p);
         }
-        profiles.insert("none".to_string(), Profile::NONE);
-        profiles.insert("mirrors".to_string(), Profile::MIRRORS);
         for (id, (name, domains)) in (FIRST_CUSTOM..).zip(&cfg.profiles) {
             let p = Profile(id);
             let rules: Vec<Rule> = Profile::NONE
@@ -81,7 +84,8 @@ impl Net {
         }
         let book =
             Arc::new(Book { cells: RwLock::default(), allow: Mutex::new(guard.dns_allow()?) });
-        let settings = Settings { upstream, policies, ..Settings::default() };
+        let hosts = vec![Host { name: LLM_HOST.into(), ip: LLM_VIP, profiles: vec![Profile::LLM] }];
+        let settings = Settings { upstream, policies, hosts, ..Settings::default() };
         let proxy = Arc::new(Proxy::new(settings, book.clone()));
         let mut nl = Netlink::open()?;
         wire::vips(&mut nl)?;
@@ -145,12 +149,19 @@ impl Net {
         wired
     }
 
-    /// Puts a cell on its interface: from now on it reaches what `profile` allows.
-    pub(crate) fn assign(&self, veth: &Veth, idx: u32, profile: Profile) -> io::Result<()> {
+    /// Puts cell `id` on its interface: from now on it reaches what `profile` allows.
+    pub(crate) fn assign(&self, veth: &Veth, id: CellId, profile: Profile) -> io::Result<()> {
+        let idx = idx(id);
         let cell = CellNet { idx, ip: veth.ip, mac: Some(veth.mac), profile };
         self.state().guard.set_cell(veth.ifindex, &cell)?;
-        self.book.set(veth.ip, Some((idx, profile)));
+        self.book.set(veth.ip, Some(Seat { idx, profile, id }));
         Ok(())
+    }
+
+    /// The cell with address `ip` and its profile, for the node's services on the VIPs, which
+    /// see a cell only by the address it connects from.
+    pub(crate) fn cell_at(&self, ip: Ipv4Addr) -> Option<(CellId, Profile)> {
+        self.book.seat(ip).map(|s| (s.id, s.profile))
     }
 
     /// Takes the program and the cell off an interface and frees its address. The interface
@@ -163,15 +174,16 @@ impl Net {
         s.ips.free(veth.ip);
     }
 
-    /// The interface of namespace `n` after a restart, with its address marked as used again.
-    pub(crate) fn recover(&self, n: u64) -> Option<Veth> {
+    /// The interface of namespace `n`, which cell `id` has, after a restart, with its address
+    /// marked as used again.
+    pub(crate) fn recover(&self, n: u64, id: CellId) -> Option<Veth> {
         let host = wire::host_name(n);
         let ifindex = std::fs::read_to_string(format!("/sys/class/net/{host}/ifindex")).ok()?;
         let ifindex = ifindex.trim().parse().ok()?;
         let mut s = self.state();
         let cell = s.guard.cell(ifindex).ok()??;
         s.ips.claim(cell.ip);
-        self.book.set(cell.ip, Some((cell.idx, cell.profile)));
+        self.book.set(cell.ip, Some(Seat { idx: cell.idx, profile: cell.profile, id }));
         Some(Veth { host, ifindex, ip: cell.ip, mac: cell.mac.unwrap_or(wire::macs(n).1) })
     }
 
@@ -197,15 +209,33 @@ impl Net {
     }
 }
 
-/// Which cell has which address, for the DNS proxy, which reads it on every query and so has it
-/// apart from the lock wiring holds.
+/// The number the guard's maps know cell `id` by. The low bits of the sequence number are unique
+/// among every cell the node has at once, and never go back to one that just ended.
+fn idx(id: CellId) -> u32 {
+    id.seq() as u32
+}
+
+/// Which cell has which address, for the DNS proxy and the LLM gateway, which read it on every
+/// query and call and so have it apart from the lock wiring holds.
 struct Book {
-    cells: RwLock<HashMap<Ipv4Addr, (u32, Profile)>>,
+    cells: RwLock<HashMap<Ipv4Addr, Seat>>,
     allow: Mutex<DnsAllow>,
 }
 
+/// A cell on an address.
+#[derive(Clone, Copy)]
+struct Seat {
+    idx: u32,
+    profile: Profile,
+    id: CellId,
+}
+
 impl Book {
-    fn set(&self, ip: Ipv4Addr, cell: Option<(u32, Profile)>) {
+    fn seat(&self, ip: Ipv4Addr) -> Option<Seat> {
+        self.cells.read().unwrap_or_else(PoisonError::into_inner).get(&ip).copied()
+    }
+
+    fn set(&self, ip: Ipv4Addr, cell: Option<Seat>) {
         let mut cells = self.cells.write().unwrap_or_else(PoisonError::into_inner);
         match cell {
             Some(c) => cells.insert(ip, c),
@@ -216,7 +246,7 @@ impl Book {
 
 impl Cells for Book {
     fn cell(&self, ip: Ipv4Addr) -> Option<(u32, Profile)> {
-        self.cells.read().unwrap_or_else(PoisonError::into_inner).get(&ip).copied()
+        self.seat(ip).map(|s| (s.idx, s.profile))
     }
 
     fn allow(&self, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {

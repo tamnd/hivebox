@@ -5,6 +5,7 @@ use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
 use crate::core_sched::CoreSched;
+use crate::llm::Gateway;
 use crate::metrics::Metrics;
 use crate::net::Net;
 use crate::netns::Namespaces;
@@ -89,6 +90,8 @@ pub(crate) struct Inner {
     /// The core scheduling cookies, when the host takes them and the cells have cgroups.
     pub(crate) core: Option<CoreSched>,
     pub(crate) netns: Option<Arc<Namespaces>>,
+    /// The LLM gateway, when cells have the guard's network.
+    pub(crate) llm: Option<Arc<Gateway>>,
     images: Option<Nectar>,
     pub(crate) metrics: Metrics,
     /// Whether the pressure brake is on, which pauses idle cells and reclaims paused ones early.
@@ -203,6 +206,10 @@ impl Comb {
             }
             None => None,
         };
+        let llm = match netns.as_ref().and_then(|p| p.net()) {
+            Some(_) => Some(Arc::new(Gateway::new(&cfg.network.llm)?)),
+            None => None,
+        };
         let images = Nectar::open(&cfg)?;
         let mut records = replay.records;
         let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
@@ -215,6 +222,7 @@ impl Comb {
             cgroups,
             core,
             netns,
+            llm,
             images,
             metrics: Metrics::default(),
             pressure: watch::Sender::new(false),
@@ -244,6 +252,10 @@ impl Comb {
                         () = stop.cancelled() => {}
                     }
                 });
+                if let Some(llm) = &comb.inner.llm {
+                    let stop = comb.inner.shutdown.clone();
+                    tokio::spawn(llm.clone().serve(comb.inner.clone(), net.clone(), stop));
+                }
             }
         }
         if let Some(pool) = &comb.inner.cgroups {
@@ -667,7 +679,7 @@ impl Inner {
 
     /// The cell with `id`, or why there is none. An id from an older epoch of this node names a
     /// cell that was fenced when the node registered again, so it is lost rather than not found.
-    fn find(&self, id: CellId) -> Result<Arc<Cell>, Error> {
+    pub(crate) fn find(&self, id: CellId) -> Result<Arc<Cell>, Error> {
         if let Some(cell) = self.cell(id) {
             return Ok(cell);
         }

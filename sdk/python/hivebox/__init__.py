@@ -8,7 +8,8 @@
         await cell.files.write("/work/a.txt", "hello")
         await cell.stop()
 
-`hive.verify` checks a cell's changes against tests in a cell of its own, as a reward for RL.
+`hive.verify` checks a cell's changes against tests in a cell of its own, as a reward for RL, and
+`hive.llm` steers the node's LLM gateway and gives the token ids of the calls cells made through it.
 The endpoint is the comb's socket by default. The design is in spec/05_api_sdk.md.
 """
 
@@ -19,13 +20,16 @@ from ._client import (
     Cell,
     CellGroup,
     Cells,
+    Choice,
     FileInfo,
     Files,
+    Llm,
     Process,
     RunResult,
     Session,
     SessionResult,
     Spec,
+    Turn,
     VerifyResult,
 )
 from ._errors import (
@@ -48,8 +52,8 @@ from ._errors import (
 __version__ = "0.0.23"
 
 __all__ = [
-    "DEFAULT_SOCKET", "AsyncHive", "BulkResult", "Cell", "CellGroup", "Cells", "FileInfo", "Files", "Process",
-    "RunResult", "Session", "SessionResult", "Spec", "VerifyResult", "CapacityUnavailable", "CellLost", "CellNotFound",
-    "CellNotRunning", "DroneUnreachable", "ExecTimeout", "FileError", "HiveError", "ImageUnavailable", "Internal",
-    "InvalidArgument", "OutputLimit", "PolicyDenied", "QuotaExceeded",
+    "DEFAULT_SOCKET", "AsyncHive", "BulkResult", "Cell", "CellGroup", "Cells", "Choice", "FileInfo", "Files", "Llm",
+    "Process", "RunResult", "Session", "SessionResult", "Spec", "Turn", "VerifyResult", "CapacityUnavailable",
+    "CellLost", "CellNotFound", "CellNotRunning", "DroneUnreachable", "ExecTimeout", "FileError", "HiveError",
+    "ImageUnavailable", "Internal", "InvalidArgument", "OutputLimit", "PolicyDenied", "QuotaExceeded",
 ]

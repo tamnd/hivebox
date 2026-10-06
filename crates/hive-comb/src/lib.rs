@@ -14,6 +14,7 @@ mod comb;
 mod config;
 mod core_sched;
 pub mod lease;
+mod llm;
 mod metrics;
 mod net;
 mod netns;
@@ -25,5 +26,5 @@ mod wal;
 
 pub use cell::{CellInfo, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, WalStats};
-pub use config::{Config, ContainerBackend, Images, KeeperLink, Network, ScoutLink};
+pub use config::{Config, ContainerBackend, Images, KeeperLink, Llm, Network, ScoutLink};
 pub use metrics::Metrics;
