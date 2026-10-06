@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.28
+
+Faster snapshots and restores of cells that wrote a lot.
+
 - Faster snapshots and restores of cells that wrote a lot. A CAS put stores all the chunks a layer is missing in one batch, checked on a few threads at once, and flushes the filesystem twice for the whole batch instead of a file and a directory per chunk, and a fetch into the layer cache flushes every 64 MiB instead of every 16 MiB batch. A chunk still only gets its name once its bytes are on disk. On server3 a 1000 MiB snapshot went from 159 and 231 s to 118 and 141 s, and its restore from 26.6 and 52.5 s to 20.6 and 24.7 s.
 
 ## 0.0.27
