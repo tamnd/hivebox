@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- CPU caps with a burst factor. A `standard` or `best_effort` cell's `cpu.max` is its requested cores times `[density] cpu_burst` (default 2.0), so it can use idle cores up to that, while a `latency` cell stays at its request. Spare cgroup leaves in the pool are made with the cap of their class.
+
 ## 0.0.24
 
 The LLM gateway for `llm` cells, with token capture and holds, and the gate routing it to every node.

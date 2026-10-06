@@ -397,11 +397,13 @@ impl Actor {
         let mut cgroup = PathBuf::new();
         if let Some(pool) = self.inner.cgroups.clone() {
             let (qos, mut r) = (self.cell.spec.qos, self.cell.spec.resources);
+            let asked = r.vcpu_milli;
+            r.vcpu_milli = pool.quota(qos, asked);
             let factor = self.inner.cfg.setup_boost;
             if let Some(d) = self.cell.spec.burst_until_ready.filter(|_| factor > 1) {
                 // The leaf is set to the boosted quota from the start, which costs nothing over
-                // setting the steady one.
-                r.vcpu_milli = r.vcpu_milli.saturating_mul(factor);
+                // setting the steady one. A boost below the burst cap changes nothing.
+                r.vcpu_milli = r.vcpu_milli.max(asked.saturating_mul(factor));
                 self.boost_until = Some(self.cell.created + d);
             }
             let taken = tokio::task::spawn_blocking(move || pool.take(qos, &r))
@@ -710,8 +712,9 @@ impl Actor {
         if self.boost_until.take().is_none() {
             return;
         }
-        let Some(dir) = &self.cgroup else { return };
-        let steady = cgroup::cpu_max(self.cell.spec.resources.vcpu_milli);
+        let (Some(dir), Some(pool)) = (&self.cgroup, &self.inner.cgroups) else { return };
+        let spec = &self.cell.spec;
+        let steady = cgroup::cpu_max(pool.quota(spec.qos, spec.resources.vcpu_milli));
         if let Err(e) = cgroup::write(dir, "cpu.max", &steady) {
             eprintln!("hive-comb: {} keeps its setup boost: {e}", self.cell.id);
         }

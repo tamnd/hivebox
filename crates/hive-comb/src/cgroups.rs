@@ -5,6 +5,10 @@
 //! ahead of time, so a create does not wait on `mkdir`, which takes up to a quarter of a millisecond
 //! on a busy host. Leaves are never reused: a used one still has its `cpu.stat` and `memory.peak`, so
 //! it is killed and removed with its cell.
+//!
+//! A leaf's `cpu.max` is the cell's request times the node's burst factor, from spec 07 section 7,
+//! so a cell may use idle cores past what it asked for while `cpu.weight` shares them out when they
+//! are busy. Cells in the latency class are held to what they asked for.
 
 use hive_cell::cgroup;
 use hive_types::{Qos, Resources};
@@ -23,8 +27,8 @@ const NEEDED: [&str; 3] = ["cpu", "memory", "pids"];
 const WANTED: [&str; 1] = ["io"];
 /// Leaves the refill task makes in one go before it looks at the other classes.
 const BATCH: usize = 32;
-/// The limits spare leaves are made with. Most cells ask for the defaults, so taking a spare usually
-/// writes nothing.
+/// The limits spare leaves are made with, before the burst factor. Most cells ask for the
+/// defaults, so taking a spare usually writes nothing.
 const PRESET: Resources = Resources::DEFAULT;
 /// How long a removal waits for the killed processes to go.
 const DRAIN: Duration = Duration::from_secs(10);
@@ -33,13 +37,18 @@ const DRAIN: Duration = Duration::from_secs(10);
 pub(crate) struct Cgroups {
     classes: [Class; 3],
     depth: usize,
+    /// The burst factor in tenths, so 20 lets a cell use twice the cores it asked for.
+    burst: u32,
     next: AtomicU64,
     refill: Notify,
 }
 
 #[derive(Debug)]
 struct Class {
+    qos: Qos,
     dir: PathBuf,
+    /// The limits spare leaves in this class are made with.
+    preset: Resources,
     ready: Mutex<Vec<PathBuf>>,
 }
 
@@ -56,7 +65,9 @@ impl Cgroups {
         std::fs::create_dir_all(root)?;
         enable_controllers(root)?;
         let classes = [Qos::Latency, Qos::Standard, Qos::BestEffort].map(|qos| Class {
+            qos,
             dir: root.join(format!("{}.slice", slice_name(qos))),
+            preset: PRESET,
             ready: Mutex::new(Vec::with_capacity(depth)),
         });
         let mut next = 0;
@@ -72,7 +83,23 @@ impl Cgroups {
                 next = next.max(leaf_number(&leaf).map_or(0, |n| n + 1));
             }
         }
-        Ok(Self { classes, depth, next: AtomicU64::new(next), refill: Notify::new() })
+        Ok(Self { classes, depth, burst: 10, next: AtomicU64::new(next), refill: Notify::new() })
+    }
+
+    /// The tree with a burst factor of `tenths` tenths, which is 10 when not set.
+    #[must_use]
+    pub(crate) fn with_burst(mut self, tenths: u32) -> Self {
+        self.burst = tenths.max(10);
+        for class in &mut self.classes {
+            class.preset.vcpu_milli = cap(class.qos, PRESET.vcpu_milli, self.burst);
+        }
+        self
+    }
+
+    /// The CPU quota, in thousandths of a core, of a cell in class `qos` that asked for
+    /// `vcpu_milli`.
+    pub(crate) fn quota(&self, qos: Qos, vcpu_milli: u32) -> u32 {
+        cap(qos, vcpu_milli, self.burst)
     }
 
     fn class(&self, qos: Qos) -> &Class {
@@ -83,7 +110,8 @@ impl Cgroups {
         }
     }
 
-    /// A leaf for a new cell of class `qos`, with the limits in `r` already set.
+    /// A leaf for a new cell of class `qos`, with the limits in `r` already set. Its CPU is taken
+    /// as it is, so the caller works out the quota with [`Self::quota`].
     pub(crate) fn take(&self, qos: Qos, r: &Resources) -> io::Result<PathBuf> {
         let class = self.class(qos);
         let (ready, left) = {
@@ -95,7 +123,7 @@ impl Cgroups {
         }
         match ready {
             Some(dir) => {
-                cgroup::relimit(&dir, Some(&PRESET), r).inspect_err(|_| {
+                cgroup::relimit(&dir, Some(&class.preset), r).inspect_err(|_| {
                     let _ = std::fs::remove_dir(&dir);
                 })?;
                 Ok(dir)
@@ -150,7 +178,7 @@ impl Cgroups {
             }
             full = false;
             for _ in 0..short.min(BATCH) {
-                let dir = self.make(class, &PRESET).map_err(|e| {
+                let dir = self.make(class, &class.preset).map_err(|e| {
                     io::Error::new(e.kind(), format!("in {}: {e}", class.dir.display()))
                 })?;
                 class.ready().push(dir);
@@ -158,6 +186,14 @@ impl Cgroups {
         }
         Ok(full)
     }
+}
+
+/// `vcpu_milli` times the burst factor `tenths`, except in the latency class.
+fn cap(qos: Qos, vcpu_milli: u32, tenths: u32) -> u32 {
+    if qos == Qos::Latency {
+        return vcpu_milli;
+    }
+    u32::try_from(u64::from(vcpu_milli) * u64::from(tenths) / 10).unwrap_or(u32::MAX)
 }
 
 /// Kills whatever is in the cgroup `dir`, waits for it to go, and removes the directory. A cgroup
@@ -351,6 +387,24 @@ pub(crate) mod tests {
         assert_eq!(read(&leaf, "memory.max"), (512u64 << 20).to_string());
         assert_eq!(read(&leaf, "cpu.max"), "100000 100000");
         assert_eq!(read(&leaf, "pids.max"), "1024");
+    }
+
+    #[tokio::test]
+    async fn spares_are_made_with_the_burst_factor_of_their_class() {
+        let Some(t) = Tree::new() else { return };
+        let c = Cgroups::init(&t.0, 1).unwrap().with_burst(20);
+        assert_eq!(c.quota(Qos::Standard, 1500), 3000);
+        assert_eq!(c.quota(Qos::BestEffort, 250), 500);
+        assert_eq!(c.quota(Qos::Latency, 1500), 1500);
+        c.fill_once().unwrap();
+        for (qos, want) in [(Qos::Latency, "100000"), (Qos::Standard, "200000")] {
+            let r = Resources { vcpu_milli: c.quota(qos, 1000), ..Resources::default() };
+            let leaf = c.take(qos, &r).unwrap();
+            assert_eq!(read(&leaf, "cpu.max"), format!("{want} 100000"), "{qos:?}");
+        }
+        // A factor below one would cap cells under what they asked for, so it is taken as one.
+        let c = Cgroups::init(&t.0, 0).unwrap().with_burst(5);
+        assert_eq!(c.quota(Qos::Standard, 1500), 1500);
     }
 
     #[tokio::test]
