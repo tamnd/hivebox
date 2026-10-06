@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The Python SDK has `hive.verify`, which runs `Verify.Run` and returns a `VerifyResult` with the verdict, the tampered paths, the scores and an error that says whether to mask the sample. `AsyncHive` takes `http://host:port` for a gate without TLS and reads the token from `$HIVE_TOKEN`.
+
 ## 0.0.22
 
 The rollout worker, and `Verify.Run` through the gate.

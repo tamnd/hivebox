@@ -60,3 +60,32 @@ def test_errors_are_raised_as_their_reason():
     assert isinstance(e, hivebox.Internal) and e.is_infra_error
     e = _errors.from_rpc(FakeRpcError(grpc.StatusCode.UNIMPLEMENTED, "no"))
     assert e.reason == "INTERNAL" and not e.is_infra_error
+
+
+def test_a_verify_result_keeps_the_verdict_and_the_error():
+    from hivebox.v1 import types_pb2, verify_pb2
+
+    r = _client.VerifyResult._from(verify_pb2.VerifyResult(
+        passed=True, exit_code=0, output=b"1 passed", scores={"tests_passed": 1.0}, tampered=["tests/a.py"],
+        runs_passed=3))
+    assert (r.passed, r.output, r.scores, r.tampered, r.runs_passed, r.error, r.is_infra_error) == (
+        True, b"1 passed", {"tests_passed": 1.0}, ["tests/a.py"], 3, None, False)
+    r = _client.VerifyResult._from(verify_pb2.VerifyResult(
+        error=types_pb2.Error(reason="CAPACITY_UNAVAILABLE", message="full", is_infra_error=True)))
+    assert isinstance(r.error, hivebox.CapacityUnavailable) and r.is_infra_error and not r.passed
+
+
+async def test_endpoints_pick_tls_and_where_the_token_goes():
+    plain = hivebox.AsyncHive("http://gate:7401", token="k", project="p")
+    assert ("authorization", "Bearer k") in plain._metadata and ("x-hive-project", "p") in plain._metadata
+    tls = hivebox.AsyncHive("https://gate:7401", token="k")
+    assert tls._metadata == ()
+    for h in (plain, tls):
+        await h.close()
+
+
+async def test_verify_wants_argv_as_a_list():
+    hive = hivebox.AsyncHive("http://gate:7401")
+    with pytest.raises(hivebox.InvalidArgument):
+        await hive.verify("pytest -q", verifier=hivebox.Spec(image="i"), workdir="/w")
+    await hive.close()

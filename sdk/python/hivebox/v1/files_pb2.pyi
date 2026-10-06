@@ -79,18 +79,20 @@ class Chunk(_message.Message):
     def __init__(self, data: _Optional[bytes] = ...) -> None: ...
 
 class WriteFileHeader(_message.Message):
-    __slots__ = ("cell_id", "path", "mode", "make_parents", "append")
+    __slots__ = ("cell_id", "path", "mode", "make_parents", "append", "user")
     CELL_ID_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
     MODE_FIELD_NUMBER: _ClassVar[int]
     MAKE_PARENTS_FIELD_NUMBER: _ClassVar[int]
     APPEND_FIELD_NUMBER: _ClassVar[int]
+    USER_FIELD_NUMBER: _ClassVar[int]
     cell_id: str
     path: str
     mode: int
     make_parents: bool
     append: bool
-    def __init__(self, cell_id: _Optional[str] = ..., path: _Optional[str] = ..., mode: _Optional[int] = ..., make_parents: _Optional[bool] = ..., append: _Optional[bool] = ...) -> None: ...
+    user: str
+    def __init__(self, cell_id: _Optional[str] = ..., path: _Optional[str] = ..., mode: _Optional[int] = ..., make_parents: _Optional[bool] = ..., append: _Optional[bool] = ..., user: _Optional[str] = ...) -> None: ...
 
 class WriteFileChunk(_message.Message):
     __slots__ = ("header", "data")

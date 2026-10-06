@@ -26,8 +26,7 @@ if _version_not_supported:
 
 
 class VerifyStub:
-    """Draft: lands with the RL integration in M2.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -43,8 +42,7 @@ class VerifyStub:
 
 
 class VerifyServicer:
-    """Draft: lands with the RL integration in M2.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     def Run(self, request, context):
         """Runs a verifier in a fresh cell against the changes of a subject cell, so the policy under training never sees the verifier.
@@ -70,8 +68,7 @@ def add_VerifyServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class Verify:
-    """Draft: lands with the RL integration in M2.
-    """
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
     def Run(request,

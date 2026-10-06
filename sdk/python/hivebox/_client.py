@@ -12,7 +12,17 @@ import grpc
 from google.protobuf import duration_pb2
 
 from . import _errors
-from .v1 import cells_pb2, cells_pb2_grpc, exec_pb2, exec_pb2_grpc, files_pb2, files_pb2_grpc, types_pb2
+from .v1 import (
+    cells_pb2,
+    cells_pb2_grpc,
+    exec_pb2,
+    exec_pb2_grpc,
+    files_pb2,
+    files_pb2_grpc,
+    types_pb2,
+    verify_pb2,
+    verify_pb2_grpc,
+)
 
 DEFAULT_SOCKET = "/run/hivebox/comb.sock"
 PROJECT_HEADER = "x-hive-project"
@@ -122,6 +132,36 @@ class RunResult:
 
 
 @dataclass
+class VerifyResult:
+    """What a verifier made of a subject's changes. `passed` is every run exiting with 0, and
+    `error` is why the check could not be done, if it could not, in which case `passed` says
+    nothing about the subject. `scores` has the test counts pytest printed, the diff's size and
+    how long each step took in milliseconds."""
+
+    passed: bool
+    exit_code: int
+    output: bytes
+    scores: dict[str, float]
+    tampered: list[str]
+    flaky: bool
+    runs_passed: int
+    error: _errors.HiveError | None
+
+    @classmethod
+    def _from(cls, r) -> VerifyResult:
+        err = None
+        if r.HasField("error"):
+            err = _errors.make(r.error.reason, r.error.message, is_infra_error=r.error.is_infra_error,
+                               errno_name=r.error.errno or None)
+        return cls(r.passed, r.exit_code, r.output, dict(r.scores), list(r.tampered), r.flaky, r.runs_passed, err)
+
+    @property
+    def is_infra_error(self) -> bool:
+        """The check failed because of hivebox, so a trainer should mask the sample."""
+        return self.error is not None and self.error.is_infra_error
+
+
+@dataclass
 class SessionResult:
     """How a command in a session ended, with stdout and stderr together."""
 
@@ -173,24 +213,31 @@ def _selector(selector: str | Mapping[str, str] | Cell) -> types_pb2.CellSelecto
 class AsyncHive:
     """A connection to a comb's local API, or to a gate.
 
-    The endpoint is `unix:/path/to/comb.sock` or `host:port`, and defaults to $HIVE_ENDPOINT,
-    then to the comb's socket. Use it as an async context manager, or call `close`.
+    The endpoint is `unix:/path/to/comb.sock`, `host:port` or `https://host:port` for a gate
+    with TLS, or `http://host:port` for one without. It defaults to $HIVE_ENDPOINT, then to the
+    comb's socket. The token defaults to $HIVE_TOKEN. Use it as an async context manager, or call
+    `close`.
     """
 
     def __init__(self, endpoint: str | None = None, *, token: str | None = None, project: str | None = None):
         endpoint = endpoint or os.environ.get("HIVE_ENDPOINT") or f"unix:{os.environ.get('HIVE_SOCKET', DEFAULT_SOCKET)}"
         project = project or os.environ.get("HIVE_PROJECT")
+        token = token or os.environ.get("HIVE_TOKEN")
+        plain = endpoint.startswith(("unix:", "http://"))
+        target = endpoint.removeprefix("http://").removeprefix("https://")
         options = [("grpc.max_receive_message_length", _MAX_MESSAGE), ("grpc.max_send_message_length", _MAX_MESSAGE)]
         if endpoint.startswith("unix:"):
             # grpcio sends the socket path as the authority, which the comb's HTTP/2 server
             # rejects as malformed, so every call fails with RST_STREAM.
             options.append(("grpc.default_authority", "localhost"))
-        if token and not endpoint.startswith("unix:"):
-            creds = grpc.composite_channel_credentials(grpc.ssl_channel_credentials(), grpc.access_token_call_credentials(token))
-            self._channel = grpc.aio.secure_channel(endpoint, creds, options=options)
+        if endpoint.startswith("https://") or (token and not plain):
+            creds = grpc.ssl_channel_credentials()
+            if token:
+                creds = grpc.composite_channel_credentials(creds, grpc.access_token_call_credentials(token))
+            self._channel = grpc.aio.secure_channel(target, creds, options=options)
             self._metadata: tuple = ()
         else:
-            self._channel = grpc.aio.insecure_channel(endpoint, options=options)
+            self._channel = grpc.aio.insecure_channel(target, options=options)
             self._metadata = (("authorization", f"Bearer {token}"),) if token else ()
         if project:
             self._metadata += ((PROJECT_HEADER, project),)
@@ -198,6 +245,7 @@ class AsyncHive:
         self._cells = cells_pb2_grpc.CellsStub(self._channel)
         self._exec = exec_pb2_grpc.ExecStub(self._channel)
         self._files = files_pb2_grpc.FilesStub(self._channel)
+        self._verify = verify_pb2_grpc.VerifyStub(self._channel)
         self.cells = Cells(self)
 
     async def close(self) -> None:
@@ -208,6 +256,31 @@ class AsyncHive:
 
     async def __aexit__(self, *exc) -> None:
         await self.close()
+
+    async def verify(self, argv: Sequence[str], *, verifier: Spec, workdir: str, subject: Cell | str | None = None,
+                     protected_paths: Iterable[str] = (), files: Mapping[str, bytes | str] | None = None,
+                     repeats: int = 1, timeout: float | str | None = None) -> VerifyResult:
+        """Checks the changes `subject` made to the git checkout at `workdir` in a fresh cell
+        made from `verifier`, with no network, and runs `argv` there `repeats` times. Changes to
+        `protected_paths`, globs like tests/** under `workdir`, are left out and reported in
+        `tampered`. `files`, such as hidden tests, are written in after the changes, a relative
+        path being under `workdir`. With no subject the image is checked as it is. `timeout` is
+        for each run. A check that could not be done returns with `error` set rather than
+        raising, unless the request itself was wrong."""
+        if isinstance(argv, str):
+            raise _errors.InvalidArgument("argv is a list, like [\"bash\", \"-c\", script]")
+        subject_id = subject.id if isinstance(subject, Cell) else (subject or "")
+        req = verify_pb2.VerifyRequest(
+            subject_cell_id=subject_id,
+            verifier=verifier.to_proto(),
+            argv=list(argv),
+            workdir=workdir,
+            protected_paths=list(protected_paths),
+            files={k: v.encode() if isinstance(v, str) else v for k, v in (files or {}).items()},
+            repeats=repeats,
+            timeout=_seconds(timeout),
+        )
+        return VerifyResult._from(await self._call(self._verify.Run, req))
 
     async def _call(self, method, request, *, retry: bool = False, timeout: float | None = None):
         """One unary call. With `retry`, a failure that was hivebox's is tried again, since

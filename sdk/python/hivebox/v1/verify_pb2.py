@@ -26,21 +26,25 @@ from google.protobuf import duration_pb2 as google_dot_protobuf_dot_duration__pb
 from hivebox.v1 import types_pb2 as hivebox_dot_v1_dot_types__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17hivebox/v1/verify.proto\x12\nhivebox.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x16hivebox/v1/types.proto\"\x8a\x01\n\rVerifyRequest\x12\x17\n\x0fsubject_cell_id\x18\x01 \x01(\t\x12&\n\x08verifier\x18\x02 \x01(\x0b\x32\x14.hivebox.v1.CellSpec\x12\x0c\n\x04\x61rgv\x18\x03 \x03(\t\x12*\n\x07timeout\x18\x04 \x01(\x0b\x32\x19.google.protobuf.Duration\"\xc8\x01\n\x0cVerifyResult\x12\x0e\n\x06passed\x18\x01 \x01(\x08\x12\x11\n\texit_code\x18\x02 \x01(\x05\x12\x0e\n\x06output\x18\x03 \x01(\x0c\x12\x34\n\x06scores\x18\x04 \x03(\x0b\x32$.hivebox.v1.VerifyResult.ScoresEntry\x12 \n\x05\x65rror\x18\x05 \x01(\x0b\x32\x11.hivebox.v1.Error\x1a-\n\x0bScoresEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x32\x44\n\x06Verify\x12:\n\x03Run\x12\x19.hivebox.v1.VerifyRequest\x1a\x18.hivebox.v1.VerifyResultb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17hivebox/v1/verify.proto\x12\nhivebox.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x16hivebox/v1/types.proto\"\xa8\x02\n\rVerifyRequest\x12\x17\n\x0fsubject_cell_id\x18\x01 \x01(\t\x12&\n\x08verifier\x18\x02 \x01(\x0b\x32\x14.hivebox.v1.CellSpec\x12\x0c\n\x04\x61rgv\x18\x03 \x03(\t\x12*\n\x07timeout\x18\x04 \x01(\x0b\x32\x19.google.protobuf.Duration\x12\x0f\n\x07workdir\x18\x05 \x01(\t\x12\x17\n\x0fprotected_paths\x18\x06 \x03(\t\x12\x33\n\x05\x66iles\x18\x07 \x03(\x0b\x32$.hivebox.v1.VerifyRequest.FilesEntry\x12\x0f\n\x07repeats\x18\x08 \x01(\r\x1a,\n\nFilesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x0c:\x02\x38\x01\"\xfe\x01\n\x0cVerifyResult\x12\x0e\n\x06passed\x18\x01 \x01(\x08\x12\x11\n\texit_code\x18\x02 \x01(\x05\x12\x0e\n\x06output\x18\x03 \x01(\x0c\x12\x34\n\x06scores\x18\x04 \x03(\x0b\x32$.hivebox.v1.VerifyResult.ScoresEntry\x12 \n\x05\x65rror\x18\x05 \x01(\x0b\x32\x11.hivebox.v1.Error\x12\x10\n\x08tampered\x18\x06 \x03(\t\x12\r\n\x05\x66laky\x18\x07 \x01(\x08\x12\x13\n\x0bruns_passed\x18\x08 \x01(\r\x1a-\n\x0bScoresEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x32\x44\n\x06Verify\x12:\n\x03Run\x12\x19.hivebox.v1.VerifyRequest\x1a\x18.hivebox.v1.VerifyResultb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'hivebox.v1.verify_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
+  _globals['_VERIFYREQUEST_FILESENTRY']._loaded_options = None
+  _globals['_VERIFYREQUEST_FILESENTRY']._serialized_options = b'8\001'
   _globals['_VERIFYRESULT_SCORESENTRY']._loaded_options = None
   _globals['_VERIFYRESULT_SCORESENTRY']._serialized_options = b'8\001'
   _globals['_VERIFYREQUEST']._serialized_start=96
-  _globals['_VERIFYREQUEST']._serialized_end=234
-  _globals['_VERIFYRESULT']._serialized_start=237
-  _globals['_VERIFYRESULT']._serialized_end=437
-  _globals['_VERIFYRESULT_SCORESENTRY']._serialized_start=392
-  _globals['_VERIFYRESULT_SCORESENTRY']._serialized_end=437
-  _globals['_VERIFY']._serialized_start=439
-  _globals['_VERIFY']._serialized_end=507
+  _globals['_VERIFYREQUEST']._serialized_end=392
+  _globals['_VERIFYREQUEST_FILESENTRY']._serialized_start=348
+  _globals['_VERIFYREQUEST_FILESENTRY']._serialized_end=392
+  _globals['_VERIFYRESULT']._serialized_start=395
+  _globals['_VERIFYRESULT']._serialized_end=649
+  _globals['_VERIFYRESULT_SCORESENTRY']._serialized_start=604
+  _globals['_VERIFYRESULT_SCORESENTRY']._serialized_end=649
+  _globals['_VERIFY']._serialized_start=651
+  _globals['_VERIFY']._serialized_end=719
 # @@protoc_insertion_point(module_scope)
