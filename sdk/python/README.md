@@ -82,6 +82,19 @@ The three tools share the trajectory's cell, made on the first tool call, and `b
 
 The tools also work in verl's plain `tool_agent` loop. There they find the trajectory by verl's request id, `submit` stops the cell, and the reward is the `submit` call's tool reward. A trajectory that never submits is not checked, and its cell ends at its hard TTL, the task's `max_wall_s` plus 15 minutes.
 
+## slime
+
+slime's coding agent example can run its sandboxes on hivebox through the gate's E2B API, with `E2B_API_URL` and `E2B_SANDBOX_URL` set to the gate and `SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY` set to the gate's `e2b.image_key`. `hivebox.slime` moves the grading into `Verify.Run` as well. Its `run_evaluation` takes what slime's does and grades the same way: a fresh cell from the task's image, the pre commands, the diff by the same ladder of `git apply` and `patch`, then the task's `eval_cmd` or `f2p_script`, with 1 for an exit code of 0. The verifier cell has no network, and the files it needs go in with the call, so grading is one request.
+
+```python
+from examples.coding_agent_rl import swe
+from hivebox import slime
+
+slime.install(swe, slime.Grader(mem_mib=2048, cpu_milli=2000, repeats=1))
+```
+
+`install` swaps `swe.run_evaluation`, which `generate.py` calls, and keeps slime's grader for swepro and SWE-bench tasks. The client comes from `$HIVE_ENDPOINT` and `$HIVE_TOKEN`. When hivebox cannot do the check, `run_evaluation` raises `HiveError`, and `generate` aborts the sample so it is left out of training. The result is still `(reward, applied_cleanly)`, with the verdict in `.verdict` for the test counts and timings. One difference: slime runs the tests as its `agent` user, and the verifier runs them as the cell's default user.
+
 ## Development
 
 The stubs in `hivebox/v1` are made from the protos in `crates/hive-proto/proto` by `generate.sh`, and are checked in so installing needs no protoc.
@@ -99,4 +112,4 @@ The verify test also wants `HIVE_TEST_GIT_IMAGE`, an image with a git checkout a
 HIVE_TEST_GIT_IMAGE=swe-requests pytest tests/test_live.py -s -k verify
 ```
 
-`tests/test_verl.py` wants the same, with verl installed.
+`tests/test_verl.py` wants the same, with verl installed, and so does `tests/test_slime.py`, without slime.
