@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hivebox.verl`, tools and an agent loop for verl 0.9. `BashTool`, `EditorTool` and `SubmitTool` work in one hivebox cell per trajectory, made on the first tool call, with a shell that keeps its directory and variables. `HiveAgentLoop` (`hive_agent`) checks each trajectory with `Verify.Run` when it ends, sets the sample's reward score, puts the verdict in its extra fields and stops the cell. A failure in hivebox gives a reward of 0 with `hive_infra_error` set, so the trainer can mask the sample.
 - The Python SDK has `hive.verify`, which runs `Verify.Run` and returns a `VerifyResult` with the verdict, the tampered paths, the scores and an error that says whether to mask the sample. `AsyncHive` takes `http://host:port` for a gate without TLS and reads the token from `$HIVE_TOKEN`.
 
 ## 0.0.22
