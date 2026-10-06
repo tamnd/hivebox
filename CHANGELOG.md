@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The gate routes the `Llm` service. `SetRoute` and `Hold` go to every node, leaving out nodes with no gateway, and `Hold` adds up the calls left in flight. `Turns` for a rollout gathers the turns from every node in order and lists the nodes it could not reach in `unreached`, and `Turns` for a cell goes to the cell's node. Tokens can be held to the new `llm` call.
+
 - The LLM gateway. Cells with the `llm` network profile reach `http://llm.hive.internal` (169.254.77.81), and the comb forwards their OpenAI and Anthropic style calls to the project's inference engine with the trainer's key, which the cell never sees. For chat and completions calls it asks the engine for the token ids, and log probabilities when `[network.llm] logprobs` is set, keeps them by the cell's `rollout_id` label within `keep_mib`, and takes them out of the answer, streamed or not, unless the cell asked for them. The new `Llm` service sets a project's route, holds its calls with 503 and Retry-After around a weight sync, and returns the turns. The Python SDK has it as `hive.llm` with `route`, `hold`, `release` and `turns`.
 
 ## 0.0.23

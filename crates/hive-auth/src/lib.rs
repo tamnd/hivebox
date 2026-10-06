@@ -33,6 +33,7 @@ pub const OPS: &[&str] = &[
     "exec",
     "files",
     "verify",
+    "llm",
 ];
 
 /// Why a token was not taken.

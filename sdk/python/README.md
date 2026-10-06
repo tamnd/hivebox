@@ -117,6 +117,8 @@ await hive.llm.release()
 
 For chat and completions calls the gateway asks the engine for `return_token_ids`, as vLLM takes it, and for log probabilities too when the node sets `[network.llm] logprobs`, then takes whatever the cell did not ask for out of the answer, streamed or not. `turns` gives a rollout's calls in order, or one cell's with `cell=`, and `take=True` removes them. When the gateway runs out of the memory it keeps turns in, it drops the rollout changed longest ago and counts the calls in `hive.llm.dropped`. `hold` answers new calls with 503 and Retry-After, which OpenAI's clients wait out, and waits up to `drain` for the calls in flight, returning how many are left. The hold ends with `release`, or by itself after `ttl` (10 minutes unless set).
 
+Through a gate, `route`, `hold` and `release` go to every node, and `hold` returns the calls left in flight on all of them. `turns` for a rollout asks every node too, while `turns` with `cell=` asks only the node the cell is on, which is cheaper when there are many nodes and the trainer knows the cell. A node that did not answer a rollout's `turns` is listed in `hive.llm.unreached`, and its turns are still there for the next call. A comb that restarts, or a node that joins later, goes back to its own route from its config until `route` is called again.
+
 ## Development
 
 The stubs in `hivebox/v1` are made from the protos in `crates/hive-proto/proto` by `generate.sh`, and are checked in so installing needs no protoc.

@@ -48,12 +48,14 @@ class LlmTurnsRequest(_message.Message):
     def __init__(self, rollout_id: _Optional[str] = ..., cell_id: _Optional[str] = ..., take: _Optional[bool] = ...) -> None: ...
 
 class LlmTurnsResponse(_message.Message):
-    __slots__ = ("turns", "dropped")
+    __slots__ = ("turns", "dropped", "unreached")
     TURNS_FIELD_NUMBER: _ClassVar[int]
     DROPPED_FIELD_NUMBER: _ClassVar[int]
+    UNREACHED_FIELD_NUMBER: _ClassVar[int]
     turns: _containers.RepeatedCompositeFieldContainer[LlmTurn]
     dropped: int
-    def __init__(self, turns: _Optional[_Iterable[_Union[LlmTurn, _Mapping]]] = ..., dropped: _Optional[int] = ...) -> None: ...
+    unreached: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, turns: _Optional[_Iterable[_Union[LlmTurn, _Mapping]]] = ..., dropped: _Optional[int] = ..., unreached: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class LlmTurn(_message.Message):
     __slots__ = ("cell_id", "rollout_id", "seq", "path", "model", "status", "stream", "started", "took", "prompt_ids", "choices", "prompt_tokens", "completion_tokens", "error")

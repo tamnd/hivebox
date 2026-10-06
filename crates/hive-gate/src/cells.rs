@@ -100,6 +100,11 @@ impl Api {
         Ok(self.client(self.inner.nodes.channel(node).map_err(|e| convert::error_to_status(&e))?))
     }
 
+    /// The nodes the gate knows.
+    pub(crate) fn nodes(&self) -> &Nodes {
+        &self.inner.nodes
+    }
+
     /// The channel to `node`.
     pub(crate) fn channel(&self, node: u16) -> Result<Channel, Status> {
         self.inner.nodes.channel(node).map_err(|e| convert::error_to_status(&e))

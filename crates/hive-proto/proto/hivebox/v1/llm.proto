@@ -60,6 +60,9 @@ message LlmTurnsResponse {
   // Calls the gateway dropped for the project since the comb started, a whole rollout at a time,
   // the one changed longest ago first, to keep within the node's memory for them.
   uint64 dropped = 2;
+  // Nodes the gate could not get turns from, so theirs are not here and a later call may get
+  // them. Only the gate sets it, when it gathers a rollout's turns from every node.
+  repeated uint32 unreached = 3;
 }
 
 // One call a cell made through the gateway.
