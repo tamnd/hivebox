@@ -45,7 +45,7 @@ from ._errors import (
     QuotaExceeded,
 )
 
-__version__ = "0.0.22"
+__version__ = "0.0.23"
 
 __all__ = [
     "DEFAULT_SOCKET", "AsyncHive", "BulkResult", "Cell", "CellGroup", "Cells", "FileInfo", "Files", "Process",
