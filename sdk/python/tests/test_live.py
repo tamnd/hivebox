@@ -1,5 +1,6 @@
 """The SDK against a real comb. Set HIVE_TEST_ENDPOINT to its socket, like unix:/run/hivebox/comb.sock,
-and HIVE_TEST_IMAGE to an image it has with python3 in it."""
+and HIVE_TEST_IMAGE to an image it has with python3 in it. Through a gate, set HIVE_TOKEN too, and
+HIVE_TEST_OTHER_TOKEN to a key for another project, since there the key picks the project."""
 
 import asyncio
 import errno
@@ -16,7 +17,15 @@ ENDPOINT = os.environ.get("HIVE_TEST_ENDPOINT")
 IMAGE = os.environ.get("HIVE_TEST_IMAGE", "python")
 # A label only this run uses, so cells left by an earlier run are not counted.
 RUN = f"many-{os.getpid()}"
+OTHER_TOKEN = os.environ.get("HIVE_TEST_OTHER_TOKEN")
 pytestmark = pytest.mark.skipif(not ENDPOINT, reason="set HIVE_TEST_ENDPOINT to run against a comb")
+
+
+def other_project():
+    """A client in another project."""
+    if os.environ.get("HIVE_TOKEN") and not OTHER_TOKEN:
+        pytest.fail("through a gate, set HIVE_TEST_OTHER_TOKEN to a key for another project")
+    return hivebox.AsyncHive(ENDPOINT, project="sdk-other", token=OTHER_TOKEN)
 
 
 def spec(**kw):
@@ -83,7 +92,7 @@ async def test_a_cell_runs_commands_keeps_sessions_and_files():
         with pytest.raises(hivebox.InvalidArgument):
             await hive.cells.get("c" * 26)
         # Another project does not see the cell at all.
-        async with hivebox.AsyncHive(ENDPOINT, project="sdk-other") as other:
+        async with other_project() as other:
             with pytest.raises(hivebox.CellNotFound):
                 await other.cells.get(cell.id)
 
@@ -106,5 +115,28 @@ async def test_many_cells_at_once_and_bulk_calls():
         left = await hive.cells.list({"test": RUN}, states=["running", "paused"])
         assert left == []
         # Another project sees none of them.
-        async with hivebox.AsyncHive(ENDPOINT, project="sdk-other") as other:
+        async with other_project() as other:
             assert await other.cells.list({"test": RUN}) == []
+
+
+GIT_IMAGE = os.environ.get("HIVE_TEST_GIT_IMAGE")
+GIT_WORKDIR = os.environ.get("HIVE_TEST_GIT_WORKDIR", "/testbed")
+
+
+@pytest.mark.skipif(not GIT_IMAGE, reason="set HIVE_TEST_GIT_IMAGE to an image with a git checkout at HIVE_TEST_GIT_WORKDIR")
+async def test_verify_checks_a_cells_changes_in_a_cell_of_its_own():
+    verifier = hivebox.Spec(image=GIT_IMAGE, backend="container", mem_mib=512)
+    check = ["bash", "-c", "[ \"$(cat probe.txt 2>/dev/null)\" = fixed ] && test ! -e guarded.txt && grep -q 7 hidden.txt"]
+    async with hivebox.AsyncHive(ENDPOINT, project="sdk-test") as hive:
+        cell = await hive.cells.create(hivebox.Spec(image=GIT_IMAGE, backend="container", mem_mib=512))
+        try:
+            await cell.run("echo fixed > probe.txt && echo x > guarded.txt", cwd=GIT_WORKDIR)
+            r = await hive.verify(check, subject=cell, verifier=verifier, workdir=GIT_WORKDIR,
+                                  protected_paths=["guarded.txt"], files={"hidden.txt": "7\n"}, repeats=2)
+            assert (r.passed, r.exit_code, r.runs_passed, r.flaky, r.error) == (True, 0, 2, False, None), r.output
+            assert r.tampered == ["guarded.txt"] and r.scores["diff_bytes"] > 0
+        finally:
+            await cell.stop()
+        # With no subject the image is checked as it is, and has no probe.txt.
+        r = await hive.verify(check, verifier=verifier, workdir=GIT_WORKDIR, files={"hidden.txt": "7\n"})
+        assert (r.passed, r.exit_code, r.runs_passed, r.error) == (False, 1, 0, None)

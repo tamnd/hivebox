@@ -98,14 +98,16 @@ class ExtendTtlRequest(_message.Message):
     def __init__(self, id: _Optional[str] = ..., hard_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., idle_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ...) -> None: ...
 
 class UpdatePolicyRequest(_message.Message):
-    __slots__ = ("id", "network_profile", "limits")
+    __slots__ = ("id", "network_profile", "limits", "ready")
     ID_FIELD_NUMBER: _ClassVar[int]
     NETWORK_PROFILE_FIELD_NUMBER: _ClassVar[int]
     LIMITS_FIELD_NUMBER: _ClassVar[int]
+    READY_FIELD_NUMBER: _ClassVar[int]
     id: str
     network_profile: str
     limits: _types_pb2.Limits
-    def __init__(self, id: _Optional[str] = ..., network_profile: _Optional[str] = ..., limits: _Optional[_Union[_types_pb2.Limits, _Mapping]] = ...) -> None: ...
+    ready: bool
+    def __init__(self, id: _Optional[str] = ..., network_profile: _Optional[str] = ..., limits: _Optional[_Union[_types_pb2.Limits, _Mapping]] = ..., ready: _Optional[bool] = ...) -> None: ...
 
 class ExposePortRequest(_message.Message):
     __slots__ = ("id", "port")

@@ -141,7 +141,7 @@ class CheckpointPolicy(_message.Message):
     def __init__(self, none: _Optional[bool] = ..., every: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., on_session_idle: _Optional[bool] = ...) -> None: ...
 
 class CellSpec(_message.Message):
-    __slots__ = ("template", "image", "snapshot", "backend", "resources", "qos", "network_profile", "idle_ttl", "idle_action", "hard_ttl", "labels", "env", "limits", "trusted_image", "checkpoint")
+    __slots__ = ("template", "image", "snapshot", "backend", "resources", "qos", "network_profile", "idle_ttl", "idle_action", "hard_ttl", "labels", "env", "limits", "trusted_image", "checkpoint", "burst_until_ready")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -171,6 +171,7 @@ class CellSpec(_message.Message):
     LIMITS_FIELD_NUMBER: _ClassVar[int]
     TRUSTED_IMAGE_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINT_FIELD_NUMBER: _ClassVar[int]
+    BURST_UNTIL_READY_FIELD_NUMBER: _ClassVar[int]
     template: str
     image: ImageRef
     snapshot: SnapshotRef
@@ -186,7 +187,8 @@ class CellSpec(_message.Message):
     limits: Limits
     trusted_image: bool
     checkpoint: CheckpointPolicy
-    def __init__(self, template: _Optional[str] = ..., image: _Optional[_Union[ImageRef, _Mapping]] = ..., snapshot: _Optional[_Union[SnapshotRef, _Mapping]] = ..., backend: _Optional[_Union[Backend, str]] = ..., resources: _Optional[_Union[Resources, _Mapping]] = ..., qos: _Optional[_Union[Qos, str]] = ..., network_profile: _Optional[str] = ..., idle_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., idle_action: _Optional[_Union[IdleAction, str]] = ..., hard_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., labels: _Optional[_Mapping[str, str]] = ..., env: _Optional[_Mapping[str, str]] = ..., limits: _Optional[_Union[Limits, _Mapping]] = ..., trusted_image: _Optional[bool] = ..., checkpoint: _Optional[_Union[CheckpointPolicy, _Mapping]] = ...) -> None: ...
+    burst_until_ready: _duration_pb2.Duration
+    def __init__(self, template: _Optional[str] = ..., image: _Optional[_Union[ImageRef, _Mapping]] = ..., snapshot: _Optional[_Union[SnapshotRef, _Mapping]] = ..., backend: _Optional[_Union[Backend, str]] = ..., resources: _Optional[_Union[Resources, _Mapping]] = ..., qos: _Optional[_Union[Qos, str]] = ..., network_profile: _Optional[str] = ..., idle_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., idle_action: _Optional[_Union[IdleAction, str]] = ..., hard_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., labels: _Optional[_Mapping[str, str]] = ..., env: _Optional[_Mapping[str, str]] = ..., limits: _Optional[_Union[Limits, _Mapping]] = ..., trusted_image: _Optional[bool] = ..., checkpoint: _Optional[_Union[CheckpointPolicy, _Mapping]] = ..., burst_until_ready: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ...) -> None: ...
 
 class Cell(_message.Message):
     __slots__ = ("id", "project", "state", "cause", "backend", "spec", "node", "created_at", "state_since", "expires_at", "labels")
