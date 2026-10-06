@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package hivebox.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "hivebox/v1/types.proto";
+
+// The LLM gateway each node runs for cells with the `llm` network profile, which reach it at
+// http://llm.hive.internal. It forwards OpenAI and Anthropic style calls to the project's
+// inference engine with the engine's key, which the cell never sees, and keeps the token ids of
+// each call for the trainer.
+service Llm {
+  // Sets where calls from the project's cells go on this node.
+  rpc SetRoute(LlmRoute) returns (Empty);
+  // Answers new calls from the project's cells with 503 and Retry-After, as while the engine
+  // loads new weights, and waits for the calls in flight to end.
+  rpc Hold(LlmHoldRequest) returns (LlmHoldResult);
+  // The calls the project's cells made, with their token ids.
+  rpc Turns(LlmTurnsRequest) returns (LlmTurnsResponse);
+}
+
+message LlmRoute {
+  // The engine's base URL, such as http://10.0.0.5:30000, plain HTTP. A call to
+  // /v1/chat/completions goes to that path under it. Empty goes back to the node's own route.
+  string upstream = 1;
+  // Sent to the engine as a bearer token in place of whatever the cell sent.
+  string api_key = 2;
+}
+
+message LlmHoldRequest {
+  // Ends the hold, and the rest of the request is ignored.
+  bool release = 1;
+  // What the 503 answers say in Retry-After. 5 s when unset.
+  google.protobuf.Duration retry_after = 2;
+  // The hold ends by itself after this, in case the trainer never ends it. 10 min when unset,
+  // and at most an hour.
+  google.protobuf.Duration ttl = 3;
+  // How long to wait for the calls in flight to end before answering. None when unset.
+  google.protobuf.Duration drain = 4;
+}
+
+message LlmHoldResult {
+  // Calls from the project's cells still in flight when the call returned.
+  uint32 in_flight = 1;
+}
+
+message LlmTurnsRequest {
+  // The calls from cells with this rollout label, by default `rollout_id`.
+  string rollout_id = 1;
+  // The calls from this cell. With a rollout id too, only the calls that match both.
+  string cell_id = 2;
+  // Removes the calls returned, so the next call does not return them again.
+  bool take = 3;
+}
+
+message LlmTurnsResponse {
+  // In the order they were made.
+  repeated LlmTurn turns = 1;
+  // Calls the gateway dropped for the project since the comb started, a whole rollout at a time,
+  // the one changed longest ago first, to keep within the node's memory for them.
+  uint64 dropped = 2;
+}
+
+// One call a cell made through the gateway.
+message LlmTurn {
+  string cell_id = 1;
+  // The cell's rollout label. Empty when it has none.
+  string rollout_id = 2;
+  // The call's place among the rollout's calls, or the cell's when it has no rollout label.
+  uint64 seq = 3;
+  // The path called, such as /v1/chat/completions.
+  string path = 4;
+  // The model the engine answered with, or the one asked for.
+  string model = 5;
+  // The engine's HTTP status, or the gateway's when the engine did not answer: 502 when it
+  // could not be reached and 504 when it took too long.
+  uint32 status = 6;
+  bool stream = 7;
+  google.protobuf.Timestamp started = 8;
+  google.protobuf.Duration took = 9;
+  // The prompt's tokens as the engine saw them.
+  repeated uint32 prompt_ids = 10;
+  repeated LlmChoice choices = 11;
+  // The engine's token counts.
+  uint64 prompt_tokens = 12;
+  uint64 completion_tokens = 13;
+  // What went wrong, when the call did not end well.
+  string error = 14;
+}
+
+message LlmChoice {
+  uint32 index = 1;
+  // The tokens the engine sampled.
+  repeated uint32 output_ids = 2;
+  // The log probability of each sampled token, when the engine gave them.
+  repeated float logprobs = 3;
+  string finish_reason = 4;
+  // The choice's own prompt, for a completions call with several prompts. Empty when it is the
+  // turn's prompt.
+  repeated uint32 prompt_ids = 5;
+}

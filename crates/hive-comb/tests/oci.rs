@@ -8,7 +8,16 @@
 
 mod common;
 
+use bytes::Bytes;
 use common::*;
+use hive_comb::Llm;
+use hive_comb::api::Api;
+use hive_proto::v1;
+use hive_proto::v1::llm_server::Llm as _;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
+use serde_json::{Value, json};
 
 /// A comb with only the container backend, on pools and a data directory of its own.
 struct Node {
@@ -19,7 +28,12 @@ struct Node {
     guard: Option<Guarded>,
     tree: Tree,
     _scratch: Scratch,
+    // Last, so the next guarded node waits until this one is all gone.
+    _one: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
+
+/// Guarded nodes share the guard's addresses on the host, so one runs at a time.
+static GUARDED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What a node with `hive-guard` adds to the host, removed however the test ends.
 struct Guarded {
@@ -56,6 +70,11 @@ impl Node {
     }
 
     async fn with(depth: usize, guard: bool) -> Option<Self> {
+        Self::build(depth, guard.then(Llm::default)).await
+    }
+
+    /// A node with the guard, and its LLM gateway set up as `llm` says.
+    async fn build(depth: usize, llm: Option<Llm>) -> Option<Self> {
         let Some(drone) = std::env::var_os("HIVE_OCI_DRONE") else {
             eprintln!("skipped: set HIVE_OCI_DRONE to run it");
             return None;
@@ -88,17 +107,22 @@ impl Node {
             (None, Some(image)) => std::os::unix::fs::symlink(image, &python).unwrap(),
             (None, None) => unreachable!(),
         }
-        let guard = guard.then(Guarded::new);
-        let network = match &guard {
-            Some(g) => Network {
+        let one = match llm {
+            Some(_) => Some(GUARDED.lock().await),
+            None => None,
+        };
+        let guard = llm.is_some().then(Guarded::new);
+        let network = match (&guard, llm) {
+            (Some(g), Some(llm)) => Network {
                 guard: true,
                 cells: (std::net::Ipv4Addr::new(100, 64, 240, 0), 24),
                 pin_dir: g.pins.clone(),
                 upstream: vec![upstream().await],
                 profiles: [("lookup".into(), vec!["ok.test".into(), "*.example.test".into()])]
                     .into(),
+                llm,
             },
-            None => Network { guard: false, ..Network::default() },
+            _ => Network { guard: false, ..Network::default() },
         };
         let cfg = Config {
             network,
@@ -115,7 +139,7 @@ impl Node {
         };
         let drone = PathBuf::from(drone);
         let comb = open_oci(&cfg, &drone).await;
-        Some(Self { cfg, drone, comb, guard, tree, _scratch: scratch })
+        Some(Self { cfg, drone, comb, guard, tree, _scratch: scratch, _one: one })
     }
 
     /// Shuts the comb down, which leaves its cells running, and opens a new one on the same data.
@@ -424,6 +448,238 @@ async fn a_guarded_cell_reaches_the_node_resolver_and_nothing_else() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     node.comb.shutdown().await;
+}
+
+/// What the engine was sent: the Authorization header and the body of each call.
+type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// An inference engine that answers chat completions the way vLLM does, streamed or not. The
+/// prompt's tokens are the bytes of the last message, the answer is always "hi", the tokens 104 and
+/// 105, and a model named `slow` takes a second and a half to give it.
+async fn engine() -> (std::net::SocketAddr, Seen) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Seen::default();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let log = log.clone();
+                    async move { Ok::<_, std::convert::Infallible>(answer(req, &log).await) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (addr, seen)
+}
+
+async fn answer(req: hyper::Request<Incoming>, log: &Seen) -> hyper::Response<Full<Bytes>> {
+    if req.uri().path() != "/v1/chat/completions" {
+        let r = hyper::Response::builder().status(404);
+        return r.body(Full::new(req.uri().path().to_string().into())).unwrap();
+    }
+    let auth = req.headers().get("authorization").map_or("", |v| v.to_str().unwrap()).to_string();
+    let v: Value =
+        serde_json::from_slice(&req.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    log.lock().unwrap().push((auth, v.clone()));
+    if v["model"] == "slow" {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    let last = v["messages"].as_array().unwrap().last().unwrap();
+    let prompt: Vec<u32> = last["content"].as_str().unwrap().bytes().map(u32::from).collect();
+    let (ids, lp) = (v["return_token_ids"] == true, v["logprobs"] == true);
+    let usage = json!({"prompt_tokens": prompt.len(), "completion_tokens": 2});
+    let (kind, body) = if v["stream"] == true {
+        let mut first = json!({"model": "m", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]});
+        if ids {
+            first["prompt_token_ids"] = json!(prompt);
+        }
+        let mut events = vec![first];
+        for (t, text) in [(104, "h"), (105, "i")] {
+            let mut c = json!({"index": 0, "delta": {"content": text}});
+            if ids {
+                c["token_ids"] = json!([t]);
+            }
+            if lp {
+                c["logprobs"] = json!({"content": [{"token": text, "logprob": -0.5}]});
+            }
+            events.push(json!({"model": "m", "choices": [c]}));
+        }
+        events.push(
+            json!({"model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        );
+        events.push(json!({"model": "m", "choices": [], "usage": usage}));
+        let mut s: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        s += "data: [DONE]\n\n";
+        ("text/event-stream", s)
+    } else {
+        let mut c = json!({"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop", "logprobs": null});
+        if ids {
+            c["token_ids"] = json!([104, 105]);
+        }
+        if lp {
+            c["logprobs"] = json!({"content": [{"token": "h", "logprob": -0.5}, {"token": "i", "logprob": -0.5}]});
+        }
+        let mut r = json!({"model": "m", "choices": [c], "usage": usage});
+        if ids {
+            r["prompt_token_ids"] = json!(prompt);
+        }
+        ("application/json", r.to_string())
+    };
+    hyper::Response::builder().header("content-type", kind).body(Full::new(body.into())).unwrap()
+}
+
+/// A chat completion from the cell to `llm.hive.internal` with its own key: the status, the
+/// Retry-After header or `-`, and the body.
+async fn chat(comb: &Comb, id: CellId, body: &Value) -> (u16, String, String) {
+    let script = format!(
+        "python3 - '{body}' <<'P'
+import sys, urllib.request, urllib.error
+req = urllib.request.Request('http://llm.hive.internal/v1/chat/completions', data=sys.argv[1].encode(), headers={{'Content-Type': 'application/json', 'Authorization': 'Bearer cell-secret'}})
+try:
+    r = urllib.request.urlopen(req, timeout=30)
+except urllib.error.HTTPError as e:
+    r = e
+print(r.status, r.headers.get('Retry-After') or '-')
+sys.stdout.write(r.read().decode())
+P"
+    );
+    let out = sh(comb, id, &script).await;
+    let (head, body) = out.split_once('\n').unwrap();
+    let (code, retry) = head.split_once(' ').unwrap();
+    (code.parse().unwrap(), retry.to_string(), body.to_string())
+}
+
+fn msg(model: &str, text: &str, extra: &Value) -> Value {
+    let mut v = json!({"model": model, "messages": [{"role": "user", "content": text}]});
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+fn call<T>(m: T) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(m);
+    r.metadata_mut().insert("x-hive-project", "p".parse().unwrap());
+    r
+}
+
+fn hold(retry_s: u64, drain_s: u64) -> tonic::Request<v1::LlmHoldRequest> {
+    call(v1::LlmHoldRequest {
+        retry_after: Some(Duration::from_secs(retry_s).try_into().unwrap()),
+        ttl: Some(Duration::from_secs(60).try_into().unwrap()),
+        drain: Some(Duration::from_secs(drain_s).try_into().unwrap()),
+        ..v1::LlmHoldRequest::default()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_with_the_llm_profile_calls_the_engine_through_the_gateway() {
+    if !Path::new("/sys/fs/bpf").exists() {
+        eprintln!("skipped: no bpf filesystem");
+        return;
+    }
+    let llm = Llm { logprobs: true, ..Llm::default() };
+    let Some(node) = Node::build(4, Some(llm)).await else { return };
+    let comb = node.comb.clone();
+    let api = Api::new(comb.clone(), tokio_util::sync::CancellationToken::new());
+    let (engine, seen) = engine().await;
+    let mut s = spec("python");
+    s.network_profile = "llm".into();
+    s.labels.insert("rollout_id".into(), "r7".into());
+    let id = comb.create(request(s)).await.unwrap().id;
+    let plain = comb.create(request(spec("python"))).await.unwrap().id;
+    assert_eq!(lookup(&comb, id, &["llm.hive.internal"]).await, "169.254.77.81\n");
+    assert_eq!(lookup(&comb, plain, &["llm.hive.internal"]).await, "-\n");
+    assert!(!reaches(&comb, plain, "169.254.77.81", 80).await, "none has no gateway");
+
+    // With no route yet the gateway asks the agent to come back.
+    let (code, retry, _) = chat(&comb, id, &msg("m", "hello", &json!({}))).await;
+    assert_eq!((code, retry.as_str()), (503, "5"));
+    let route = v1::LlmRoute { upstream: format!("http://{engine}"), api_key: "sk-engine".into() };
+    api.set_route(call(route)).await.unwrap();
+
+    // The cell gets the answer it asked for, and the engine got the gateway's key and was asked
+    // for the token ids and log probabilities.
+    let (code, _, body) = chat(&comb, id, &msg("m", "hello", &json!({}))).await;
+    assert_eq!(code, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "hi");
+    assert_eq!(v["choices"][0]["logprobs"], Value::Null);
+    assert!(!body.contains("token_ids"), "{body}");
+    let (auth, sent) = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(auth, "Bearer sk-engine");
+    assert_eq!(
+        (sent["return_token_ids"].clone(), sent["logprobs"].clone()),
+        (json!(true), json!(true))
+    );
+
+    let (code, _, body) = chat(&comb, id, &msg("m", "again", &json!({"stream": true}))).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains("token_ids") && body.ends_with("data: [DONE]\n\n"), "{body}");
+    let text: String = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str().map(String::from))
+        .collect();
+    assert_eq!(text, "hi");
+    // What the cell asked for itself stays in its answer.
+    let (_, _, body) = chat(&comb, id, &msg("m", "x", &json!({"return_token_ids": true}))).await;
+    assert!(body.contains(r#""token_ids":[104,105]"#), "{body}");
+
+    let turns = |take| v1::LlmTurnsRequest { rollout_id: "r7".into(), take, ..Default::default() };
+    let got = api.turns(call(turns(true))).await.unwrap().into_inner();
+    assert_eq!(got.turns.len(), 3);
+    for (i, (t, prompt)) in got.turns.iter().zip(["hello", "again", "x"]).enumerate() {
+        assert_eq!((t.seq, t.stream, t.status), (i as u64, i == 1, 200));
+        assert_eq!((t.cell_id.as_str(), t.rollout_id.as_str()), (id.to_string().as_str(), "r7"));
+        assert_eq!(t.prompt_ids, prompt.bytes().map(u32::from).collect::<Vec<_>>());
+        assert_eq!(t.choices[0].output_ids, [104, 105]);
+        assert_eq!(t.choices[0].logprobs, [-0.5, -0.5]);
+        assert_eq!((t.prompt_tokens, t.completion_tokens), (prompt.len() as u64, 2));
+        assert_eq!(t.path, "/v1/chat/completions");
+    }
+    assert!(api.turns(call(turns(false))).await.unwrap().into_inner().turns.is_empty());
+
+    // A hold that does not wait reports the call in flight, one that does waits for it, and the
+    // call ends well. New calls get 503 until the hold ends.
+    let slow = tokio::spawn({
+        let comb = comb.clone();
+        async move { chat(&comb, id, &msg("slow", "slow", &json!({}))).await }
+    });
+    while !seen.lock().unwrap().iter().any(|(_, v)| v["model"] == "slow") {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(api.hold(hold(2, 0)).await.unwrap().into_inner().in_flight, 1);
+    let t = Instant::now();
+    assert_eq!(api.hold(hold(2, 10)).await.unwrap().into_inner().in_flight, 0);
+    println!("the hold waited {:.2?} for the call in flight", t.elapsed());
+    assert_eq!(slow.await.unwrap().0, 200);
+    let (code, retry, body) = chat(&comb, id, &msg("m", "held", &json!({}))).await;
+    assert_eq!((code, retry.as_str()), (503, "2"), "{body}");
+    let release = v1::LlmHoldRequest { release: true, ..Default::default() };
+    api.hold(call(release)).await.unwrap();
+    assert_eq!(chat(&comb, id, &msg("m", "after", &json!({}))).await.0, 200);
+    let got = api.turns(call(turns(true))).await.unwrap().into_inner();
+    let seqs: Vec<_> = got.turns.iter().map(|t| (t.seq, t.prompt_ids.len())).collect();
+    assert_eq!(seqs, [(3, 4), (4, 5)], "the numbering goes on and held calls are not kept");
+
+    // Another project's trainer sees none of it.
+    let mut other = tonic::Request::new(turns(false));
+    other.metadata_mut().insert("x-hive-project", "q".parse().unwrap());
+    let route = v1::LlmRoute::default();
+    api.set_route(call(route)).await.unwrap();
+    assert!(api.turns(other).await.unwrap().into_inner().turns.is_empty());
+    for id in [id, plain] {
+        comb.stop(id, None).await.unwrap();
+    }
+    comb.shutdown().await;
 }
 
 /// What a container cell costs through the comb. Run it with

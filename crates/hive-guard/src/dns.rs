@@ -10,6 +10,11 @@
 //! address that is not a cell's and queries past a cell's rate. Addresses in private, shared,
 //! loopback, link local and other special ranges are taken out of answers, so a public name cannot
 //! open the way to the node's own networks.
+//!
+//! Names of the node's own services, like [`crate::LLM_HOST`], are answered by the proxy itself
+//! for the profiles that may reach them, and never go upstream. They do not count against the
+//! cell's rate either, as an agent that opens a new connection for each call to the LLM gateway
+//! looks it up each time, twice with the AAAA query, and the answer costs no more than a refusal.
 
 use std::collections::HashMap;
 use std::io;
@@ -150,6 +155,8 @@ pub struct Settings {
     pub upstream: Vec<SocketAddr>,
     /// What each profile may look up. A profile with no entry may look up nothing.
     pub policies: HashMap<Profile, Policy>,
+    /// The node's own names, answered here for the profiles each lists.
+    pub hosts: Vec<Host>,
     /// Queries a cell may make each second, on average.
     pub rate: u32,
     /// Queries a cell may make at once after a quiet spell.
@@ -163,12 +170,28 @@ impl Default for Settings {
         Self {
             upstream: Vec::new(),
             policies: HashMap::new(),
+            hosts: Vec::new(),
             rate: 50,
             burst: 100,
             timeout: Duration::from_secs(2),
         }
     }
 }
+
+/// A name of the node's own, with its address and the profiles that may look it up. Its address
+/// must be one those profiles reach by a rule, since answering it allows nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    /// The name, in lower case and with no trailing dot.
+    pub name: String,
+    /// Its address.
+    pub ip: Ipv4Addr,
+    /// The profiles it is answered for. Others get NXDOMAIN, as for any name they may not look up.
+    pub profiles: Vec<Profile>,
+}
+
+/// The TTL of an answer for a [`Host`].
+const HOST_TTL: u32 = 300;
 
 /// The proxy. One per node, shared by every cell.
 pub struct Proxy {
@@ -301,10 +324,34 @@ impl Proxy {
         let Some((cell, profile)) = self.cells.cell(from) else {
             return reply(ResponseCode::Refused);
         };
+        let name = q.name.to_ascii().trim_end_matches('.').to_ascii_lowercase();
+        if let Some(host) = self.settings.hosts.iter().find(|h| h.name == name) {
+            if !host.profiles.contains(&profile) {
+                return reply(ResponseCode::NXDomain);
+            }
+            return match q.query_type {
+                RecordType::A => {
+                    let mut r = Message::response(msg.metadata.id, OpCode::Query);
+                    r.queries.clone_from(&msg.queries);
+                    r.metadata.recursion_desired = msg.metadata.recursion_desired;
+                    r.metadata.recursion_available = true;
+                    r.metadata.authoritative = true;
+                    r.answers.push(hickory_proto::rr::Record::from_rdata(
+                        q.name.clone(),
+                        HOST_TTL,
+                        RData::A(hickory_proto::rr::rdata::A(host.ip)),
+                    ));
+                    r.to_vec().ok()
+                }
+                RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB => {
+                    reply(ResponseCode::NoError)
+                }
+                _ => reply(ResponseCode::Refused),
+            };
+        }
         if !self.take(cell) {
             return reply(ResponseCode::Refused);
         }
-        let name = q.name.to_ascii().trim_end_matches('.').to_ascii_lowercase();
         let allowed = self.settings.policies.get(&profile).is_some_and(|p| p.allows(&name));
         if !allowed {
             return reply(ResponseCode::NXDomain);
@@ -426,6 +473,8 @@ mod tests {
 
     const CELL: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
     const PYPI: Ipv4Addr = Ipv4Addr::new(151, 101, 0, 223);
+    /// A cell with a profile that may look up nothing.
+    const OTHER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 4);
 
     #[derive(Default)]
     struct Fake {
@@ -434,7 +483,11 @@ mod tests {
 
     impl Cells for Fake {
         fn cell(&self, ip: Ipv4Addr) -> Option<(u32, Profile)> {
-            (ip == CELL).then_some((7, Profile(16)))
+            match ip {
+                CELL => Some((7, Profile(16))),
+                OTHER => Some((8, Profile(17))),
+                _ => None,
+            }
         }
 
         fn allow(&self, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
@@ -493,9 +546,15 @@ mod tests {
         )]);
         // The first resolver never answers, so every lookup also shows the fallback working.
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hosts = vec![Host {
+            name: "svc.hive.internal".into(),
+            ip: Ipv4Addr::new(169, 254, 77, 81),
+            profiles: vec![Profile(16)],
+        }];
         let settings = Settings {
             upstream: vec![dead.local_addr().unwrap(), addr],
             policies,
+            hosts,
             rate,
             burst: rate,
             timeout: Duration::from_millis(200),
@@ -556,6 +615,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_nodes_own_names_are_answered_here_for_their_profiles() {
+        let (p, fake, seen) = proxy(100).await;
+        let r = ask(&p, CELL, "SVC.hive.internal.", RecordType::A).await;
+        assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+        let ips: Vec<_> = r
+            .answers
+            .iter()
+            .map(|r| (r.ttl, if let RData::A(a) = &r.data { Some(a.0) } else { None }))
+            .collect();
+        assert_eq!(ips, [(300, Some(Ipv4Addr::new(169, 254, 77, 81)))]);
+        let r = ask(&p, CELL, "svc.hive.internal", RecordType::AAAA).await;
+        assert_eq!((r.metadata.response_code, r.answers.len()), (ResponseCode::NoError, 0));
+        let code = |r: Message| r.metadata.response_code;
+        let txt = ask(&p, CELL, "svc.hive.internal", RecordType::TXT).await;
+        assert_eq!(code(txt), ResponseCode::Refused);
+        let other = ask(&p, OTHER, "svc.hive.internal", RecordType::A).await;
+        assert_eq!(code(other), ResponseCode::NXDomain);
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+        assert!(fake.allowed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_cell_past_its_rate_is_refused() {
         let (p, _, _) = proxy(5).await;
         let mut codes = Vec::new();
@@ -564,6 +645,10 @@ mod tests {
         }
         assert_eq!(codes[..5], [ResponseCode::NXDomain; 5]);
         assert_eq!(codes[5..], [ResponseCode::Refused; 2]);
+        for _ in 0..20 {
+            let own = ask(&p, CELL, "svc.hive.internal", RecordType::A).await;
+            assert_eq!(own.metadata.response_code, ResponseCode::NoError);
+        }
     }
 
     #[test]

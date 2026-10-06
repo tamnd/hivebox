@@ -46,6 +46,11 @@ pub const PIN_DIR: &str = "/sys/fs/bpf/hive/guard-v1";
 pub const DNS_VIP: Ipv4Addr = Ipv4Addr::new(169, 254, 77, 53);
 /// The node's package mirror proxy.
 pub const MIRRORS_VIP: Ipv4Addr = Ipv4Addr::new(169, 254, 77, 80);
+/// The node's LLM gateway, on port 80.
+pub const LLM_VIP: Ipv4Addr = Ipv4Addr::new(169, 254, 77, 81);
+/// The name cells with the `llm` profile reach the LLM gateway by. The DNS proxy answers it
+/// with [`LLM_VIP`] and nothing asks upstream.
+pub const LLM_HOST: &str = "llm.hive.internal";
 /// The next hop every cell routes through, answered by the host side of its interface.
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 77, 1);
 
@@ -58,6 +63,10 @@ impl Profile {
     pub const NONE: Self = Self(1);
     /// The DNS proxy and the package mirrors.
     pub const MIRRORS: Self = Self(2);
+    /// What `mirrors` has, and the LLM gateway.
+    pub const LLM: Self = Self(3);
+    /// The built-in profiles.
+    pub const BUILTIN: [Self; 3] = [Self::NONE, Self::MIRRORS, Self::LLM];
 
     /// A built-in profile by name.
     #[must_use]
@@ -65,6 +74,7 @@ impl Profile {
         match name {
             "none" => Some(Self::NONE),
             "mirrors" => Some(Self::MIRRORS),
+            "llm" => Some(Self::LLM),
             _ => None,
         }
     }
@@ -78,16 +88,18 @@ impl Profile {
             proto,
             port: 53,
         });
+        let tcp = |ip, port| Rule { profile: self, ip, proto: Proto::Tcp, port };
         match self {
             Self::NONE => dns.to_vec(),
             Self::MIRRORS => {
                 let mut rules = dns.to_vec();
-                rules.extend([80, 443].map(|port| Rule {
-                    profile: self,
-                    ip: MIRRORS_VIP,
-                    proto: Proto::Tcp,
-                    port,
-                }));
+                rules.extend([80, 443].map(|port| tcp(MIRRORS_VIP, port)));
+                rules
+            }
+            Self::LLM => {
+                let mut rules = dns.to_vec();
+                rules.extend([80, 443].map(|port| tcp(MIRRORS_VIP, port)));
+                rules.push(tcp(LLM_VIP, 80));
                 rules
             }
             _ => Vec::new(),
@@ -282,6 +294,11 @@ mod tests {
         let mirrors = Profile::MIRRORS.builtin_rules();
         assert_eq!(mirrors.len(), 4);
         assert!(mirrors.iter().all(|r| r.profile == Profile::MIRRORS));
+        assert!(mirrors.iter().all(|r| r.ip != LLM_VIP));
+        assert_eq!(Profile::builtin("llm"), Some(Profile::LLM));
+        let llm = Profile::LLM.builtin_rules();
+        assert_eq!(llm.len(), 5);
+        assert!(llm.iter().any(|r| r.ip == LLM_VIP && r.port == 80 && r.proto == Proto::Tcp));
         assert!(Profile(9).builtin_rules().is_empty());
     }
 

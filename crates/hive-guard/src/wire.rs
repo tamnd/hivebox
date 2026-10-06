@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use crate::link::{CELL_IFINDEX, Netlink};
-use crate::{DNS_VIP, GATEWAY, MIRRORS_VIP};
+use crate::{DNS_VIP, GATEWAY, LLM_VIP, MIRRORS_VIP};
 
 /// The interface that holds the VIPs on the node.
 pub const VIP_DEVICE: &str = "hive0";
@@ -43,7 +43,7 @@ pub fn macs(n: u64) -> ([u8; 6], [u8; 6]) {
     ([0x02, 0x68, 0x76, a, b, c], [0x02, 0x68, 0x63, a, b, c])
 }
 
-/// Brings up the dummy interface with the DNS and mirror VIPs, or leaves it as it is.
+/// Brings up the dummy interface with the DNS, mirror and LLM gateway VIPs, or leaves it as it is.
 ///
 /// # Errors
 ///
@@ -51,7 +51,7 @@ pub fn macs(n: u64) -> ([u8; 6], [u8; 6]) {
 pub fn vips(nl: &mut Netlink) -> io::Result<()> {
     nl.dummy(VIP_DEVICE).apply()?;
     let ifindex = crate::guard::ifindex(VIP_DEVICE)?;
-    nl.address(ifindex, DNS_VIP).address(ifindex, MIRRORS_VIP).apply()
+    nl.address(ifindex, DNS_VIP).address(ifindex, MIRRORS_VIP).address(ifindex, LLM_VIP).apply()
 }
 
 /// Wires the namespace at `ns`, number `n`, with `ip` as the cell's address. `nl` is a socket in

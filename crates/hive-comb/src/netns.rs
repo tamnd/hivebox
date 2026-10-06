@@ -100,9 +100,9 @@ impl Namespaces {
         }
     }
 
-    /// The interface a cell's namespace had before a restart.
-    pub(crate) fn recover(&self, path: &Path) -> Option<Veth> {
-        self.net.as_ref()?.recover(number(path)?)
+    /// The interface cell `id`'s namespace had before a restart.
+    pub(crate) fn recover(&self, path: &Path, id: hive_types::CellId) -> Option<Veth> {
+        self.net.as_ref()?.recover(number(path)?, id)
     }
 
     /// Where cells send DNS queries, when they have a network.

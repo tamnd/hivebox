@@ -1,4 +1,4 @@
-//! The local API: the `hivebox.v1` Cells, Exec, Files and Verify services on a Unix socket, for
+//! The local API: the `hivebox.v1` Cells, Exec, Files, Verify and Llm services on a Unix socket, for
 //! standalone mode, where no gate sits in front of the comb, and on TCP for gates when
 //! `node.listen` is set.
 //!
@@ -18,6 +18,7 @@ use hive_proto::v1;
 use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_server::{Exec, ExecServer};
 use hive_proto::v1::files_server::{Files, FilesServer};
+use hive_proto::v1::llm_server::LlmServer;
 use hive_proto::v1::verify_server::VerifyServer;
 use hive_types::{CellId, CellState, Error, Reason, is_name};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -34,6 +35,7 @@ use tonic::codegen::{BoxFuture, Service, http};
 use tonic::server::NamedService;
 use tonic::{Request, Response, Status, Streaming};
 
+mod llm;
 mod verify;
 
 /// The header that names the caller's project.
@@ -134,6 +136,7 @@ struct Router {
     exec: ExecServer<Api>,
     files: FilesServer<Api>,
     verify: VerifyServer<Api>,
+    llm: LlmServer<Api>,
 }
 
 impl Router {
@@ -142,7 +145,8 @@ impl Router {
             cells: CellsServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             exec: ExecServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             files: FilesServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
-            verify: VerifyServer::new(api).max_decoding_message_size(MAX_REQUEST),
+            verify: VerifyServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
+            llm: LlmServer::new(api),
         }
     }
 }
@@ -170,6 +174,7 @@ where
             Some(<ExecServer<Api> as NamedService>::NAME) => Box::pin(self.exec.call(req)),
             Some(<FilesServer<Api> as NamedService>::NAME) => Box::pin(self.files.call(req)),
             Some(<VerifyServer<Api> as NamedService>::NAME) => Box::pin(self.verify.call(req)),
+            Some(<LlmServer<Api> as NamedService>::NAME) => Box::pin(self.llm.call(req)),
             _ => {
                 let status = Status::unimplemented(format!("no service at {}", req.uri().path()));
                 Box::pin(async move { Ok(status.into_http()) })
