@@ -15,6 +15,8 @@ use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::exec_server::{Exec, ExecServer};
 use hive_proto::v1::files_server::{Files, FilesServer};
+use hive_proto::v1::verify_client::VerifyClient;
+use hive_proto::v1::verify_server::{Verify, VerifyServer};
 use hive_scout::NodeReport;
 use hive_types::{Backend, CellId, Reason};
 use hive_waggle::{BackendSet, LayerBloom};
@@ -420,6 +422,42 @@ impl Files for FakeComb {
     }
 }
 
+/// Says which node ran the verify, in the scores, and takes a cell's room for the verifier.
+#[tonic::async_trait]
+impl Verify for FakeComb {
+    async fn run(
+        &self,
+        req: Request<v1::VerifyRequest>,
+    ) -> Result<Response<v1::VerifyResult>, Status> {
+        let project = project(&req);
+        let req = req.into_inner();
+        if !req.subject_cell_id.is_empty() {
+            self.find(&project, &req.subject_cell_id)?;
+        }
+        let mut room = self.room.lock().unwrap();
+        if *room == 0 {
+            let error = v1::Error {
+                reason: "CAPACITY_UNAVAILABLE".into(),
+                message: "full".into(),
+                retryable: true,
+                ..Default::default()
+            };
+            return Ok(Response::new(v1::VerifyResult {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+        *room -= 1;
+        let scores = [("node".to_string(), f64::from(self.node))].into();
+        Ok(Response::new(v1::VerifyResult {
+            passed: true,
+            runs_passed: 1,
+            scores,
+            ..Default::default()
+        }))
+    }
+}
+
 fn report(node: u16, addr: SocketAddr, seq: u64) -> NodeReport {
     NodeReport {
         node,
@@ -487,6 +525,7 @@ impl Cluster {
                     .add_service(CellsServer::new(comb.clone()))
                     .add_service(ExecServer::new(comb.clone()))
                     .add_service(FilesServer::new(comb.clone()))
+                    .add_service(VerifyServer::new(comb.clone()))
                     .serve_with_incoming_shutdown(incoming(l), stop.clone().cancelled_owned()),
             );
             // Reports keep coming, as from a real comb, so the node never goes stale.
@@ -532,6 +571,10 @@ impl Cluster {
 
     fn exec(&self) -> ExecClient<Channel> {
         ExecClient::new(self.channel.clone())
+    }
+
+    fn verify(&self) -> VerifyClient<Channel> {
+        VerifyClient::new(self.channel.clone())
     }
 }
 
@@ -673,6 +716,50 @@ async fn cells_a_full_node_turns_away_go_to_the_other() {
         let Some(v1::create_event::Result::Error(err)) = &e.result else { panic!("{e:?}") };
         assert_eq!(err.reason, "CAPACITY_UNAVAILABLE");
     }
+}
+
+async fn verify(c: &Cluster, subject: &str) -> Result<v1::VerifyResult, Status> {
+    let req = v1::VerifyRequest {
+        subject_cell_id: subject.into(),
+        verifier: Some(spec("v")),
+        argv: vec!["pytest".into()],
+        workdir: "/testbed".into(),
+        ..Default::default()
+    };
+    c.verify().run(authed(req)).await.map(Response::into_inner)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verify_goes_to_its_subjects_node_or_where_there_is_room() {
+    let c = Cluster::new(1000).await;
+    let events = create(&c, 8, "s").await;
+    let mut seen = HashSet::new();
+    for e in &events {
+        let subject = cell(e).unwrap();
+        let r = verify(&c, &subject.id).await.unwrap();
+        assert!(r.passed);
+        assert_eq!(r.scores["node"].to_string(), subject.node, "{}", subject.id);
+        seen.insert(subject.node.clone());
+    }
+    assert_eq!(seen.len(), 2, "the subjects were on both nodes");
+
+    // A subject the comb does not know, or that is not a cell id at all, is the caller's error.
+    let gone = CellId::new(1, 2, 1, 999, 5).unwrap().to_string();
+    assert_eq!(verify(&c, &gone).await.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(verify(&c, "nope").await.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // With no subject, a node with no room for the verifier cell is passed over.
+    *c.combs[0].room.lock().unwrap() = 0;
+    for _ in 0..4 {
+        assert_eq!(verify(&c, "").await.unwrap().scores["node"], 2.0);
+    }
+    *c.combs[1].room.lock().unwrap() = 0;
+    let e = verify(&c, "").await.unwrap_err();
+    assert_eq!(hive_proto::convert::error_from_status(&e).reason, Reason::CapacityUnavailable);
+
+    // A call without a good key gets nowhere.
+    let r = Request::new(v1::VerifyRequest::default());
+    assert_eq!(c.verify().run(r).await.unwrap_err().code(), tonic::Code::Unauthenticated);
 }
 
 async fn create_keyed(c: &Cluster, key: &str) -> v1::CreateEvent {

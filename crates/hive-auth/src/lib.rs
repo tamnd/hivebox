@@ -32,6 +32,7 @@ pub const OPS: &[&str] = &[
     "expose_port",
     "exec",
     "files",
+    "verify",
 ];
 
 /// Why a token was not taken.
