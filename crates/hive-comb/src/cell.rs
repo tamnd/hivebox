@@ -32,6 +32,8 @@ const REMOVE_PATIENCE: Duration = Duration::from_secs(60);
 /// Longest one connection attempt with its handshake may take. A local one takes well under a
 /// millisecond.
 const ATTEMPT: Duration = Duration::from_secs(2);
+/// The longest a cell's trim wait backs off to, in multiples of `trim_idle`.
+const TRIM_BACKOFF: u32 = 16;
 
 /// Where a cell is, as its actor last left it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +209,11 @@ pub(crate) struct Actor {
     reclaimed: bool,
     /// When the running cell last gave back its cold page cache.
     trimmed: Option<SystemTime>,
+    /// How long the running cell waits idle before a trim, once it has read back most of what a
+    /// trim gave away. `None` is `trim_idle`.
+    trim_wait: Option<Duration>,
+    /// The cell's refaulted bytes and the bytes it gave back, right after its last trim.
+    trim_mark: Option<(u64, u64)>,
     /// When the setup boost ends, while the cell has one.
     boost_until: Option<SystemTime>,
 }
@@ -233,6 +240,8 @@ impl Actor {
             veth: None,
             reclaimed: false,
             trimmed: None,
+            trim_wait: None,
+            trim_mark: None,
             boost_until: None,
         }
     }
@@ -680,7 +689,7 @@ impl Actor {
                     && self.driver.caps().trim)
                     .then(|| {
                         let since = self.trimmed.map_or(last, |t| t.max(last));
-                        (at(since + cfg.trim_idle), Timer::Trim)
+                        (at(since + self.trim_wait.unwrap_or(cfg.trim_idle)), Timer::Trim)
                     });
                 (idle, squeeze, trim, None, None)
             }
@@ -714,11 +723,27 @@ impl Actor {
 
     /// Has the driver give back the page cache the idle cell has not used lately. The cell runs on
     /// either way, and a trim that failed waits its turn again like one that worked.
+    ///
+    /// A cell that was used since its last trim and had to read back at least half of what that
+    /// trim gave away needed those pages, the way an agent that rereads its files after each wait
+    /// for its model does. Its next trim waits twice as long, up to [`TRIM_BACKOFF`] times
+    /// `trim_idle`, and a trim the cell did not read back halves the wait again.
     async fn trim(&mut self) {
+        let base = self.inner.cfg.trim_idle;
+        let last = time(self.cell.last_active_ms.load(Ordering::Relaxed));
+        if let (Some(trimmed), Some((mark, given))) = (self.trimmed, self.trim_mark)
+            && last > trimmed
+            && let Some(now) = self.cgroup.as_deref().and_then(cgroup::refaulted)
+        {
+            let wait = self.trim_wait.unwrap_or(base);
+            self.trim_wait = Some(backoff(wait, base, given, now.saturating_sub(mark)));
+        }
         self.trimmed = Some(SystemTime::now());
         let handle = self.handle.clone().expect("a live cell has a handle");
         if let Ok(bytes) = self.driver.trim(&handle).await {
             self.inner.metrics.trimmed(bytes);
+            let refaulted = self.cgroup.as_deref().and_then(cgroup::refaulted);
+            self.trim_mark = refaulted.map(|r| (r, bytes));
         }
     }
 
@@ -1116,4 +1141,40 @@ pub(crate) fn wal_error(e: &io::Error) -> Error {
 
 fn io_error(what: &str, e: &io::Error) -> Error {
     Error::new(Reason::Internal, format!("{what}: {e}"))
+}
+
+/// The wait before a cell's next trim, from the one before it: doubled up to [`TRIM_BACKOFF`] times
+/// `base` when the cell read back at least half of the `given` bytes its last trim gave away, and
+/// halved down to `base` when it did not. A trim that gave nothing away says nothing either way.
+fn backoff(wait: Duration, base: Duration, given: u64, refaulted: u64) -> Duration {
+    if given == 0 {
+        wait
+    } else if refaulted >= given / 2 {
+        (wait * 2).min(base * TRIM_BACKOFF)
+    } else {
+        (wait / 2).max(base)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_that_reads_back_its_trims_is_trimmed_less_often() {
+        let base = Duration::from_secs(30);
+        let mib = 1 << 20;
+        // Read back 40 of 64 MiB: the wait doubles, and stops at 16 times the base.
+        let mut wait = base;
+        for want in [60, 120, 240, 480, 480] {
+            wait = backoff(wait, base, 64 * mib, 40 * mib);
+            assert_eq!(wait, Duration::from_secs(want));
+        }
+        // Read back 1 of 64 MiB: it halves, and stops at the base.
+        for want in [240, 120, 60, 30, 30] {
+            wait = backoff(wait, base, 64 * mib, mib);
+            assert_eq!(wait, Duration::from_secs(want));
+        }
+        assert_eq!(backoff(Duration::from_secs(120), base, 0, 5 * mib), Duration::from_secs(120));
+    }
 }

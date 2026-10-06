@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Idle trimming backs off for cells that read back what it dropped. A running cell that had to read back at least half of what its last trim gave away waits twice as long before the next one, up to 16 times `trim_idle`, and a trim it did not read back halves the wait again. The comb reads this from `workingset_refault_file` in the cell's cgroup.
+
 ## 0.0.28
 
 Faster snapshots and restores of cells that wrote a lot.

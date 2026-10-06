@@ -79,6 +79,15 @@ pub fn trim(dir: &Path, floor: u64) -> u64 {
     current().map_or(0, |after| before.saturating_sub(after))
 }
 
+/// The bytes of page cache the cgroup `dir` has had to read back after they were dropped, by the
+/// kernel or by a [`trim`], since the cgroup was made. `None` when there is no such cgroup.
+#[must_use]
+pub fn refaulted(dir: &Path) -> Option<u64> {
+    let stat = std::fs::read_to_string(dir.join("memory.stat")).ok()?;
+    let pages = field(&stat, "workingset_refault_file")?;
+    Some(pages * rustix::param::page_size() as u64)
+}
+
 /// Kills every process in the cgroup `dir` and its children with `SIGKILL`, all at once.
 pub fn kill(dir: &Path) -> io::Result<()> {
     write(dir, "cgroup.kill", "1")
@@ -165,5 +174,6 @@ mod tests {
         assert!(populated(gone).is_err());
         assert!(kill(gone).is_err());
         assert_eq!(trim(gone, 0), 0);
+        assert_eq!(refaulted(gone), None);
     }
 }
