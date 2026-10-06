@@ -448,6 +448,16 @@ impl Layers {
             .clone();
         let got = cell
             .get_or_try_init(|| async {
+                // Data kept as chunks is read through its recipes, and everything else as it is.
+                let recipes = [layer.data_chunks, layer.relaid_chunks];
+                let chunked: Arc<dyn BlobStore>;
+                let store = if recipes.iter().any(Option::is_some) {
+                    let c = crate::cas::Chunked::open(store.clone(), recipes.into_iter().flatten());
+                    chunked = Arc::new(c.await?);
+                    &chunked
+                } else {
+                    store
+                };
                 // A relaid copy's order comes in alongside the metadata. Without one, or if it
                 // cannot be read, the data is filled from the data blob itself.
                 let relaid = async {

@@ -21,9 +21,11 @@
 //! `relayout` stores a copy of each traced layer's data with the traced chunks first and prints
 //! the name of the relaid image, whose lazy mounts fetch from the copies.
 //!
-//! Imports take `--mkfs PATH` for a `mkfs.erofs` that is not on the path, and `--chunk BYTES` for
-//! the layer chunk size. They remember built layers in `--work DIR`, which is `STORE/import` by
-//! default.
+//! Imports take `--mkfs PATH` for a `mkfs.erofs` that is not on the path, `--chunk BYTES` for
+//! the layer chunk size, and `--dedup chunks` to keep data blobs as content addressed chunks, so
+//! layers that share files share them in the store. `--cas-avg BYTES` sets the average size of
+//! those chunks, 64 KiB by default. They remember built layers in `--work DIR`,
+//! which is `STORE/import` by default.
 //!
 //! In place of `--store DIR`, `--s3 URL` uses a bucket, as in `http://10.0.0.5:9000/bucket/prefix`,
 //! signing as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in `AWS_REGION`. Imports to a bucket
@@ -37,12 +39,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
+use hive_nectar::cas::{self, Chunked, Cuts};
 use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
 use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 
 const USAGE: &str = "usage: hive-nectar import-oci LAYOUT | import-tar TAR | show IMAGE | fetch IMAGE \
-                     | copy IMAGE | relayout IMAGE | run IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] \
+                     | copy IMAGE | relayout IMAGE | run IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] [--dedup chunks [--cas-avg BYTES]] \
                      [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace]";
 
 fn main() -> ExitCode {
@@ -106,7 +109,16 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 (None, Some(dir)) => dir.join("import"),
                 (None, None) => return Err("an import to a bucket needs --work".into()),
             };
-            let importer = Importer::new(mkfs, work).map_err(|e| e.to_string())?;
+            let mut importer = Importer::new(mkfs, work).map_err(|e| e.to_string())?;
+            match flags.get("dedup").map(String::as_str) {
+                None => {}
+                Some("chunks") => {
+                    let avg = usize::try_from(number("cas-avg", 64 << 10)?)
+                        .map_err(|_| "--cas-avg is too big")?;
+                    importer = importer.chunked(Cuts::new(avg).map_err(|e| e.to_string())?);
+                }
+                Some(other) => return Err(format!("--dedup takes chunks, not {other}")),
+            }
             let started = Instant::now();
             let path = PathBuf::from(what);
             let got = if cmd == "import-oci" {
@@ -118,13 +130,14 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
             let m = &got.manifest;
             println!("{}", got.id);
             eprintln!(
-                "{} layers, {} built and {} already there, in {:.2?}: {} of metadata and {} of data",
+                "{} layers, {} built and {} already there, in {:.2?}: {} of metadata and {} of data, {} of it new to the store",
                 m.layers.len(),
                 got.built,
                 got.reused,
                 started.elapsed(),
                 mib(m.layers.iter().map(|l| l.meta_size).sum()),
                 mib(m.layers.iter().map(|l| l.data_size).sum()),
+                mib(got.stored),
             );
             Ok(())
         }
@@ -141,6 +154,10 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 .map_err(|e| format!("{}: {e}", cache_dir.display()))?;
             let started = Instant::now();
             let m = load_manifest(store, id).await.map_err(|e| format!("image {id}: {e}"))?;
+            let recipes = m.layers.iter().filter_map(|l| l.data_chunks);
+            let chunked =
+                Chunked::open(shared.clone(), recipes).await.map_err(|e| e.to_string())?;
+            let store = &chunked;
             let blobs: Vec<BlobId> = m.layers.iter().flat_map(|l| [l.meta, l.data]).collect();
             let held = futures::future::try_join_all(blobs.iter().map(|b| cache.get(store, *b)))
                 .await
@@ -168,21 +185,24 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 .map_err(|e| e.to_string())?;
             let started = Instant::now();
             let m = load_manifest(&from, id).await.map_err(|e| format!("image {id}: {e}"))?;
-            let mut blobs: Vec<BlobId> = m
-                .layers
-                .iter()
-                .flat_map(|l| {
-                    [
-                        Some(l.meta),
-                        Some(l.data),
-                        l.data_leaves,
-                        l.data_trace,
-                        l.data_relaid,
-                        l.data_order,
-                    ]
-                })
-                .flatten()
-                .collect();
+            let mut blobs = Vec::new();
+            for l in &m.layers {
+                // A blob kept as chunks is its chunks, then its recipe.
+                for (blob, recipe) in
+                    [(Some(l.data), l.data_chunks), (l.data_relaid, l.relaid_chunks)]
+                {
+                    match recipe {
+                        Some(r) => {
+                            let r = cas::load(&from, r).await.map_err(|e| format!("{r}: {e}"))?;
+                            let mut seen = std::collections::HashSet::new();
+                            blobs.extend(r.chunks().iter().filter(|c| seen.insert(**c)));
+                        }
+                        None => blobs.extend(blob),
+                    }
+                }
+                let rest = [Some(l.meta), l.data_chunks, l.relaid_chunks, l.data_leaves];
+                blobs.extend(rest.into_iter().chain([l.data_trace, l.data_order]).flatten());
+            }
             // The manifest goes last, so an image in the bucket always has all its layers.
             blobs.push(id);
             let mut sent = 0;

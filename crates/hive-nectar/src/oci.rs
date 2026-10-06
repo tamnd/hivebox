@@ -16,6 +16,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::BlobId;
+use crate::cas::Cuts;
 use crate::erofs::Mkfs;
 use crate::image::{ImageConfig, LayerRef, Manifest};
 use crate::leaves::Leaves;
@@ -64,6 +65,9 @@ pub struct Imported {
     pub built: usize,
     /// Layers found already imported.
     pub reused: usize,
+    /// Bytes of layer data the store did not have before: whole data blobs, or the new chunks of
+    /// them when the importer stores chunks.
+    pub stored: u64,
 }
 
 /// Builds layers with one `mkfs.erofs` into one store, using `work` for scratch space and for
@@ -73,6 +77,7 @@ pub struct Importer {
     mkfs: Mkfs,
     work: PathBuf,
     seq: AtomicU64,
+    chunked: Option<Cuts>,
 }
 
 impl Importer {
@@ -85,7 +90,15 @@ impl Importer {
         let work = work.into();
         std::fs::create_dir_all(work.join("layers"))?;
         std::fs::create_dir_all(work.join("build"))?;
-        Ok(Self { mkfs, work, seq: AtomicU64::new(0) })
+        Ok(Self { mkfs, work, seq: AtomicU64::new(0), chunked: None })
+    }
+
+    /// The same importer, storing each data blob as [`crate::cas`] chunks cut by `cuts` rather
+    /// than whole.
+    #[must_use]
+    pub const fn chunked(mut self, cuts: Cuts) -> Self {
+        self.chunked = Some(cuts);
+        self
     }
 
     /// Imports the image for `platform` from the OCI image layout in the directory `layout`.
@@ -128,14 +141,15 @@ impl Importer {
             jobs.push(self.layer(store, src));
         }
         let mut layers = Vec::new();
-        let (mut built, mut reused) = (0, 0);
+        let (mut built, mut reused, mut stored) = (0, 0, 0);
         for r in futures::future::join_all(jobs).await {
-            let (layer, new) = r?;
+            let (layer, new, sent) = r?;
             if new {
                 built += 1
             } else {
                 reused += 1
             }
+            stored += sent;
             layers.push(layer);
         }
         let run = config.config.unwrap_or_default();
@@ -151,7 +165,7 @@ impl Importer {
             source,
         };
         let id = self.put_manifest(store, &manifest).await?;
-        Ok(Imported { id, manifest, built, reused })
+        Ok(Imported { id, manifest, built, reused, stored })
     }
 
     /// Imports a flat root filesystem from the tar file `tar` as an image of one layer with no
@@ -162,32 +176,33 @@ impl Importer {
     /// The build or the store fails.
     pub async fn import_tar(&self, store: &dyn BlobStore, tar: &Path) -> io::Result<Imported> {
         let src = Source { tar: tar.to_path_buf(), digest: None, diff_id: None };
-        let (layer, _) = self.layer(store, src).await?;
+        let (layer, _, stored) = self.layer(store, src).await?;
         let manifest =
             Manifest { layers: vec![layer], config: ImageConfig::default(), source: None };
         let id = self.put_manifest(store, &manifest).await?;
-        Ok(Imported { id, manifest, built: 1, reused: 0 })
+        Ok(Imported { id, manifest, built: 1, reused: 0, stored })
     }
 
     /// Builds one layer, or finds it built before, and puts its blobs in the store. Says whether
-    /// it was built.
-    async fn layer(&self, store: &dyn BlobStore, src: Source) -> io::Result<(LayerRef, bool)> {
+    /// it was built and how many bytes of its data the store did not have.
+    async fn layer(&self, store: &dyn BlobStore, src: Source) -> io::Result<(LayerRef, bool, u64)> {
         let memo = src.digest.as_ref().map(|d| {
             self.work.join("layers").join(format!(
-                "{}-{}.json",
+                "{}-{}{}.json",
                 d.replace(':', "-"),
-                self.mkfs.chunk_size()
+                self.mkfs.chunk_size(),
+                self.chunked.map(|c| format!("-cas{}", c.avg())).unwrap_or_default()
             ))
         });
         if let Some(memo) = &memo
             && let Ok(bytes) = tokio::fs::read(memo).await
             && let Ok(layer) = serde_json::from_slice::<LayerRef>(&bytes)
             && store.stat(layer.meta).await.is_ok()
-            && store.stat(layer.data).await.is_ok()
+            && store.stat(layer.data_chunks.unwrap_or(layer.data)).await.is_ok()
             && let Some(leaves) = layer.data_leaves
             && store.stat(leaves).await.is_ok()
         {
-            return Ok((layer, false));
+            return Ok((layer, false, 0));
         }
         let dir = self.work.join("build").join(format!(
             "{}.{}",
@@ -226,7 +241,13 @@ impl Importer {
                 })
                 .await?;
             store.put(meta, &built.meta).await?;
-            store.put(data, &built.data).await?;
+            let (data_chunks, stored) = if let Some(cuts) = self.chunked {
+                let put = crate::cas::put(store, data, &built.data, cuts, &dir).await?;
+                (Some(put.recipe), put.new_bytes)
+            } else {
+                let put = store.put(data, &built.data).await?;
+                (None, if put.existed { 0 } else { data_size })
+            };
             store.put(leaves, &leaves_path).await?;
             let layer = LayerRef {
                 digest: LayerRef::digest_of(meta, data),
@@ -239,6 +260,8 @@ impl Importer {
                 data_trace: None,
                 data_relaid: None,
                 data_order: None,
+                data_chunks,
+                relaid_chunks: None,
                 diff_id: src.diff_id,
             };
             if let Some(memo) = &memo {
@@ -246,7 +269,7 @@ impl Importer {
                 let memo = memo.clone();
                 blocking(move || write_synced(&memo, &bytes)).await?;
             }
-            Ok((layer, true))
+            Ok((layer, true, stored))
         }
         .await;
         let _ = tokio::fs::remove_dir_all(&dir).await;

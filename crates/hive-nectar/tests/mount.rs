@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use hive_nectar::cas::Cuts;
 use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
 use hive_nectar::mount::{IdMap, Layers};
 use hive_nectar::oci::{Importer, Platform};
@@ -191,13 +192,22 @@ async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
         Ok(url) => Arc::new(S3Store::new(S3Config::from_url_and_env(&url).unwrap()).unwrap()),
         Err(_) => Arc::new(PosixStore::open(dir.join("store")).unwrap()),
     };
-    let importer =
+    let mut importer =
         Importer::new(Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap(), dir.join("work")).unwrap();
+    // With HIVE_DEDUP=chunks the data is kept as chunks, and both mounts read through recipes.
+    let chunked = std::env::var("HIVE_DEDUP").is_ok_and(|d| d == "chunks");
+    if chunked {
+        importer = importer.chunked(Cuts::default());
+    }
     let image =
         importer.import_layout(&*store, layout.as_ref(), &Platform::default()).await.unwrap();
     let m = &image.manifest;
     let data: u64 = m.layers.iter().map(|l| l.data_size).sum();
     assert!(m.layers.iter().all(|l| l.data_size == 0 || l.data_leaves.is_some()));
+    for l in &m.layers {
+        assert_eq!(l.data_chunks.is_some(), chunked);
+        assert_eq!(store.stat(l.data).await.is_ok(), !chunked);
+    }
     let in_use = nbd_in_use();
 
     let whole =

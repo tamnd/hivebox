@@ -67,7 +67,7 @@ pub async fn put(
     for layer in &mut traced.layers {
         let Some(order) = traces.get(&layer.digest).filter(|o| !o.is_empty()) else { continue };
         layer.data_trace = Some(put_bytes(store, &to_bytes(order), work).await?);
-        (layer.data_relaid, layer.data_order) = (None, None);
+        (layer.data_relaid, layer.data_order, layer.relaid_chunks) = (None, None, None);
     }
     // The manifest goes last, so an image in the store always has all its traces.
     let id = put_bytes(store, &traced.to_bytes(), work).await?;
