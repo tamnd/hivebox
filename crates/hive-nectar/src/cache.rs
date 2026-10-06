@@ -30,6 +30,8 @@ pub const CHUNK: u64 = 256 << 10;
 const BATCH: u64 = 16 << 20;
 /// Batches in flight at once for one blob.
 const IN_FLIGHT: usize = 4;
+/// How many fetched bytes go between flushes of a part file and its map.
+const FLUSH_EVERY: u64 = 64 << 20;
 
 /// Blobs on local disk, up to a capacity.
 #[derive(Debug)]
@@ -340,7 +342,10 @@ impl Cache {
             let (part_path, map_path) = (part_path.clone(), map_path.clone());
             blocking(move || open_part(&part_path, &map_path, size)).await?
         };
-        let (part, map) = (Arc::new(part), Arc::new(Mutex::new(map)));
+        // Chunks are marked in the map only after their bytes are flushed, and that is done every
+        // FLUSH_EVERY bytes rather than after every read, since a flush can cost as much as the
+        // read on a busy disk. A crash loses at most that much of the fetch.
+        let (part, map) = (Arc::new(part), Arc::new(Mutex::new((map, Vec::new(), 0u64))));
         let ideal = (store.caps().ideal_io as u64).max(CHUNK) / CHUNK * CHUNK;
         let batches = plan(&missing, size, ideal);
         futures::stream::iter(batches)
@@ -353,14 +358,21 @@ impl Cache {
                     for r in &reqs {
                         part.write_all_at(&r.buf, r.offset)?;
                     }
-                    part.sync_data()?;
-                    let mut map = map.lock().expect("map lock");
+                    let mut guard = map.lock().expect("map lock");
+                    let (map, written, bytes) = &mut *guard;
                     for r in &reqs {
                         let first = r.offset / CHUNK;
-                        for c in first..(r.offset + r.buf.len() as u64).div_ceil(CHUNK) {
-                            map.set(c);
-                        }
+                        written.extend(first..(r.offset + r.buf.len() as u64).div_ceil(CHUNK));
+                        *bytes += r.buf.len() as u64;
                     }
+                    if *bytes < FLUSH_EVERY {
+                        return Ok(());
+                    }
+                    part.sync_data()?;
+                    for c in written.drain(..) {
+                        map.set(c);
+                    }
+                    *bytes = 0;
                     map.flush()
                 })
             })
@@ -375,6 +387,8 @@ impl Cache {
                     format!("the store sent bytes for {blob} that hash to {got}"),
                 ));
             }
+            // The last bytes fetched have not been flushed yet.
+            part.sync_data()?;
             std::fs::set_permissions(&part_path, std::fs::Permissions::from_mode(0o444))?;
             let done = part_path.with_extension("");
             std::fs::rename(&part_path, &done)?;

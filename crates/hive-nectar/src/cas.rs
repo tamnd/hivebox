@@ -344,7 +344,9 @@ pub async fn put(
         first.entry(*c).or_insert(i);
     }
     let file = Arc::new(File::open(path)?);
-    let stored: Vec<Option<u64>> = stream::iter(first)
+    // The chunks the store lacks are written out first and then stored all at once, so the
+    // store can make thousands of them durable together.
+    let staged: Vec<Option<(BlobId, std::path::PathBuf, u64)>> = stream::iter(first)
         .map(|(chunk, i)| {
             let (file, start) = (file.clone(), recipe.start(i));
             let len = recipe.ends[i] - start;
@@ -358,23 +360,30 @@ pub async fn put(
                     SEQ.fetch_add(1, Ordering::Relaxed)
                 ));
                 let tmp2 = tmp.clone();
-                let r = async {
-                    blocking(move || {
-                        let mut buf = vec![0; usize::try_from(len).map_err(io::Error::other)?];
-                        file.read_exact_at(&mut buf, start)?;
-                        std::fs::write(&tmp2, &buf)
-                    })
-                    .await?;
-                    store.put(chunk, &tmp).await
-                }
-                .await;
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Ok::<_, io::Error>(if r?.existed { None } else { Some(len) })
+                blocking(move || {
+                    let mut buf = vec![0; usize::try_from(len).map_err(io::Error::other)?];
+                    file.read_exact_at(&mut buf, start)?;
+                    std::fs::write(&tmp2, &buf)
+                })
+                .await?;
+                Ok::<_, io::Error>(Some((chunk, tmp, len)))
             }
         })
         .buffer_unordered(AT_ONCE)
         .try_collect()
         .await?;
+    let staged: Vec<_> = staged.into_iter().flatten().collect();
+    let put = store.put_many(staged.iter().map(|(c, tmp, _)| (*c, tmp.clone())).collect()).await;
+    let tmps: Vec<_> = staged.iter().map(|(_, tmp, _)| tmp.clone()).collect();
+    let _ = blocking(move || {
+        for tmp in tmps {
+            let _ = std::fs::remove_file(tmp);
+        }
+        Ok(())
+    })
+    .await;
+    let stored: Vec<Option<u64>> =
+        put?.iter().zip(&staged).map(|(r, (_, _, len))| (!r.existed).then_some(*len)).collect();
     let id = crate::trace::put_bytes(store, &recipe.to_bytes(), work).await?;
     let new: Vec<u64> = stored.into_iter().flatten().collect();
     Ok(Put {
@@ -470,6 +479,13 @@ impl BlobStore for Chunked {
 
     fn put<'a>(&'a self, blob: BlobId, src: &'a Path) -> BoxFuture<'a, io::Result<PutReceipt>> {
         self.inner.put(blob, src)
+    }
+
+    fn put_many(
+        &self,
+        blobs: Vec<(BlobId, std::path::PathBuf)>,
+    ) -> BoxFuture<'_, io::Result<Vec<PutReceipt>>> {
+        self.inner.put_many(blobs)
     }
 
     fn stat(&self, blob: BlobId) -> BoxFuture<'_, io::Result<BlobStat>> {
