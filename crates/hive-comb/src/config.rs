@@ -61,7 +61,8 @@ pub struct Config {
     /// once instead of after `reclaim_after`. Zero leaves cells alone.
     pub pressure_idle: Duration,
     /// A running cell idle this long gives back the page cache it has not used lately, and again
-    /// each time it stays idle that long more. Latency cells keep theirs. Zero turns it off.
+    /// each time it stays idle that long more. A cell that reads most of it back waits up to 16
+    /// times as long before the next one. Latency cells keep theirs. Zero turns it off.
     pub trim_idle: Duration,
     /// Gives each CPU class a core scheduling cookie of its own, so the two threads of a core never
     /// run cells of different classes at once. It does nothing on a host without SMT.
