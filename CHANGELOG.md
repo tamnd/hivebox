@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.22
+
+The rollout worker, and `Verify.Run` through the gate.
+
 - The gate routes `Verify.Run`: to the comb that owns the subject cell, or with no subject to the node waggle picks for the verifier cell, trying up to two more nodes when one has no room. Tokens have a new `verify` op, and the verifier cell counts against the project's quota. `hive-pollen` sends `$HIVE_TOKEN` so it can run through a gate. On server3 the same 16 samples with eight cells in flight took 25.8 s straight on the comb socket and 26.5 s through the gate.
 - `hive-pollen`, the rollout worker. It reads tasks as lines of JSON, makes each task's sample cells in one batched call, keeps at most `--max-inflight` sample cells alive, runs a script of commands in each, checks each sample with `Verify.Run` and writes a trajectory with a reward (1, 0, or masked when hivebox failed) as a line of JSON as soon as the sample is done. On server3, 16 samples of swe-requests-2317 with three verifier runs each took 99.9 s with one cell in flight, 47.0 s with four and 34.9 s with eight, and all 48 rewards were right.
 
