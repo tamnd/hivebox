@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.25
+
+Content addressed chunks for layer data, and CPU caps with a burst factor.
+
 - Content addressed chunks for layer data. `hive-nectar import-oci` and `import-tar` with `--dedup chunks` keep each data blob as content defined chunks of about 64 KiB (`--cas-avg` to change it) plus a recipe, and write only the chunks the store lacks, so layers that share files share them in the store. On four python images and six django checkouts the store is 495 MiB against 693 MiB with whole blobs, and a django point release adds 4 to 9 MiB of its 55 MiB. Relayout keeps its copies as chunks too, and mounts, `fetch` and `copy` read through the recipe. Imports print how much of the data was new to the store.
 - CPU caps with a burst factor. A `standard` or `best_effort` cell's `cpu.max` is its requested cores times `[density] cpu_burst` (default 2.0), so it can use idle cores up to that, while a `latency` cell stays at its request. Spare cgroup leaves in the pool are made with the cap of their class.
 
