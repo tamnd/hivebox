@@ -56,6 +56,29 @@ pub fn cpu_max(vcpu_milli: u32) -> String {
     format!("{quota} {CPU_PERIOD_USEC}")
 }
 
+/// Asks the kernel for the page cache the cgroup `dir` has not used lately back, the pages on its
+/// inactive file list, and returns how much the cgroup's memory went down by. With swap off for
+/// the cgroup the kernel only drops file pages, which a cell that needs them again reads back from
+/// disk, so its own memory stays put. Less than `floor` bytes cold is left alone, since the write
+/// costs more than it gives.
+#[must_use]
+pub fn trim(dir: &Path, floor: u64) -> u64 {
+    let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+    let cold = field(&stat, "inactive_file").unwrap_or(0);
+    if cold < floor {
+        return 0;
+    }
+    let current = || {
+        std::fs::read_to_string(dir.join("memory.current"))
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+    };
+    let Some(before) = current() else { return 0 };
+    // The write fails with EAGAIN when the kernel got back less than asked, which still counts.
+    let _ = write(dir, "memory.reclaim", &cold.to_string());
+    current().map_or(0, |after| before.saturating_sub(after))
+}
+
 /// Kills every process in the cgroup `dir` and its children with `SIGKILL`, all at once.
 pub fn kill(dir: &Path) -> io::Result<()> {
     write(dir, "cgroup.kill", "1")
@@ -141,5 +164,6 @@ mod tests {
         assert_eq!(oom_kills(gone), 0);
         assert!(populated(gone).is_err());
         assert!(kill(gone).is_err());
+        assert_eq!(trim(gone, 0), 0);
     }
 }

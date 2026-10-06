@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Idle container cells give back their cold page cache. A running cell idle for `[density] trim_idle` (30 s by default, 0 turns it off) has the comb ask `memory.reclaim` for its inactive file pages, again every 30 s while it stays idle. Its own memory stays, since running cells have no swap, and latency cells are left alone. `hive_memory_trimmed_bytes_total` counts it. On server3, six idle python cells went from 419 to 491 MiB to 235 to 275 MiB, and the next python start in a trimmed cell took 613 to 893 ms against 282 to 329 ms warm.
+
 ## 0.0.26
 
 Snapshots of container cells in the comb, and committing a container's changes as a new image.

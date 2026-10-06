@@ -343,6 +343,130 @@ async fn a_paused_cell_is_reclaimed_and_then_stopped() {
     node.comb.shutdown().await;
 }
 
+/// The memory of a cgroup: `memory.current`, and the file and anon lines of `memory.stat`, in MiB.
+fn memory(dir: &Path) -> (u64, u64, u64) {
+    let current = std::fs::read_to_string(dir.join("memory.current")).unwrap();
+    let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap();
+    let field = |k| hive_cell::cgroup::field(&stat, k).unwrap() >> 20;
+    (current.trim().parse::<u64>().unwrap() >> 20, field("file"), field("anon"))
+}
+
+fn median(mut v: Vec<Duration>) -> Duration {
+    v.sort();
+    v[v.len() / 2]
+}
+
+/// The leaves of the class slice `class` that have a cell in them.
+fn leaves(class: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(class).unwrap() {
+        let path = e.unwrap().path();
+        let procs = std::fs::read_to_string(path.join("cgroup.procs")).unwrap_or_default();
+        if path.is_dir() && !procs.trim().is_empty() {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_cells_give_back_their_cold_page_cache() {
+    const CELLS: usize = 6;
+    let Some(mut node) = Node::new(CELLS + 1).await else { return };
+    node.cfg.trim_idle = Duration::from_secs(10);
+    node.restart().await;
+    let mut ids = Vec::new();
+    for _ in 0..CELLS {
+        ids.push(node.comb.create(request(spec("python"))).await.unwrap().id);
+    }
+    let mut warm = spec("python");
+    warm.qos = Qos::Latency;
+    let warm = node.comb.create(request(warm)).await.unwrap().id;
+    // Each cell reads the whole of python's library from the image, writes and reads a file of its
+    // own, and keeps a process holding memory.
+    let work = "find /usr/local/lib -type f -exec cat {} + > /dev/null; \
+                head -c 32M /dev/urandom > /tmp/blob && cat /tmp/blob > /dev/null; \
+                python3 -c 'import time; x = bytearray(32 << 20); time.sleep(3600)' >/dev/null 2>&1 &";
+    for &id in ids.iter().chain([&warm]) {
+        sh(&node.comb, id, work).await;
+    }
+    let start = "python3 -c 'import asyncio, json, sqlite3, ssl, decimal, email.parser'";
+    let timed = |id| {
+        let comb = &node.comb;
+        async move {
+            let t = Instant::now();
+            sh(comb, id, start).await;
+            t.elapsed()
+        }
+    };
+    for &id in ids.iter().chain([&warm]) {
+        sh(&node.comb, id, start).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (standard, latency) =
+        (node.tree.0.join("standard.slice"), node.tree.0.join("latency.slice"));
+    assert_eq!(leaves(&standard).len(), CELLS);
+    let before = (memory(&standard), memory(&latency));
+    let mut warm_starts = Vec::new();
+    for &id in &ids {
+        warm_starts.push(timed(id).await);
+    }
+    let warm_start = (median(warm_starts), timed(warm).await);
+
+    // Every standard cell gets trimmed once it has been idle long enough.
+    let trimmed = || {
+        let text = node.comb.metrics().registry().render();
+        let line = text.lines().find(|l| l.starts_with("hive_memory_trimmed_bytes_total "));
+        line.and_then(|l| l.rsplit(' ').next()?.parse::<u64>().ok()).unwrap_or(0)
+    };
+    tokio::time::sleep(Duration::from_secs(13)).await;
+    let after = (memory(&standard), memory(&latency));
+    // The first start reads the library back in, and it is shared, so the others find most of it.
+    let first = timed(ids[0]).await;
+    let mut rest = Vec::new();
+    for &id in &ids[1..] {
+        rest.push(timed(id).await);
+    }
+    let cold_start = (first, median(rest), timed(warm).await);
+    println!(
+        "{CELLS} standard cells: {} MiB ({} file, {} anon) before, {} MiB ({} file, {} anon) once \
+         trimmed, {} MiB counted; latency cell: {} MiB before, {} MiB after",
+        before.0.0,
+        before.0.1,
+        before.0.2,
+        after.0.0,
+        after.0.1,
+        after.0.2,
+        trimmed() >> 20,
+        before.1.0,
+        after.1.0,
+    );
+    println!(
+        "python start in a standard cell {:.2?} warm (median), {:.2?} for the first one trimmed, \
+         {:.2?} for the rest (median); in the latency cell {:.2?} before, {:.2?} after",
+        warm_start.0, cold_start.0, cold_start.1, warm_start.1, cold_start.2
+    );
+    assert!(after.0.1 < before.0.1, "the standard cells kept their page cache");
+    assert!(after.0.2 + 8 >= before.0.2, "the standard cells lost memory of their own");
+    assert!(after.1.1 + 8 >= before.1.1, "the latency cell was trimmed");
+
+    // What one trim costs, on each cell with its cache read in again.
+    for &id in &ids {
+        sh(&node.comb, id, "find /usr/local/lib -type f -exec cat {} + > /dev/null").await;
+    }
+    let mut took = Vec::new();
+    for leaf in leaves(&standard) {
+        let t = Instant::now();
+        let freed = hive_cell::cgroup::trim(&leaf, 1 << 20);
+        took.push(format!("{:.2?} for {} MiB", t.elapsed(), freed >> 20));
+    }
+    println!("one trim by hand on each cell: {}", took.join(", "));
+    for id in ids.into_iter().chain([warm]) {
+        node.comb.stop(id, None).await.unwrap();
+    }
+    node.comb.shutdown().await;
+}
+
 /// A cell made from snapshot `snap` of another.
 async fn restore(comb: &Comb, snap: hive_nectar::BlobId) -> CellId {
     let mut s = spec("python");
