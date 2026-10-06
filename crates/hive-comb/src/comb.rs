@@ -178,9 +178,16 @@ impl Comb {
             .unwrap_or(0);
         let admission = Arc::new(Admission::new(mem, cfg.max_cells, &cfg.create_limit));
         let cgroups = match &cfg.cgroup_root {
-            Some(root) => Some(Arc::new(Cgroups::init(root, cfg.cgroup_depth).map_err(|e| {
-                io::Error::new(e.kind(), format!("setting up cgroups in {}: {e}", root.display()))
-            })?)),
+            Some(root) => Some(Arc::new(
+                Cgroups::init(root, cfg.cgroup_depth)
+                    .map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("setting up cgroups in {}: {e}", root.display()),
+                        )
+                    })?
+                    .with_burst(cfg.cpu_burst_tenths),
+            )),
             None => None,
         };
         let core = (cfg.core_scheduling && cgroups.is_some())

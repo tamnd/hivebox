@@ -717,12 +717,13 @@ async fn a_setup_boost_lifts_the_cpu_quota_until_the_cell_is_ready() {
     };
     let cpu_max = |leaf: &Path| std::fs::read_to_string(leaf.join("cpu.max")).unwrap();
 
-    // Four times the quota until the caller says the setup is done.
+    // Four times the quota until the caller says the setup is done, then twice it, which is
+    // the default burst factor for the standard class.
     let a = comb.create(request(boosted(Duration::from_secs(3600)))).await.unwrap().id;
     let leaf = cgroup_of(worker(&fake, a));
     assert_eq!(cpu_max(&leaf).trim(), "200000 100000");
     comb.ready(a).await.unwrap();
-    assert_eq!(cpu_max(&leaf).trim(), "50000 100000");
+    assert_eq!(cpu_max(&leaf).trim(), "100000 100000");
     // Ready twice is fine, and a comb that starts over does not put the boost back.
     comb.ready(a).await.unwrap();
     comb.shutdown().await;
@@ -730,13 +731,13 @@ async fn a_setup_boost_lifts_the_cpu_quota_until_the_cell_is_ready() {
     let comb = open(cfg, &fake).await;
     reaches(&comb, a, CellState::Running).await;
     assert_eq!(comb.get(a).unwrap().spec.burst_until_ready, None);
-    assert_eq!(cpu_max(&leaf).trim(), "50000 100000");
+    assert_eq!(cpu_max(&leaf).trim(), "100000 100000");
 
     // Or until the boost runs out.
     let b = comb.create(request(boosted(Duration::from_millis(300)))).await.unwrap().id;
     let leaf_b = cgroup_of(worker(&fake, b));
     let until = Instant::now() + Duration::from_secs(10);
-    while cpu_max(&leaf_b).trim() != "50000 100000" {
+    while cpu_max(&leaf_b).trim() != "100000 100000" {
         assert!(Instant::now() < until, "still {}", cpu_max(&leaf_b).trim());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

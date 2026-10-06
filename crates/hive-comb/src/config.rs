@@ -66,6 +66,9 @@ pub struct Config {
     /// A cell that asks for a setup boost runs on this many times its CPU quota until it is ready
     /// or its boost runs out. One or zero turns the boost off.
     pub setup_boost: u32,
+    /// The burst factor in tenths: a cell in the standard or best effort class may use this many
+    /// tenths of the cores it asked for when cores are idle. `cpu_burst` in the file, as a factor.
+    pub cpu_burst_tenths: u32,
     /// Where the local API listens.
     pub api_socket: PathBuf,
     /// Where gates reach the API over TCP, if anywhere. Whoever can connect is trusted the way
@@ -267,6 +270,7 @@ impl Default for Config {
             pressure_idle: Duration::from_secs(30),
             core_scheduling: true,
             setup_boost: 4,
+            cpu_burst_tenths: 20,
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             listen: None,
             metrics: None,
@@ -302,6 +306,7 @@ impl Config {
     /// pressure_idle = "30s"
     /// core_scheduling = true
     /// setup_boost = 4
+    /// cpu_burst = 2.0
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -401,6 +406,12 @@ impl Config {
         }
         set(&mut c.core_scheduling, file.density.core_scheduling);
         set(&mut c.setup_boost, file.density.setup_boost);
+        if let Some(v) = file.density.cpu_burst {
+            if !(1.0..=16.0).contains(&v) {
+                return Err(format!("density.cpu_burst = {v} must be from 1 to 16"));
+            }
+            c.cpu_burst_tenths = (v * 10.0).round() as u32;
+        }
         let l = file.lifecycle;
         for (field, value, name) in [
             (&mut c.create_deadline, l.create_deadline, "create_deadline"),
@@ -661,6 +672,7 @@ struct DensityFile {
     pressure_idle: Option<String>,
     core_scheduling: Option<bool>,
     setup_boost: Option<u32>,
+    cpu_burst: Option<f64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -706,6 +718,7 @@ mod tests {
         assert_eq!(c.pressure_idle, Duration::from_secs(30));
         assert!(c.core_scheduling);
         assert_eq!(c.setup_boost, 4);
+        assert_eq!(c.cpu_burst_tenths, 20);
     }
 
     #[test]
@@ -738,6 +751,7 @@ mod tests {
             pressure_idle = "2m"
             core_scheduling = false
             setup_boost = 8
+            cpu_burst = 1.5
 
             [lifecycle]
             create_deadline = "5s"
@@ -784,6 +798,7 @@ mod tests {
         assert_eq!(c.pressure_idle, Duration::from_secs(120));
         assert!(!c.core_scheduling);
         assert_eq!(c.setup_boost, 8);
+        assert_eq!(c.cpu_burst_tenths, 15);
         assert_eq!(c.create_deadline, Duration::from_secs(5));
         assert_eq!(c.stop_grace, Duration::from_millis(250));
         assert_eq!(c.keep_ended, Duration::from_secs(600));
@@ -874,6 +889,7 @@ mod tests {
     fn mistakes_are_errors() {
         assert!(Config::from_toml("[node]\ndata_dri = \"/x\"").unwrap_err().contains("data_dri"));
         assert!(Config::from_toml("[lifecycle]\nstop_grace = \"10\"").is_err());
+        assert!(Config::from_toml("[density]\ncpu_burst = 0.5").is_err());
         assert!(Config::from_toml("[lifecycle]\nstop_grace = \"1d\"").is_err());
         assert!(Config::from_toml("[backends.create_limit]\nauto = 1").is_err());
         assert!(Config::from_toml("[node]\nnode = 0").is_err());
