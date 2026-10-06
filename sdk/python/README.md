@@ -44,6 +44,44 @@ The verifier takes the subject's diff against HEAD of the git checkout at `workd
 
 Every failure raises a subclass of `HiveError` named after its reason, like `CellNotFound`, with `is_infra_error` set when the failure was hivebox's and not the command's. A file that is missing raises `FileError`, which is also a `FileNotFoundError`, and the same goes for the other common errno values. Calls that are safe to repeat are tried up to three times when the failure was hivebox's.
 
+## verl
+
+`hivebox.verl` has three tools for verl's tool agent loop, `bash`, `str_replace_editor` and `submit`, and `HiveAgentLoop`, which gives each trajectory a cell of its own and makes the verifier's verdict its reward. It is written against verl 0.9.
+
+```yaml
+# tools.yaml, for actor_rollout_ref.rollout.multi_turn.tool_config_path
+tools:
+  - class_name: hivebox.verl.BashTool
+    config: &hive
+      type: native
+      endpoint: https://gate.example:7401
+      task:
+        image: swe-requests
+        workdir: /testbed
+        cell: {mem_mib: 1024, vcpu_milli: 1000}
+        limits: {command_timeout_s: 120, max_wall_s: 1800}
+        verify:
+          argv: [bash, -c, "python -m pytest -q tests/test_fix.py"]
+          protected_paths: ["tests/**", "**/conftest.py"]
+          cell: {mem_mib: 2048, vcpu_milli: 2000}
+  - class_name: hivebox.verl.EditorTool
+    config: *hive
+  - class_name: hivebox.verl.SubmitTool
+    config: *hive
+```
+
+```yaml
+# agent_loops.yaml, for actor_rollout_ref.rollout.agent.agent_loop_config_path
+- name: hive_agent
+  _target_: hivebox.verl.loop.HiveAgentLoop
+```
+
+Set `agent_name` to `hive_agent` in the dataset, or `actor_rollout_ref.rollout.agent.default_agent_loop` to `hive_agent`. The `task` in the tool config holds the defaults, and a row's `extra_info["hive"]` goes on top of them, so a row only carries what differs, such as `task_id`, `image` or `verify.files` with its hidden tests. The task has the same shape as a `hive-pollen` task. The token comes from `$HIVE_TOKEN`.
+
+The three tools share the trajectory's cell, made on the first tool call, and `bash` keeps one shell, so `cd` and `export` carry over between calls. `submit` checks the changes with `Verify.Run` and only tells the model they were submitted. When the loop ends, `HiveAgentLoop` checks a trajectory that never called `submit` (set `verify_unsubmitted: false` in the task to give it 0 instead), sets `reward_score` to 1 or 0, stops the cell and adds `hive_cell`, `hive_passed`, `hive_infra_error`, `hive_tampered`, `hive_submitted`, `hive_verify_s` and `hive_error` to the sample's extra fields. A sample hivebox failed gets 0 with `hive_infra_error` set, so the trainer can mask it.
+
+The tools also work in verl's plain `tool_agent` loop. There they find the trajectory by verl's request id, `submit` stops the cell, and the reward is the `submit` call's tool reward. A trajectory that never submits is not checked, and its cell ends at its hard TTL, the task's `max_wall_s` plus 15 minutes.
+
 ## Development
 
 The stubs in `hivebox/v1` are made from the protos in `crates/hive-proto/proto` by `generate.sh`, and are checked in so installing needs no protoc.
@@ -60,3 +98,5 @@ The verify test also wants `HIVE_TEST_GIT_IMAGE`, an image with a git checkout a
 ```
 HIVE_TEST_GIT_IMAGE=swe-requests pytest tests/test_live.py -s -k verify
 ```
+
+`tests/test_verl.py` wants the same, with verl installed.
