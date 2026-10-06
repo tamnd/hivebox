@@ -20,7 +20,7 @@ message MintTokenRequest {
   // Only these cells, or any when empty. A token held to some cells can not create or list.
   repeated string cell_ids = 2;
   // Only these calls, or any when empty: create, get, list, watch, pause, resume, stop,
-  // extend_ttl, update_policy, expose_port, exec and files.
+  // extend_ttl, update_policy, expose_port, exec, files, verify and llm.
   repeated string ops = 3;
 }
 

@@ -15,6 +15,8 @@ use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::exec_server::{Exec, ExecServer};
 use hive_proto::v1::files_server::{Files, FilesServer};
+use hive_proto::v1::llm_client::LlmClient;
+use hive_proto::v1::llm_server::{Llm, LlmServer};
 use hive_proto::v1::verify_client::VerifyClient;
 use hive_proto::v1::verify_server::{Verify, VerifyServer};
 use hive_scout::NodeReport;
@@ -43,6 +45,18 @@ struct FakeComb {
     files: Arc<Mutex<BTreeMap<String, (bytes::Bytes, String)>>>,
     /// The signals sent to processes, by pid.
     signals: Arc<Mutex<Vec<(u32, i32)>>>,
+    /// The LLM gateway's route and hold, by project, as the calls set them.
+    llm: Arc<Mutex<FakeLlm>>,
+}
+
+#[derive(Default)]
+struct FakeLlm {
+    /// Answers every call as a node whose cells have no network does.
+    none: bool,
+    /// Answers every call as a node that can not be reached.
+    down: bool,
+    routes: HashMap<String, String>,
+    held: HashSet<String>,
 }
 
 fn project<T>(r: &Request<T>) -> String {
@@ -422,6 +436,65 @@ impl Files for FakeComb {
     }
 }
 
+/// A gateway with one call in flight, whose turns say which node they came from: two from node
+/// 1 and one from node 2 for any rollout, started so that node 2's falls between node 1's.
+#[tonic::async_trait]
+impl Llm for FakeComb {
+    async fn set_route(&self, req: Request<v1::LlmRoute>) -> Result<Response<v1::Empty>, Status> {
+        let project = project(&req);
+        let mut llm = self.gateway()?;
+        llm.routes.insert(project, req.into_inner().upstream);
+        Ok(Response::new(v1::Empty {}))
+    }
+
+    async fn hold(
+        &self,
+        req: Request<v1::LlmHoldRequest>,
+    ) -> Result<Response<v1::LlmHoldResult>, Status> {
+        let project = project(&req);
+        let mut llm = self.gateway()?;
+        if req.into_inner().release {
+            llm.held.remove(&project);
+        } else {
+            llm.held.insert(project);
+        }
+        Ok(Response::new(v1::LlmHoldResult { in_flight: 1 }))
+    }
+
+    async fn turns(
+        &self,
+        req: Request<v1::LlmTurnsRequest>,
+    ) -> Result<Response<v1::LlmTurnsResponse>, Status> {
+        drop(self.gateway()?);
+        let req = req.into_inner();
+        let starts: &[i64] = if self.node == 1 { &[10, 30] } else { &[20] };
+        let turns = starts
+            .iter()
+            .map(|&seconds| v1::LlmTurn {
+                cell_id: req.cell_id.clone(),
+                rollout_id: req.rollout_id.clone(),
+                model: format!("node {}", self.node),
+                started: Some(prost_types::Timestamp { seconds, nanos: 0 }),
+                ..Default::default()
+            })
+            .collect();
+        Ok(Response::new(v1::LlmTurnsResponse { turns, dropped: 1, ..Default::default() }))
+    }
+}
+
+impl FakeComb {
+    fn gateway(&self) -> Result<std::sync::MutexGuard<'_, FakeLlm>, Status> {
+        let llm = self.llm.lock().unwrap();
+        if llm.none {
+            return Err(Status::failed_precondition("this node has no LLM gateway"));
+        }
+        if llm.down {
+            return Err(Status::unavailable("connection refused"));
+        }
+        Ok(llm)
+    }
+}
+
 /// Says which node ran the verify, in the scores, and takes a cell's room for the verifier.
 #[tonic::async_trait]
 impl Verify for FakeComb {
@@ -526,6 +599,7 @@ impl Cluster {
                     .add_service(ExecServer::new(comb.clone()))
                     .add_service(FilesServer::new(comb.clone()))
                     .add_service(VerifyServer::new(comb.clone()))
+                    .add_service(LlmServer::new(comb.clone()))
                     .serve_with_incoming_shutdown(incoming(l), stop.clone().cancelled_owned()),
             );
             // Reports keep coming, as from a real comb, so the node never goes stale.
@@ -575,6 +649,10 @@ impl Cluster {
 
     fn verify(&self) -> VerifyClient<Channel> {
         VerifyClient::new(self.channel.clone())
+    }
+
+    fn llm(&self) -> LlmClient<Channel> {
+        LlmClient::new(self.channel.clone())
     }
 }
 
@@ -760,6 +838,61 @@ async fn a_verify_goes_to_its_subjects_node_or_where_there_is_room() {
     // A call without a good key gets nowhere.
     let r = Request::new(v1::VerifyRequest::default());
     assert_eq!(c.verify().run(r).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_llm_route_and_hold_go_to_every_node_and_turns_are_gathered() {
+    let c = Cluster::new(1000).await;
+    let route = v1::LlmRoute { upstream: "http://10.0.0.5:30000".into(), api_key: "k".into() };
+    c.llm().set_route(authed(route)).await.unwrap();
+    for comb in &c.combs {
+        assert_eq!(comb.llm.lock().unwrap().routes["swe"], "http://10.0.0.5:30000");
+    }
+    let hold = |release| v1::LlmHoldRequest { release, ..Default::default() };
+    let r = c.llm().hold(authed(hold(false))).await.unwrap().into_inner();
+    assert_eq!(r.in_flight, 2, "one call in flight on each node");
+    assert!(c.combs.iter().all(|comb| comb.llm.lock().unwrap().held.contains("swe")));
+
+    // A rollout's turns come from both nodes, in the order they started.
+    let turns = |rollout: &str, cell: &str| v1::LlmTurnsRequest {
+        rollout_id: rollout.into(),
+        cell_id: cell.into(),
+        take: true,
+    };
+    let r = c.llm().turns(authed(turns("r1", ""))).await.unwrap().into_inner();
+    let from: Vec<&str> = r.turns.iter().map(|t| t.model.as_str()).collect();
+    assert_eq!(from, ["node 1", "node 2", "node 1"]);
+    assert_eq!((r.dropped, r.unreached.len()), (2, 0));
+
+    // A cell's turns come from its own node alone.
+    let events = create(&c, 4, "llm").await;
+    for e in &events {
+        let made = cell(e).unwrap();
+        let r = c.llm().turns(authed(turns("", &made.id))).await.unwrap().into_inner();
+        assert_eq!(r.turns[0].model, format!("node {}", made.node), "{}", made.id);
+        assert!(r.turns.iter().all(|t| t.cell_id == made.id));
+    }
+    let e = c.llm().turns(authed(turns("", ""))).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument);
+
+    // A node with no gateway is left out, and one that is down fails a hold but not the turns.
+    c.combs[1].llm.lock().unwrap().none = true;
+    let r = c.llm().hold(authed(hold(true))).await.unwrap().into_inner();
+    assert_eq!(r.in_flight, 1);
+    assert!(!c.combs[0].llm.lock().unwrap().held.contains("swe"));
+    c.combs[1].llm.lock().unwrap().none = false;
+    c.combs[1].llm.lock().unwrap().down = true;
+    let e = c.llm().hold(authed(hold(false))).await.unwrap_err();
+    assert!(e.message().contains("node 2"), "{}", e.message());
+    let r = c.llm().turns(authed(turns("r1", ""))).await.unwrap().into_inner();
+    assert_eq!((r.turns.len(), r.unreached.as_slice()), (2, &[2][..]));
+    c.combs[0].llm.lock().unwrap().none = true;
+    c.combs[1].llm.lock().unwrap().none = true;
+    let e = c.llm().set_route(authed(v1::LlmRoute::default())).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+
+    let r = Request::new(v1::LlmRoute::default());
+    assert_eq!(c.llm().set_route(r).await.unwrap_err().code(), tonic::Code::Unauthenticated);
 }
 
 async fn create_keyed(c: &Cluster, key: &str) -> v1::CreateEvent {

@@ -27,7 +27,7 @@ from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__
 from hivebox.v1 import types_pb2 as hivebox_dot_v1_dot_types__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14hivebox/v1/llm.proto\x12\nhivebox.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x16hivebox/v1/types.proto\"-\n\x08LlmRoute\x12\x10\n\x08upstream\x18\x01 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x02 \x01(\t\"\xa3\x01\n\x0eLlmHoldRequest\x12\x0f\n\x07release\x18\x01 \x01(\x08\x12.\n\x0bretry_after\x18\x02 \x01(\x0b\x32\x19.google.protobuf.Duration\x12&\n\x03ttl\x18\x03 \x01(\x0b\x32\x19.google.protobuf.Duration\x12(\n\x05\x64rain\x18\x04 \x01(\x0b\x32\x19.google.protobuf.Duration\"\"\n\rLlmHoldResult\x12\x11\n\tin_flight\x18\x01 \x01(\r\"D\n\x0fLlmTurnsRequest\x12\x12\n\nrollout_id\x18\x01 \x01(\t\x12\x0f\n\x07\x63\x65ll_id\x18\x02 \x01(\t\x12\x0c\n\x04take\x18\x03 \x01(\x08\"G\n\x10LlmTurnsResponse\x12\"\n\x05turns\x18\x01 \x03(\x0b\x32\x13.hivebox.v1.LlmTurn\x12\x0f\n\x07\x64ropped\x18\x02 \x01(\x04\"\xcb\x02\n\x07LlmTurn\x12\x0f\n\x07\x63\x65ll_id\x18\x01 \x01(\t\x12\x12\n\nrollout_id\x18\x02 \x01(\t\x12\x0b\n\x03seq\x18\x03 \x01(\x04\x12\x0c\n\x04path\x18\x04 \x01(\t\x12\r\n\x05model\x18\x05 \x01(\t\x12\x0e\n\x06status\x18\x06 \x01(\r\x12\x0e\n\x06stream\x18\x07 \x01(\x08\x12+\n\x07started\x18\x08 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\'\n\x04took\x18\t \x01(\x0b\x32\x19.google.protobuf.Duration\x12\x12\n\nprompt_ids\x18\n \x03(\r\x12&\n\x07\x63hoices\x18\x0b \x03(\x0b\x32\x15.hivebox.v1.LlmChoice\x12\x15\n\rprompt_tokens\x18\x0c \x01(\x04\x12\x19\n\x11\x63ompletion_tokens\x18\r \x01(\x04\x12\r\n\x05\x65rror\x18\x0e \x01(\t\"k\n\tLlmChoice\x12\r\n\x05index\x18\x01 \x01(\r\x12\x12\n\noutput_ids\x18\x02 \x03(\r\x12\x10\n\x08logprobs\x18\x03 \x03(\x02\x12\x15\n\rfinish_reason\x18\x04 \x01(\t\x12\x12\n\nprompt_ids\x18\x05 \x03(\r2\xbd\x01\n\x03Llm\x12\x33\n\x08SetRoute\x12\x14.hivebox.v1.LlmRoute\x1a\x11.hivebox.v1.Empty\x12=\n\x04Hold\x12\x1a.hivebox.v1.LlmHoldRequest\x1a\x19.hivebox.v1.LlmHoldResult\x12\x42\n\x05Turns\x12\x1b.hivebox.v1.LlmTurnsRequest\x1a\x1c.hivebox.v1.LlmTurnsResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14hivebox/v1/llm.proto\x12\nhivebox.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x16hivebox/v1/types.proto\"-\n\x08LlmRoute\x12\x10\n\x08upstream\x18\x01 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x02 \x01(\t\"\xa3\x01\n\x0eLlmHoldRequest\x12\x0f\n\x07release\x18\x01 \x01(\x08\x12.\n\x0bretry_after\x18\x02 \x01(\x0b\x32\x19.google.protobuf.Duration\x12&\n\x03ttl\x18\x03 \x01(\x0b\x32\x19.google.protobuf.Duration\x12(\n\x05\x64rain\x18\x04 \x01(\x0b\x32\x19.google.protobuf.Duration\"\"\n\rLlmHoldResult\x12\x11\n\tin_flight\x18\x01 \x01(\r\"D\n\x0fLlmTurnsRequest\x12\x12\n\nrollout_id\x18\x01 \x01(\t\x12\x0f\n\x07\x63\x65ll_id\x18\x02 \x01(\t\x12\x0c\n\x04take\x18\x03 \x01(\x08\"Z\n\x10LlmTurnsResponse\x12\"\n\x05turns\x18\x01 \x03(\x0b\x32\x13.hivebox.v1.LlmTurn\x12\x0f\n\x07\x64ropped\x18\x02 \x01(\x04\x12\x11\n\tunreached\x18\x03 \x03(\r\"\xcb\x02\n\x07LlmTurn\x12\x0f\n\x07\x63\x65ll_id\x18\x01 \x01(\t\x12\x12\n\nrollout_id\x18\x02 \x01(\t\x12\x0b\n\x03seq\x18\x03 \x01(\x04\x12\x0c\n\x04path\x18\x04 \x01(\t\x12\r\n\x05model\x18\x05 \x01(\t\x12\x0e\n\x06status\x18\x06 \x01(\r\x12\x0e\n\x06stream\x18\x07 \x01(\x08\x12+\n\x07started\x18\x08 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12\'\n\x04took\x18\t \x01(\x0b\x32\x19.google.protobuf.Duration\x12\x12\n\nprompt_ids\x18\n \x03(\r\x12&\n\x07\x63hoices\x18\x0b \x03(\x0b\x32\x15.hivebox.v1.LlmChoice\x12\x15\n\rprompt_tokens\x18\x0c \x01(\x04\x12\x19\n\x11\x63ompletion_tokens\x18\r \x01(\x04\x12\r\n\x05\x65rror\x18\x0e \x01(\t\"k\n\tLlmChoice\x12\r\n\x05index\x18\x01 \x01(\r\x12\x12\n\noutput_ids\x18\x02 \x03(\r\x12\x10\n\x08logprobs\x18\x03 \x03(\x02\x12\x15\n\rfinish_reason\x18\x04 \x01(\t\x12\x12\n\nprompt_ids\x18\x05 \x03(\r2\xbd\x01\n\x03Llm\x12\x33\n\x08SetRoute\x12\x14.hivebox.v1.LlmRoute\x1a\x11.hivebox.v1.Empty\x12=\n\x04Hold\x12\x1a.hivebox.v1.LlmHoldRequest\x1a\x19.hivebox.v1.LlmHoldResult\x12\x42\n\x05Turns\x12\x1b.hivebox.v1.LlmTurnsRequest\x1a\x1c.hivebox.v1.LlmTurnsResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -43,11 +43,11 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_LLMTURNSREQUEST']._serialized_start=374
   _globals['_LLMTURNSREQUEST']._serialized_end=442
   _globals['_LLMTURNSRESPONSE']._serialized_start=444
-  _globals['_LLMTURNSRESPONSE']._serialized_end=515
-  _globals['_LLMTURN']._serialized_start=518
-  _globals['_LLMTURN']._serialized_end=849
-  _globals['_LLMCHOICE']._serialized_start=851
-  _globals['_LLMCHOICE']._serialized_end=958
-  _globals['_LLM']._serialized_start=961
-  _globals['_LLM']._serialized_end=1150
+  _globals['_LLMTURNSRESPONSE']._serialized_end=534
+  _globals['_LLMTURN']._serialized_start=537
+  _globals['_LLMTURN']._serialized_end=868
+  _globals['_LLMCHOICE']._serialized_start=870
+  _globals['_LLMCHOICE']._serialized_end=977
+  _globals['_LLM']._serialized_start=980
+  _globals['_LLM']._serialized_end=1169
 # @@protoc_insertion_point(module_scope)

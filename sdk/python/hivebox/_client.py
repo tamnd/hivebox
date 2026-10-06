@@ -352,6 +352,9 @@ class Llm:
         # Turns the gateway dropped for the project to stay within its memory, as of the last
         # call to `turns`.
         self.dropped = 0
+        # Nodes a gate could not get a rollout's turns from in the last call to `turns`, whose
+        # turns a later call may get.
+        self.unreached: list[int] = []
 
     async def route(self, upstream: str, api_key: str = "") -> None:
         """Sends the project's calls to the engine at `upstream`, a plain HTTP base URL like
@@ -373,11 +376,14 @@ class Llm:
 
     async def turns(self, rollout_id: str = "", *, cell: Cell | str | None = None, take: bool = False) -> list[Turn]:
         """The calls of a rollout, or of a cell, or of a cell in a rollout, in the order they
-        were made. With `take` they are removed, so the next call does not return them again."""
+        were made. With `take` they are removed, so the next call does not return them again.
+        Through a gate, a rollout's turns are gathered from every node, and naming the cell
+        asks only the node it is on."""
         cell_id = cell.id if isinstance(cell, Cell) else (cell or "")
         req = llm_pb2.LlmTurnsRequest(rollout_id=rollout_id, cell_id=cell_id, take=take)
         r = await self._hive._call(self._hive._llm.Turns, req, retry=not take)
         self.dropped = r.dropped
+        self.unreached = list(r.unreached)
         return [Turn._from(t) for t in r.turns]
 
 

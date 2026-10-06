@@ -119,6 +119,7 @@ impl Llm for Api {
         Ok(Response::new(v1::LlmTurnsResponse {
             turns: turns.into_iter().map(turn).collect(),
             dropped,
+            unreached: Vec::new(),
         }))
     }
 }

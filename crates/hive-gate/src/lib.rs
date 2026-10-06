@@ -1,7 +1,8 @@
 //! The only component with a foot on both the trusted and the untrusted network. It checks the
 //! caller's key, places batches of cells with waggle, and sends every call about one cell to the
 //! comb that owns it, which it knows from the node in the cell id. A verify goes to the comb that
-//! owns its subject, or where waggle would put the verifier cell when it has none. It takes gRPC
+//! owns its subject, or where waggle would put the verifier cell when it has none. A route or a
+//! hold for the LLM gateway goes to every node, as do the turns of a rollout. It takes gRPC
 //! and Connect, the second over HTTP/1.1 as well, so `curl` can call it.
 //!
 //! The gate keeps no state of its own. It follows scout for the nodes and their addresses, so
@@ -18,6 +19,7 @@ pub mod config;
 mod connect;
 mod e2b;
 pub mod keys;
+mod llm;
 pub mod nodes;
 pub mod proxy;
 pub mod quota;
@@ -31,6 +33,7 @@ use std::time::Duration;
 
 use futures::{FutureExt, stream};
 use hive_proto::v1::cells_server::CellsServer;
+use hive_proto::v1::llm_server::LlmServer;
 use hive_proto::v1::tokens_server::TokensServer;
 use hive_proto::v1::verify_server::VerifyServer;
 use hive_telemetry::{CounterVec, Registry};
@@ -82,6 +85,7 @@ pub struct Gate {
     api: cells::Api,
     cells: CellsServer<cells::Api>,
     verify: VerifyServer<cells::Api>,
+    llm: LlmServer<cells::Api>,
     tokens: Option<TokensServer<tokens::Api>>,
     e2b: Option<Arc<e2b::E2b>>,
     calls: CounterVec,
@@ -103,6 +107,7 @@ impl Gate {
             nodes,
             cells: CellsServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             verify: VerifyServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
+            llm: LlmServer::new(api.clone()),
             api,
             tokens: None,
             e2b: None,
@@ -182,6 +187,7 @@ impl Service<http::Request<Body>> for Gate {
             Some(("hivebox.v1.Cells", m)) => (To::Cells, m),
             Some(("hivebox.v1.Exec" | "hivebox.v1.Files", m)) => (To::Comb, m),
             Some(("hivebox.v1.Verify", m)) => (To::Verify, m),
+            Some(("hivebox.v1.Llm", m)) => (To::Llm, m),
             Some(("hivebox.v1.Tokens", m)) => (To::Tokens, m),
             _ => (To::Nowhere, "unknown"),
         };
@@ -206,6 +212,7 @@ impl Service<http::Request<Body>> for Gate {
         match to {
             To::Cells => Box::pin(self.cells.call(req)),
             To::Verify => Box::pin(self.verify.call(req)),
+            To::Llm => Box::pin(self.llm.call(req)),
             To::Comb => {
                 let nodes = self.nodes.clone();
                 Box::pin(async move { Ok(proxy::forward(&nodes, req).await) })
@@ -233,6 +240,8 @@ enum To {
     Comb,
     /// The gate's Verify service.
     Verify,
+    /// The gate's Llm service.
+    Llm,
     /// The gate's Tokens service.
     Tokens,
     Nowhere,
