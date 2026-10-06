@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use hive_nectar::cas::{Chunked, Cuts};
 use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs, superblock};
 use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobStore, Cache, PosixStore};
@@ -155,4 +156,66 @@ async fn an_oci_image_is_imported_once_and_fetched_whole() {
         );
     }
     assert_eq!(cache.usage().pinned, held.len());
+}
+
+/// A tar of `files`, each a name and its bytes.
+fn tar_of(path: &Path, files: &[(&str, &[u8])]) {
+    let mut b = tar::Builder::new(std::fs::File::create(path).unwrap());
+    for (name, data) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_mtime(1_700_000_000);
+        h.set_size(data.len() as u64);
+        b.append_data(&mut h, name, *data).unwrap();
+    }
+    b.finish().unwrap();
+}
+
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn layers_that_share_a_file_share_its_chunks() {
+    let Some(mkfs) = mkfs() else { return };
+    let s = Scratch::new();
+    let store = PosixStore::open(s.0.join("store")).unwrap();
+    let importer = Importer::new(mkfs, s.0.join("work")).unwrap().chunked(Cuts::default());
+    let lib = noise(1, 6 << 20);
+    let (a, b) = (s.0.join("a.tar"), s.0.join("b.tar"));
+    tar_of(&a, &[("app/main.py", &noise(2, 50_000)), ("usr/lib/libbig.so", &lib)]);
+    tar_of(
+        &b,
+        &[
+            ("app/main.py", &noise(3, 330_000)),
+            ("app/util.py", &noise(4, 9_000)),
+            ("usr/lib/libbig.so", &lib),
+        ],
+    );
+    let first = importer.import_tar(&store, &a).await.unwrap();
+    let second = importer.import_tar(&store, &b).await.unwrap();
+    let (la, lb) = (&first.manifest.layers[0], &second.manifest.layers[0]);
+    assert_ne!(la.data, lb.data);
+    assert_eq!(first.stored, la.data_size);
+    // The library sits at another offset in the second layer, and only the chunks around the
+    // files that differ are new.
+    assert!(second.stored < lb.data_size / 3, "{} of {} new", second.stored, lb.data_size);
+    assert!(store.stat(lb.data).await.is_err());
+
+    // A whole fetch through the recipe gives the data blob back, checked against its name.
+    let recipes = [la.data_chunks.unwrap(), lb.data_chunks.unwrap()];
+    let store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(store);
+    let chunked = Chunked::open(store, recipes).await.unwrap();
+    let cache = Cache::open(s.0.join("cache"), 1 << 30).unwrap();
+    let held = cache.get(&chunked, lb.data).await.unwrap();
+    assert_eq!(held.size(), lb.data_size);
 }

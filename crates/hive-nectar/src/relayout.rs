@@ -14,6 +14,7 @@ use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
 use crate::cache::CHUNK;
+use crate::cas::Recipe;
 use crate::trace::{put_bytes, to_bytes};
 use crate::{BlobId, BlobStore, Leaves, Manifest, ReadReq};
 
@@ -86,8 +87,13 @@ pub async fn put(store: &dyn BlobStore, image: &Manifest, work: &Path) -> io::Re
             continue;
         }
         let leaves = load_leaves(store, layer.data, layer.data_size, leaves).await?;
-        let copied = copy(store, layer.data, layer.data_size, &leaves, &order, work).await?;
-        layer.data_relaid = Some(copied);
+        let recipe = match layer.data_chunks {
+            Some(r) => Some(crate::cas::load(store, r).await?),
+            None => None,
+        };
+        let from = Data { store, blob: layer.data, size: layer.data_size, recipe: recipe.as_ref() };
+        let (copied, chunks) = copy(&from, &leaves, &order, work).await?;
+        (layer.data_relaid, layer.relaid_chunks) = (Some(copied), chunks);
         layer.data_order = Some(put_bytes(store, &to_bytes(&order), work).await?);
         layers += 1;
         traced += moved as u64;
@@ -109,17 +115,33 @@ async fn load_leaves(
     Leaves::from_bytes(blob, size, &got[0].buf)
 }
 
-/// Writes the chunks of `blob` in `order` to a file in `work`, checking each, and stores it. A
-/// short last chunk is padded with zeros, so every chunk of the copy is whole and the short one
-/// can go anywhere.
-async fn copy(
-    store: &dyn BlobStore,
+/// A data blob to copy from, and its recipe when it is kept as chunks.
+struct Data<'a> {
+    store: &'a dyn BlobStore,
     blob: BlobId,
     size: u64,
+    recipe: Option<&'a Recipe>,
+}
+
+impl Data<'_> {
+    async fn read(&self, reqs: Vec<ReadReq>) -> io::Result<Vec<ReadReq>> {
+        match self.recipe {
+            Some(r) => r.read(self.store, reqs).await,
+            None => self.store.read_vectored(self.blob, reqs).await,
+        }
+    }
+}
+
+/// Writes the chunks of the data blob in `order` to a file in `work`, checking each, and stores
+/// it, as chunks when the data blob is kept as chunks, with the recipe's name. A short last chunk
+/// is padded with zeros, so every chunk of the copy is whole and the short one can go anywhere.
+async fn copy(
+    from: &Data<'_>,
     leaves: &Leaves,
     order: &[u64],
     work: &Path,
-) -> io::Result<BlobId> {
+) -> io::Result<(BlobId, Option<BlobId>)> {
+    let (store, blob, size) = (from.store, from.blob, from.size);
     let path = work.join(format!("{blob}.relaid.{}", std::process::id()));
     let written = async {
         let mut out = tokio::io::BufWriter::new(tokio::fs::File::create(&path).await?);
@@ -132,7 +154,7 @@ async fn copy(
                     ReadReq { offset: c * CHUNK, buf: vec![0; len] }
                 })
                 .collect();
-            for (r, &c) in store.read_vectored(blob, reqs).await?.iter().zip(batch) {
+            for (r, &c) in from.read(reqs).await?.iter().zip(batch) {
                 if !leaves.check(c, &r.buf) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -150,7 +172,10 @@ async fn copy(
         Ok(BlobId::from(hash.finalize()))
     };
     let id = match written.await {
-        Ok(id) => store.put(id, &path).await.map(|_| id),
+        Ok(id) if let Some(r) = from.recipe => {
+            crate::cas::put(store, id, &path, r.cuts(), work).await.map(|p| (id, Some(p.recipe)))
+        }
+        Ok(id) => store.put(id, &path).await.map(|_| (id, None)),
         Err(e) => Err(e),
     };
     let _ = tokio::fs::remove_file(&path).await;
@@ -202,6 +227,8 @@ mod tests {
             data_trace: None,
             data_relaid: None,
             data_order: None,
+            data_chunks: None,
+            relaid_chunks: None,
             diff_id: None,
         };
         let image = Manifest { layers: vec![layer], config: ImageConfig::default(), source: None };
@@ -250,6 +277,69 @@ mod tests {
         // A relaid image relaid again is left as it is.
         let again = put(&*store, &done.manifest, &work).await.unwrap();
         assert_eq!(again.id, done.id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_layer_kept_as_chunks_is_relaid_as_chunks_that_mostly_exist_already() {
+        let dir = crate::tests::scratch();
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(PosixStore::open(dir.join("store")).unwrap());
+        let c = CHUNK as usize;
+        let len = 40 * c + 777;
+        let mut x = 7u64;
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        std::fs::write(dir.join("src"), &bytes).unwrap();
+        let leaves = Leaves::of_file(&dir.join("src")).unwrap();
+        let data = leaves.blob();
+        let kept =
+            crate::cas::put(&*store, data, &dir.join("src"), crate::cas::Cuts::default(), &work)
+                .await
+                .unwrap();
+        let leaves_id = put_bytes(&*store, &leaves.to_bytes(), &work).await.unwrap();
+        let layer = LayerRef {
+            digest: LayerRef::digest_of(BlobId::of(b"meta"), data),
+            meta: BlobId::of(b"meta"),
+            data,
+            meta_size: 4,
+            data_size: len as u64,
+            chunk_size: CHUNK as u32,
+            data_leaves: Some(leaves_id),
+            data_trace: None,
+            data_relaid: None,
+            data_order: None,
+            data_chunks: Some(kept.recipe),
+            relaid_chunks: None,
+            diff_id: None,
+        };
+        let image = Manifest { layers: vec![layer], config: ImageConfig::default(), source: None };
+        let traces = HashMap::from([(image.layers[0].digest, vec![30, 2, 17, 5, 6])]);
+        let (_, traced) = crate::trace::put(&*store, &image, &traces, &work).await.unwrap();
+        let done = put(&*store, &traced, &work).await.unwrap();
+        let l = &done.manifest.layers[0];
+        let (relaid, recipe) = (l.data_relaid.unwrap(), l.relaid_chunks.unwrap());
+        assert!(store.stat(data).await.is_err() && store.stat(relaid).await.is_err());
+        let chunked =
+            crate::cas::Chunked::open(store.clone(), [kept.recipe, recipe]).await.unwrap();
+        let got = chunked
+            .read_vectored(relaid, vec![ReadReq { offset: 0, buf: vec![0; 2 * c] }])
+            .await
+            .unwrap();
+        assert_eq!(got[0].buf[..c], bytes[30 * c..31 * c]);
+        assert_eq!(got[0].buf[c..], bytes[2 * c..3 * c]);
+        // Most of the copy is runs of the original, which cut the same way.
+        let r = crate::cas::load(&*store, recipe).await.unwrap();
+        let old = crate::cas::load(&*store, kept.recipe).await.unwrap();
+        let shared = r.chunks().iter().filter(|c| old.chunks().contains(c)).count();
+        assert!(shared * 2 > r.chunks().len(), "{shared} of {}", r.chunks().len());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

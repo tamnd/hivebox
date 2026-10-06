@@ -38,6 +38,13 @@ pub struct LayerRef {
     /// `u32` chunk numbers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_order: Option<BlobId>,
+    /// The [`crate::cas`] recipe the data blob is kept as, when it is kept as chunks. The store
+    /// then has the chunks and not the data blob itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_chunks: Option<BlobId>,
+    /// The same for `data_relaid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaid_chunks: Option<BlobId>,
     /// The OCI digest of the uncompressed tar it came from, when it came from one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_id: Option<String>,

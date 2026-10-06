@@ -16,7 +16,8 @@
 //! A blob can be filled lazily with [`Cache::lazy`], chunk by chunk as it is read, each chunk
 //! checked against the blob's [`Leaves`]. [`trace`] records what a run read so the next mount
 //! fills that first, and [`relayout`] stores a copy of each traced data blob with those chunks
-//! first so the fill fetches them in a few long reads. Chunk level dedup and the 3FS store come
+//! first so the fill fetches them in a few long reads. [`cas`] stores a data blob as content
+//! addressed chunks, so layers that share files share the chunks they fall in. The 3FS store comes
 //! later.
 
 // Only the mount module has any, for loop device ioctls and `mount_setattr`.
@@ -24,6 +25,7 @@
 
 mod blob;
 pub mod cache;
+pub mod cas;
 pub mod erofs;
 pub mod image;
 pub mod lazy;
