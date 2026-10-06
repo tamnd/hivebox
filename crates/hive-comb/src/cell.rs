@@ -11,7 +11,9 @@ use crate::record::{Handle, Record, now_ms, time};
 use hive_cell::{CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, Slot, cgroup};
 use hive_drone::Client;
 use hive_guard::wire::Veth;
-use hive_types::{Cause, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason};
+use hive_nectar::oci::Staged;
+use hive_nectar::upper::Scrub;
+use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason};
 use prost::Message;
 use std::io;
 use std::path::PathBuf;
@@ -80,6 +82,11 @@ pub(crate) enum Cmd {
     /// The setup is done, so the setup boost ends.
     Ready {
         done: oneshot::Sender<Result<(), Error>>,
+    },
+    /// A disk snapshot, answered with what was read out of the cell, for the caller to build.
+    Snapshot {
+        scrub: Option<Scrub>,
+        done: oneshot::Sender<Result<Staged, Error>>,
     },
 }
 
@@ -358,7 +365,8 @@ impl Actor {
         };
         let slot = self.slot(secret).await?;
         lap("pool");
-        let rootfs = self.inner.rootfs(&self.cell.spec, &slot).await?;
+        let (rootfs, image) = self.inner.rootfs(&self.cell.spec, &self.cell.project, &slot).await?;
+        self.record.image = image.map(|i| i.as_bytes().to_vec()).unwrap_or_default();
         lap("rootfs");
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
         self.handle = Some(handle);
@@ -488,6 +496,13 @@ impl Actor {
                 self.stop(cause, Duration::ZERO).await;
                 return false;
             }
+            Ok(Liveness::Paused) if state == CellState::Running => {
+                // Frozen for a snapshot when the last comb ended, so it is thawed again.
+                if self.driver.resume(&handle).await.is_err() {
+                    self.stop(Cause::Recovery, Duration::ZERO).await;
+                    return false;
+                }
+            }
             Ok(Liveness::Alive | Liveness::Paused) => {}
             Err(_) => {
                 self.stop(Cause::Recovery, Duration::ZERO).await;
@@ -563,6 +578,9 @@ impl Actor {
                     }
                     Some(Cmd::Ready { done }) => {
                         let _ = done.send(self.ready().await);
+                    }
+                    Some(Cmd::Snapshot { scrub, done }) => {
+                        let _ = done.send(self.snapshot(scrub).await);
                     }
                     None => return,
                 },
@@ -829,6 +847,44 @@ impl Actor {
         Ok(())
     }
 
+    /// Builds what the cell wrote into a layer on its image and stores that as a new image. A
+    /// running cell is frozen meanwhile, without telling anyone, since it is thawed again before
+    /// the actor does anything else. A comb that ends in between thaws it when it comes back.
+    async fn snapshot(&mut self, scrub: Option<Scrub>) -> Result<Staged, Error> {
+        let running = match self.cell.state() {
+            CellState::Running => true,
+            CellState::Paused => false,
+            s => return Err(not_running(s)),
+        };
+        if self.cell.spec.backend != Backend::Container {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                "only container cells have snapshots yet",
+            ));
+        }
+        let Some(base) = self.record.image() else {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                "the cell's image is not from the image store, so it has no snapshots",
+            ));
+        };
+        let handle = self.handle.clone().expect("a live cell has a handle");
+        let started = Instant::now();
+        if running {
+            self.driver.pause(&handle, PauseMode::Freeze).await?;
+        }
+        let upper = self.inner.cell_dir(self.cell.id).join("upper");
+        let staged = self.inner.stage(&upper, base, scrub, self.cell.id.to_string()).await;
+        if running && let Err(e) = self.driver.resume(&handle).await {
+            // Still frozen, so it shows as paused, the only way there being through pausing.
+            let _ = self.commit(CellState::Pausing, None, "").await;
+            let _ = self.commit(CellState::Paused, None, &e.to_string()).await;
+        }
+        self.inner.metrics.snapshot("read", started.elapsed());
+        self.cell.touch();
+        staged
+    }
+
     /// Stops the cell and records how it ended. Never fails: whatever goes wrong, the cell ends
     /// up in a terminal state.
     async fn stop(&mut self, cause: Cause, grace: Duration) {
@@ -927,6 +983,9 @@ impl Actor {
                         | Cmd::ExtendTtl { done, .. }
                         | Cmd::Ready { done },
                     ) => {
+                        let _ = done.send(Err(not_running(self.cell.state())));
+                    }
+                    Some(Cmd::Snapshot { done, .. }) => {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     None => return,

@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Snapshots of container cells in the comb. `Snapshots.Snapshot` freezes a running cell only while what it wrote is read out, then builds that into one more layer on the cell's image while the cell runs on, and returns the new image's id. A create with that id as its source restores it, and `Commit` names a scrubbed snapshot as an image of the project. `hivectl snapshot`, `hivectl commit` and `hivectl create snapshot:ID` use it, and so do `snapshot` and `commit` in the Rust and Python SDKs. Set `[images] mkfs` when `mkfs.erofs` is not on the path. On server3, a cell that wrote 32 MiB was frozen for 184 to 197 ms.
 - Committing a container's changes as a new image. `hive-nectar commit UPPER --base IMAGE` and `hive-nectar run --commit on` turn an overlay upper into an OCI layer, with whiteouts, opaque dirs, hard links, xattrs and owners shifted back from the cell's uid range, build it like any import and store a manifest of the base plus that layer with its provenance. Scrubbing is on by default: histories and home credential files are left out, `.git/config` URLs lose their passwords, and a private key or token anywhere else refuses the commit and says where, unless the path is allowed. On server3, committing `pip install numpy requests` in python:3.12-slim took 3.49 s for 74.0 MiB.
 
 ## 0.0.25

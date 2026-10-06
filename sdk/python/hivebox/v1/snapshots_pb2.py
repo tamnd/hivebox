@@ -26,7 +26,7 @@ from hivebox.v1 import cells_pb2 as hivebox_dot_v1_dot_cells__pb2
 from hivebox.v1 import types_pb2 as hivebox_dot_v1_dot_types__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1ahivebox/v1/snapshots.proto\x12\nhivebox.v1\x1a\x16hivebox/v1/cells.proto\x1a\x16hivebox/v1/types.proto\"\xb2\x01\n\x0fSnapshotRequest\x12\x0f\n\x07\x63\x65ll_id\x18\x01 \x01(\t\x12&\n\x04kind\x18\x02 \x01(\x0e\x32\x18.hivebox.v1.SnapshotKind\x12\x37\n\x06labels\x18\x03 \x03(\x0b\x32\'.hivebox.v1.SnapshotRequest.LabelsEntry\x1a-\n\x0bLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x87\x01\n\x0eRestoreRequest\x12)\n\x08snapshot\x18\x01 \x01(\x0b\x32\x17.hivebox.v1.SnapshotRef\x12\r\n\x05\x63ount\x18\x02 \x01(\r\x12\"\n\x04spec\x18\x03 \x01(\x0b\x32\x14.hivebox.v1.CellSpec\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\"\xaa\x01\n\x0b\x46orkRequest\x12\x0f\n\x07\x63\x65ll_id\x18\x01 \x01(\t\x12\r\n\x05\x63ount\x18\x02 \x01(\r\x12\x33\n\x06labels\x18\x03 \x03(\x0b\x32#.hivebox.v1.ForkRequest.LabelsEntry\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\x1a-\n\x0bLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"H\n\rCommitRequest\x12)\n\x08snapshot\x18\x01 \x01(\x0b\x32\x17.hivebox.v1.SnapshotRef\x12\x0c\n\x04name\x18\x02 \x01(\t*y\n\x0cSnapshotKind\x12\x1d\n\x19SNAPSHOT_KIND_UNSPECIFIED\x10\x00\x12\x16\n\x12SNAPSHOT_KIND_DISK\x10\x01\x12\x1a\n\x16SNAPSHOT_KIND_DISK_MEM\x10\x02\x12\x16\n\x12SNAPSHOT_KIND_PROC\x10\x03\x32\xbc\x02\n\tSnapshots\x12@\n\x08Snapshot\x12\x1b.hivebox.v1.SnapshotRequest\x1a\x17.hivebox.v1.SnapshotRef\x12@\n\x07Restore\x12\x1a.hivebox.v1.RestoreRequest\x1a\x17.hivebox.v1.CreateEvent0\x01\x12:\n\x04\x46ork\x12\x17.hivebox.v1.ForkRequest\x1a\x17.hivebox.v1.CreateEvent0\x01\x12\x39\n\x06\x43ommit\x12\x19.hivebox.v1.CommitRequest\x1a\x14.hivebox.v1.ImageRef\x12\x34\n\x06\x44\x65lete\x12\x17.hivebox.v1.SnapshotRef\x1a\x11.hivebox.v1.Emptyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1ahivebox/v1/snapshots.proto\x12\nhivebox.v1\x1a\x16hivebox/v1/cells.proto\x1a\x16hivebox/v1/types.proto\"\xd0\x01\n\x0fSnapshotRequest\x12\x0f\n\x07\x63\x65ll_id\x18\x01 \x01(\t\x12&\n\x04kind\x18\x02 \x01(\x0e\x32\x18.hivebox.v1.SnapshotKind\x12\x37\n\x06labels\x18\x03 \x03(\x0b\x32\'.hivebox.v1.SnapshotRequest.LabelsEntry\x12\r\n\x05scrub\x18\x04 \x01(\x08\x12\r\n\x05\x61llow\x18\x05 \x03(\t\x1a-\n\x0bLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x87\x01\n\x0eRestoreRequest\x12)\n\x08snapshot\x18\x01 \x01(\x0b\x32\x17.hivebox.v1.SnapshotRef\x12\r\n\x05\x63ount\x18\x02 \x01(\r\x12\"\n\x04spec\x18\x03 \x01(\x0b\x32\x14.hivebox.v1.CellSpec\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\"\xaa\x01\n\x0b\x46orkRequest\x12\x0f\n\x07\x63\x65ll_id\x18\x01 \x01(\t\x12\r\n\x05\x63ount\x18\x02 \x01(\r\x12\x33\n\x06labels\x18\x03 \x03(\x0b\x32#.hivebox.v1.ForkRequest.LabelsEntry\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\x1a-\n\x0bLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"H\n\rCommitRequest\x12)\n\x08snapshot\x18\x01 \x01(\x0b\x32\x17.hivebox.v1.SnapshotRef\x12\x0c\n\x04name\x18\x02 \x01(\t*y\n\x0cSnapshotKind\x12\x1d\n\x19SNAPSHOT_KIND_UNSPECIFIED\x10\x00\x12\x16\n\x12SNAPSHOT_KIND_DISK\x10\x01\x12\x1a\n\x16SNAPSHOT_KIND_DISK_MEM\x10\x02\x12\x16\n\x12SNAPSHOT_KIND_PROC\x10\x03\x32\xbc\x02\n\tSnapshots\x12@\n\x08Snapshot\x12\x1b.hivebox.v1.SnapshotRequest\x1a\x17.hivebox.v1.SnapshotRef\x12@\n\x07Restore\x12\x1a.hivebox.v1.RestoreRequest\x1a\x17.hivebox.v1.CreateEvent0\x01\x12:\n\x04\x46ork\x12\x17.hivebox.v1.ForkRequest\x1a\x17.hivebox.v1.CreateEvent0\x01\x12\x39\n\x06\x43ommit\x12\x19.hivebox.v1.CommitRequest\x1a\x14.hivebox.v1.ImageRef\x12\x34\n\x06\x44\x65lete\x12\x17.hivebox.v1.SnapshotRef\x1a\x11.hivebox.v1.Emptyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -37,20 +37,20 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_SNAPSHOTREQUEST_LABELSENTRY']._serialized_options = b'8\001'
   _globals['_FORKREQUEST_LABELSENTRY']._loaded_options = None
   _globals['_FORKREQUEST_LABELSENTRY']._serialized_options = b'8\001'
-  _globals['_SNAPSHOTKIND']._serialized_start=656
-  _globals['_SNAPSHOTKIND']._serialized_end=777
+  _globals['_SNAPSHOTKIND']._serialized_start=686
+  _globals['_SNAPSHOTKIND']._serialized_end=807
   _globals['_SNAPSHOTREQUEST']._serialized_start=91
-  _globals['_SNAPSHOTREQUEST']._serialized_end=269
-  _globals['_SNAPSHOTREQUEST_LABELSENTRY']._serialized_start=224
-  _globals['_SNAPSHOTREQUEST_LABELSENTRY']._serialized_end=269
-  _globals['_RESTOREREQUEST']._serialized_start=272
-  _globals['_RESTOREREQUEST']._serialized_end=407
-  _globals['_FORKREQUEST']._serialized_start=410
-  _globals['_FORKREQUEST']._serialized_end=580
-  _globals['_FORKREQUEST_LABELSENTRY']._serialized_start=224
-  _globals['_FORKREQUEST_LABELSENTRY']._serialized_end=269
-  _globals['_COMMITREQUEST']._serialized_start=582
-  _globals['_COMMITREQUEST']._serialized_end=654
-  _globals['_SNAPSHOTS']._serialized_start=780
-  _globals['_SNAPSHOTS']._serialized_end=1096
+  _globals['_SNAPSHOTREQUEST']._serialized_end=299
+  _globals['_SNAPSHOTREQUEST_LABELSENTRY']._serialized_start=254
+  _globals['_SNAPSHOTREQUEST_LABELSENTRY']._serialized_end=299
+  _globals['_RESTOREREQUEST']._serialized_start=302
+  _globals['_RESTOREREQUEST']._serialized_end=437
+  _globals['_FORKREQUEST']._serialized_start=440
+  _globals['_FORKREQUEST']._serialized_end=610
+  _globals['_FORKREQUEST_LABELSENTRY']._serialized_start=254
+  _globals['_FORKREQUEST_LABELSENTRY']._serialized_end=299
+  _globals['_COMMITREQUEST']._serialized_start=612
+  _globals['_COMMITREQUEST']._serialized_end=684
+  _globals['_SNAPSHOTS']._serialized_start=810
+  _globals['_SNAPSHOTS']._serialized_end=1126
 # @@protoc_insertion_point(module_scope)

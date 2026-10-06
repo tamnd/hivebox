@@ -2,6 +2,7 @@
 //! and carry on. It is protobuf, so a newer comb reads an older one's WAL.
 
 use hive_cell::{CellHandle, GuestChannel};
+use hive_nectar::BlobId;
 use hive_proto::convert;
 use hive_proto::v1;
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error};
@@ -34,6 +35,10 @@ pub(crate) struct Record {
     pub(crate) project: String,
     #[prost(string, tag = "10")]
     pub(crate) idem_key: String,
+    /// The id of the cell's image in the store, which its snapshots are made on. Empty for an
+    /// unpacked image.
+    #[prost(bytes = "vec", tag = "11")]
+    pub(crate) image: Vec<u8>,
 }
 
 /// A [`CellHandle`] as stored.
@@ -68,6 +73,11 @@ pub(crate) struct Seq {
 }
 
 impl Record {
+    /// The id of the cell's image in the store, if it has one.
+    pub(crate) fn image(&self) -> Option<BlobId> {
+        <[u8; 32]>::try_from(self.image.as_slice()).ok().map(BlobId::from_bytes)
+    }
+
     pub(crate) fn cell_state(&self) -> Option<CellState> {
         convert::state_from_v1(v1::CellState::try_from(self.state).ok()?)
     }
