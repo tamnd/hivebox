@@ -108,6 +108,7 @@ The platform also emits per-cell tamper signals in the rollout metadata: protect
 ## 8. Workspace and data hygiene
 
 - Commit/pack_diff scrubbing removes `.bash_history`, `~/.cache` credentials, `.env` files matching secret patterns, and `.git/config` credentials. A trufflehog-style regex pass also runs, and any hit blocks the commit unless overridden.
+  - What is in now: scrubbing is on by default in `hive-nectar commit`. It leaves out shell and REPL histories anywhere and credential files under a home (`.git-credentials`, `.netrc`, `.pypirc`, `.aws/credentials`, `.docker/config.json`, `.kube/config`, the gh and Hugging Face tokens and `.ssh/id_*`), takes the user and password out of URLs in `.git/config`, and drops `.env`, `.env.*` and `.npmrc` files that hold a secret. Every other file up to 8 MiB, outside `site-packages`, `dist-packages` and `node_modules`, is searched for private keys and AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Hugging Face, Google, Stripe and npm tokens. A hit refuses the commit and names the file, line and rule, never the secret, unless the path is under `--allow`. The manifest's provenance lists what was left out, rewritten, allowed or too big to search.
 - Images are content-addressed and signed at build (Sigstore/cosign or an internal Ed25519 key). Their provenance (who or what agent built them, and from which cell) is recorded in the manifest.
 - Shared bases are immutable. Workspace and toolkit layers are owned per project.
 

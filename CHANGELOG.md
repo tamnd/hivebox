@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Committing a container's changes as a new image. `hive-nectar commit UPPER --base IMAGE` and `hive-nectar run --commit on` turn an overlay upper into an OCI layer, with whiteouts, opaque dirs, hard links, xattrs and owners shifted back from the cell's uid range, build it like any import and store a manifest of the base plus that layer with its provenance. Scrubbing is on by default: histories and home credential files are left out, `.git/config` URLs lose their passwords, and a private key or token anywhere else refuses the commit and says where, unless the path is allowed. On server3, committing `pip install numpy requests` in python:3.12-slim took 3.49 s for 74.0 MiB.
+
 ## 0.0.25
 
 Content addressed chunks for layer data, and CPU caps with a burst factor.

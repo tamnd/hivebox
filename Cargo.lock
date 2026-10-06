@@ -1372,6 +1372,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "regex",
  "rustix 1.1.5",
  "serde",
  "serde_json",

@@ -26,6 +26,7 @@ hive-blockd.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 libc.workspace = true
+regex.workspace = true
 rustix = { workspace = true, features = ["fs", "mount", "pipe"] }
 serde.workspace = true
 serde_json.workspace = true

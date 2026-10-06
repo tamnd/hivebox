@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,9 +18,11 @@ use sha2::{Digest, Sha256};
 use crate::BlobId;
 use crate::cas::Cuts;
 use crate::erofs::Mkfs;
-use crate::image::{ImageConfig, LayerRef, Manifest};
+use crate::image::{ImageConfig, LayerRef, Manifest, Provenance};
 use crate::leaves::Leaves;
 use crate::store::{BlobStore, blocking, hash_file, write_synced};
+#[cfg(target_os = "linux")]
+use crate::upper::{Scrub, SecretsFound, Shift, Written};
 
 const INDEX: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
@@ -67,6 +69,36 @@ pub struct Imported {
     pub reused: usize,
     /// Bytes of layer data the store did not have before: whole data blobs, or the new chunks of
     /// them when the importer stores chunks.
+    pub stored: u64,
+}
+
+/// What to commit, and how.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct Commit {
+    /// The overlay upper directory the cell wrote into.
+    pub upper: PathBuf,
+    /// The image the cell ran, which the new layer goes on top of.
+    pub base: BlobId,
+    /// How the cells' ids sit on the host, or nothing to keep owners as they are.
+    pub shift: Option<Shift>,
+    /// How to scrub, or nothing to commit everything as it is.
+    pub scrub: Option<Scrub>,
+    /// What is committed, such as the cell's id, which the provenance names.
+    pub from: String,
+}
+
+/// What a commit made.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct Committed {
+    /// The new manifest's name.
+    pub id: BlobId,
+    /// The new manifest: the base's layers and config, the new layer and the provenance.
+    pub manifest: Manifest,
+    /// What went into the layer.
+    pub written: Written,
+    /// Bytes of layer data the store did not have before.
     pub stored: u64,
 }
 
@@ -163,6 +195,7 @@ impl Importer {
                 user: run.user.unwrap_or_default(),
             },
             source,
+            provenance: None,
         };
         let id = self.put_manifest(store, &manifest).await?;
         Ok(Imported { id, manifest, built, reused, stored })
@@ -177,10 +210,72 @@ impl Importer {
     pub async fn import_tar(&self, store: &dyn BlobStore, tar: &Path) -> io::Result<Imported> {
         let src = Source { tar: tar.to_path_buf(), digest: None, diff_id: None };
         let (layer, _, stored) = self.layer(store, src).await?;
-        let manifest =
-            Manifest { layers: vec![layer], config: ImageConfig::default(), source: None };
+        let manifest = Manifest {
+            layers: vec![layer],
+            config: ImageConfig::default(),
+            source: None,
+            provenance: None,
+        };
         let id = self.put_manifest(store, &manifest).await?;
         Ok(Imported { id, manifest, built: 1, reused: 0, stored })
+    }
+
+    /// Commits what a container cell changed: the upper directory `how.upper`, scrubbed unless
+    /// `how.scrub` is unset, as a new layer on top of the image `how.base`, and stores the new
+    /// manifest with a [`Provenance`].
+    ///
+    /// # Errors
+    ///
+    /// The base is not in the store, the upper cannot be read or holds what a layer cannot say,
+    /// or the build or the store fails. Secrets found outside the allowed paths fail it with
+    /// `PermissionDenied` and a [`SecretsFound`] that lists them.
+    #[cfg(target_os = "linux")]
+    pub async fn commit(&self, store: &dyn BlobStore, how: Commit) -> io::Result<Committed> {
+        let base = load_manifest(store, how.base).await?;
+        let tar = self.work.join("build").join(format!(
+            "commit.{}.{}.tar",
+            std::process::id(),
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (path, upper, shift, scrub) = (tar.clone(), how.upper, how.shift, how.scrub);
+        let made = blocking(move || {
+            let out = io::BufWriter::with_capacity(1 << 20, File::create(&path)?);
+            let out = Hashed { inner: out, sha: Sha256::new() };
+            let (mut out, written) = crate::upper::write_tar(&upper, shift, scrub.as_ref(), out)?;
+            out.flush()?;
+            Ok((written, format!("sha256:{:x}", out.sha.finalize())))
+        })
+        .await;
+        let result = async {
+            let (written, diff_id) = made?;
+            if !written.found.is_empty() {
+                let found = SecretsFound(written.found.clone());
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, found));
+            }
+            let src = Source { tar: tar.clone(), digest: None, diff_id: Some(diff_id) };
+            let (layer, _, stored) = self.layer(store, src).await?;
+            let mut layers = base.layers;
+            layers.push(layer);
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let manifest = Manifest {
+                layers,
+                config: base.config,
+                source: base.source,
+                provenance: Some(Provenance {
+                    parent: how.base,
+                    from: how.from,
+                    at,
+                    scrubbed: written.scrubbed.clone(),
+                }),
+            };
+            let id = self.put_manifest(store, &manifest).await?;
+            Ok(Committed { id, manifest, written, stored })
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tar).await;
+        result
     }
 
     /// Builds one layer, or finds it built before, and puts its blobs in the store. Says whether
@@ -450,7 +545,7 @@ fn read_blob(layout: &Path, digest: &str) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// A reader that hashes what passes through it.
+/// A reader or writer that hashes what passes through it.
 struct Hashed<R> {
     inner: R,
     sha: Sha256,
@@ -461,6 +556,18 @@ impl<R: Read> Read for Hashed<R> {
         let n = self.inner.read(buf)?;
         self.sha.update(&buf[..n]);
         Ok(n)
+    }
+}
+
+impl<W: Write> Write for Hashed<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.sha.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 

@@ -93,6 +93,51 @@ pub struct Manifest {
     /// Where it came from, such as `docker.io/library/python:3.12-slim`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// For an image committed from a cell, what it was committed from and how.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// Where a committed image came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// The image the new layer went on top of.
+    pub parent: BlobId,
+    /// What was committed, such as a cell's id.
+    pub from: String,
+    /// When, in seconds since the Unix epoch.
+    pub at: u64,
+    /// What scrubbing did, or nothing when the commit was not scrubbed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrubbed: Option<Scrubbed>,
+}
+
+/// What scrubbing did to a committed layer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scrubbed {
+    /// Files left out: histories, credential files, and env files that held a secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+    /// Files written with credentials taken out, such as a `.git/config` with a token in a url.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewritten: Vec<String>,
+    /// Secrets found in paths the caller allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<Finding>,
+    /// Files too big to search for secrets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsearched: Vec<String>,
+}
+
+/// A secret found in a file: where, and what kind. The secret itself is never kept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// The file, relative to the root.
+    pub path: String,
+    /// The line it starts on, from 1.
+    pub line: u64,
+    /// The rule it matched, such as `aws access key`.
+    pub rule: String,
 }
 
 impl Manifest {

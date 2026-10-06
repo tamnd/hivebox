@@ -9,6 +9,7 @@
 //! hive-nectar copy IMAGE --store DIR --to-s3 URL      # an image and its layers, to a bucket
 //! hive-nectar relayout IMAGE --store DIR [--work DIR]
 //! hive-nectar run IMAGE --store DIR --cache DIR --work DIR --cmd CMD [--mode MODE]
+//! hive-nectar commit UPPER --base IMAGE --store DIR [--uid-base N] [--scrub on|off] [--allow PATHS]
 //! ```
 //!
 //! `run` mounts the image as a cell would get it and runs `CMD` with `sh -c` chrooted into it,
@@ -27,6 +28,13 @@
 //! those chunks, 64 KiB by default. They remember built layers in `--work DIR`,
 //! which is `STORE/import` by default.
 //!
+//! `run --commit on` commits what the command wrote as `commit` does.
+//!
+//! `commit` writes an overlay upper directory as a layer on top of the image `--base`, as the
+//! comb does for a cell, and prints the name of the new image. `--uid-base` is the host id of the
+//! cells' root, which owners are shifted back from. It scrubs by default, and `--allow` takes a
+//! comma separated list of paths whose secrets are let through. It needs Linux.
+//!
 //! In place of `--store DIR`, `--s3 URL` uses a bucket, as in `http://10.0.0.5:9000/bucket/prefix`,
 //! signing as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in `AWS_REGION`. Imports to a bucket
 //! need `--work DIR`.
@@ -34,7 +42,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,8 +53,8 @@ use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 
 const USAGE: &str = "usage: hive-nectar import-oci LAYOUT | import-tar TAR | show IMAGE | fetch IMAGE \
-                     | copy IMAGE | relayout IMAGE | run IMAGE --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] [--dedup chunks [--cas-avg BYTES]] \
-                     [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace]";
+                     | copy IMAGE | relayout IMAGE | run IMAGE | commit UPPER --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] [--dedup chunks [--cas-avg BYTES]] \
+                     [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace] [--commit on] [--base IMAGE] [--uid-base N] [--scrub on|off] [--allow PATHS]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -99,25 +107,17 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
             .map_or(Ok(default), |v| v.parse().map_err(|_| format!("--{name} takes a number")))
     };
     match cmd {
-        "import-oci" | "import-tar" => {
-            let chunk = u32::try_from(number("chunk", DEFAULT_CHUNK_SIZE.into())?)
-                .map_err(|_| "--chunk is too big")?;
-            let program = flags.get("mkfs").map_or_else(|| "mkfs.erofs".into(), PathBuf::from);
-            let mkfs = Mkfs::new(program, chunk).map_err(|e| e.to_string())?;
+        "import-oci" | "import-tar" | "commit" => {
             let work = match (flags.get("work"), &store_dir) {
                 (Some(w), _) => PathBuf::from(w),
                 (None, Some(dir)) => dir.join("import"),
                 (None, None) => return Err("an import to a bucket needs --work".into()),
             };
-            let mut importer = Importer::new(mkfs, work).map_err(|e| e.to_string())?;
-            match flags.get("dedup").map(String::as_str) {
-                None => {}
-                Some("chunks") => {
-                    let avg = usize::try_from(number("cas-avg", 64 << 10)?)
-                        .map_err(|_| "--cas-avg is too big")?;
-                    importer = importer.chunked(Cuts::new(avg).map_err(|e| e.to_string())?);
-                }
-                Some(other) => return Err(format!("--dedup takes chunks, not {other}")),
+            let importer = importer(flags, work)?;
+            if cmd == "commit" {
+                let base = flags.get("base").ok_or("--base is needed")?;
+                let base: BlobId = base.parse().map_err(|e| format!("{base}: {e}"))?;
+                return commit(&importer, store, Path::new(what), base, flags).await;
             }
             let started = Instant::now();
             let path = PathBuf::from(what);
@@ -281,6 +281,10 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 started.elapsed(),
                 mib(fetched)
             );
+            if flags.get("commit").is_some_and(|c| c == "on") {
+                let importer = importer(flags, work.join("import"))?;
+                commit(&importer, store, &work.join("upper"), id, flags).await?;
+            }
             drop(root);
             if mode == "trace" {
                 let traces = layers.traces();
@@ -297,6 +301,92 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
     }
 }
 
+/// The importer the flags ask for, working in `work`.
+fn importer(flags: &HashMap<String, String>, work: PathBuf) -> Result<Importer, String> {
+    let number = |name: &str, default: u64| {
+        flags
+            .get(name)
+            .map_or(Ok(default), |v| v.parse().map_err(|_| format!("--{name} takes a number")))
+    };
+    let chunk = u32::try_from(number("chunk", DEFAULT_CHUNK_SIZE.into())?)
+        .map_err(|_| "--chunk is too big")?;
+    let program = flags.get("mkfs").map_or_else(|| "mkfs.erofs".into(), PathBuf::from);
+    let mkfs = Mkfs::new(program, chunk).map_err(|e| e.to_string())?;
+    let importer = Importer::new(mkfs, work).map_err(|e| e.to_string())?;
+    match flags.get("dedup").map(String::as_str) {
+        None => Ok(importer),
+        Some("chunks") => {
+            let avg = usize::try_from(number("cas-avg", 64 << 10)?)
+                .map_err(|_| "--cas-avg is too big")?;
+            Ok(importer.chunked(Cuts::new(avg).map_err(|e| e.to_string())?))
+        }
+        Some(other) => Err(format!("--dedup takes chunks, not {other}")),
+    }
+}
+
+/// Commits the overlay upper directory `upper` on top of the image `base`, and prints the name
+/// of the new image.
+#[cfg(target_os = "linux")]
+async fn commit(
+    importer: &Importer,
+    store: &dyn BlobStore,
+    upper: &Path,
+    base: BlobId,
+    flags: &HashMap<String, String>,
+) -> Result<(), String> {
+    use hive_nectar::oci::Commit;
+    use hive_nectar::upper::{Scrub, Shift};
+    let shift = match flags.get("uid-base") {
+        None => None,
+        Some(v) => {
+            Some(Shift { base: v.parse().map_err(|_| "--uid-base takes a number")?, count: 65536 })
+        }
+    };
+    let allow = flags.get("allow").map_or_else(Vec::new, |a| {
+        a.split(',').filter(|p| !p.is_empty()).map(str::to_owned).collect()
+    });
+    let scrub = match flags.get("scrub").map(String::as_str) {
+        None | Some("on") => Some(Scrub { allow }),
+        Some("off") => None,
+        Some(other) => return Err(format!("--scrub takes on or off, not {other}")),
+    };
+    let started = Instant::now();
+    let from = format!("hive-nectar commit {}", upper.display());
+    let how = Commit { upper: upper.to_owned(), base, shift, scrub, from };
+    let got = importer.commit(store, how).await.map_err(|e| format!("committing: {e}"))?;
+    println!("{}", got.id);
+    let w = &got.written;
+    eprintln!(
+        "{} entries with {} of data and {} whiteouts, committed in {:.2?}, {} of it new to the store",
+        w.entries,
+        mib(w.bytes),
+        w.whiteouts,
+        started.elapsed(),
+        mib(got.stored),
+    );
+    if let Some(s) = &w.scrubbed {
+        eprintln!(
+            "scrubbed: {} files left out, {} rewritten, {} secrets allowed, {} too big to search",
+            s.removed.len(),
+            s.rewritten.len(),
+            s.allowed.len(),
+            s.unsearched.len(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn commit(
+    _: &Importer,
+    _: &dyn BlobStore,
+    _: &Path,
+    _: BlobId,
+    _: &HashMap<String, String>,
+) -> Result<(), String> {
+    Err("commit needs Linux".into())
+}
+
 /// A cell's overlay on the layers, with its writes kept under `work`, until it drops.
 #[cfg(target_os = "linux")]
 struct Overlay {
@@ -305,7 +395,7 @@ struct Overlay {
 }
 
 #[cfg(target_os = "linux")]
-fn overlay(work: &std::path::Path, lowers: &[PathBuf]) -> std::io::Result<Overlay> {
+fn overlay(work: &Path, lowers: &[PathBuf]) -> std::io::Result<Overlay> {
     let root = Overlay { work: work.to_owned(), merged: work.join("root") };
     let (upper, scratch) = (work.join("upper"), work.join("ovl"));
     for d in [&upper, &scratch, &root.merged] {
