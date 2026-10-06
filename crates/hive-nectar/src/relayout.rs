@@ -231,7 +231,12 @@ mod tests {
             relaid_chunks: None,
             diff_id: None,
         };
-        let image = Manifest { layers: vec![layer], config: ImageConfig::default(), source: None };
+        let image = Manifest {
+            layers: vec![layer],
+            config: ImageConfig::default(),
+            source: None,
+            provenance: None,
+        };
         let trace = vec![30, 2, 17, 40, 5, 6, 33];
         let traces = HashMap::from([(image.layers[0].digest, trace.clone())]);
         let (_, traced) = crate::trace::put(&*store, &image, &traces, &work).await.unwrap();
@@ -320,7 +325,12 @@ mod tests {
             relaid_chunks: None,
             diff_id: None,
         };
-        let image = Manifest { layers: vec![layer], config: ImageConfig::default(), source: None };
+        let image = Manifest {
+            layers: vec![layer],
+            config: ImageConfig::default(),
+            source: None,
+            provenance: None,
+        };
         let traces = HashMap::from([(image.layers[0].digest, vec![30, 2, 17, 5, 6])]);
         let (_, traced) = crate::trace::put(&*store, &image, &traces, &work).await.unwrap();
         let done = put(&*store, &traced, &work).await.unwrap();

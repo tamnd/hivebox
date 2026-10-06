@@ -17,8 +17,9 @@
 //! checked against the blob's [`Leaves`]. [`trace`] records what a run read so the next mount
 //! fills that first, and [`relayout`] stores a copy of each traced data blob with those chunks
 //! first so the fill fetches them in a few long reads. [`cas`] stores a data blob as content
-//! addressed chunks, so layers that share files share the chunks they fall in. The 3FS store comes
-//! later.
+//! addressed chunks, so layers that share files share the chunks they fall in. [`upper`] writes
+//! what a container cell changed as a layer, scrubbed of secrets, which
+//! [`oci::Importer::commit`] puts on top of the image the cell ran. The 3FS store comes later.
 
 // Only the mount module has any, for loop device ioctls and `mount_setattr`.
 #![deny(unsafe_code)]
@@ -37,10 +38,12 @@ pub mod relayout;
 pub mod s3;
 pub mod store;
 pub mod trace;
+#[cfg(target_os = "linux")]
+pub mod upper;
 
 pub use blob::{BadBlobId, BlobId};
 pub use cache::{Cache, Held};
-pub use image::{ImageConfig, LayerRef, Manifest};
+pub use image::{ImageConfig, LayerRef, Manifest, Provenance};
 pub use lazy::{Lazy, Relaid};
 pub use leaves::Leaves;
 pub use s3::{S3Config, S3Store};
