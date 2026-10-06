@@ -100,6 +100,43 @@ impl Api {
         Ok(self.client(self.inner.nodes.channel(node).map_err(|e| convert::error_to_status(&e))?))
     }
 
+    /// The channel to `node`.
+    pub(crate) fn channel(&self, node: u16) -> Result<Channel, Status> {
+        self.inner.nodes.channel(node).map_err(|e| convert::error_to_status(&e))
+    }
+
+    /// Takes one cell out of `project`'s quota, when the gate holds projects to one.
+    pub(crate) async fn charge(&self, project: &str) -> Result<(), Status> {
+        match &self.inner.quotas {
+            Some(q) => q.charge(project, 1).await.map_err(|e| convert::error_to_status(&e)),
+            None => Ok(()),
+        }
+    }
+
+    /// The node waggle picks for one cell of `spec` in `project`, leaving out `exclude`.
+    pub(crate) fn place_one(&self, project: &str, spec: &CellSpec, exclude: &[u16]) -> Option<u16> {
+        let inner = &self.inner;
+        let snap = inner.nodes.snapshot();
+        let req = PlaceReq {
+            backend: spec.backend,
+            resources: spec.resources,
+            n: 1,
+            layers: &[],
+            project: project_id(project),
+            affinity: None,
+            exclude,
+        };
+        let now = inner.start.elapsed();
+        let mut placer = inner.placer.lock().unwrap_or_else(PoisonError::into_inner);
+        placer.place(&snap.view, &req, now).nodes.first().map(|&(node, _)| node)
+    }
+
+    /// Tells waggle that `node` turned away a cell of `spec`.
+    pub(crate) fn refused(&self, node: u16, spec: &CellSpec) {
+        let mut placer = self.inner.placer.lock().unwrap_or_else(PoisonError::into_inner);
+        placer.refused(node, 1, &spec.resources);
+    }
+
     /// Runs a bulk call on every node and adds up the answers. A node that fails shows up as
     /// one failure with no cell id, since which of its cells matched is not known.
     async fn everywhere<T, F, Fut>(&self, project: &str, msg: T, call: F) -> v1::BulkResult
@@ -638,7 +675,7 @@ fn parse_token(t: &str) -> Result<(u16, Option<CellId>), Status> {
 
 /// The project the gate stamped on the call, once the call's token, if it came with one, allows
 /// `op` on `cell`. A token held to some cells allows no call that is not about one cell.
-fn allowed<T>(req: &Request<T>, op: &str, cell: Option<&str>) -> Result<String, Status> {
+pub(crate) fn allowed<T>(req: &Request<T>, op: &str, cell: Option<&str>) -> Result<String, Status> {
     // The id as the comb reads it, so two ways of writing one id can not get past a check.
     let cell = cell.map(|c| c.parse::<CellId>().map_or_else(|_| c.to_owned(), |id| id.to_string()));
     Grant::check(req.extensions().get::<Grant>(), op, cell.as_deref())?;
@@ -663,7 +700,7 @@ fn project<T>(req: &Request<T>) -> Result<String, Status> {
 }
 
 /// `msg` as a call for `project`.
-fn out<T>(project: &str, msg: T) -> Request<T> {
+pub(crate) fn out<T>(project: &str, msg: T) -> Request<T> {
     let mut r = Request::new(msg);
     if let Ok(v) = project.parse() {
         r.metadata_mut().insert(PROJECT_HEADER, v);
@@ -671,16 +708,16 @@ fn out<T>(project: &str, msg: T) -> Request<T> {
     r
 }
 
-fn parse_id(id: &str) -> Result<CellId, Status> {
+pub(crate) fn parse_id(id: &str) -> Result<CellId, Status> {
     id.parse().map_err(|_| invalid(format!("{id:?} is not a cell id")))
 }
 
-fn invalid(msg: impl Into<String>) -> Status {
+pub(crate) fn invalid(msg: impl Into<String>) -> Status {
     convert::error_to_status(&Error::new(Reason::InvalidArgument, msg))
 }
 
 /// `s` from `node` as an error for the caller, saying which node.
-fn node_error(node: u16, s: &Status) -> Error {
+pub(crate) fn node_error(node: u16, s: &Status) -> Error {
     let mut e = convert::error_from_status(s);
     // A status with no hivebox reason and this code came from the connection, not the comb.
     if e.reason == Reason::Internal && s.code() == tonic::Code::Unavailable {

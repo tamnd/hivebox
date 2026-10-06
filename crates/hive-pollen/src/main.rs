@@ -17,6 +17,9 @@ usage: hive-pollen [--socket PATH | --endpoint URL] [--project NAME] [--max-infl
 TASKS is a file with one task per line as JSON, or - for stdin. Each sample's trajectory goes to
 FILE, or stdout, as a line of JSON as soon as the sample is done, and a summary goes to stderr at
 the end. --max-inflight is how many sample cells may be alive at once, 8 by default.
+
+The endpoint is $HIVE_ENDPOINT, a gate's address like http://10.0.0.5:7400, or the comb socket
+$HIVE_SOCKET, /run/hivebox/comb.sock by default. A gate needs the API key or token in $HIVE_TOKEN.
 ";
 
 fn main() -> ExitCode {
@@ -103,6 +106,9 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     let mut client = Client::connect(&endpoint).await.map_err(|e| e.to_string())?;
     if let Some(p) = args.project.clone().or_else(|| std::env::var("HIVE_PROJECT").ok()) {
         client = client.project(&p).map_err(|e| e.to_string())?;
+    }
+    if let Ok(t) = std::env::var("HIVE_TOKEN") {
+        client = client.token(&t).map_err(|e| e.to_string())?;
     }
     let mut sink: Box<dyn AsyncWrite + Unpin> = match &args.out {
         Some(f) => Box::new(tokio::fs::File::create(f).await.map_err(|e| format!("{f}: {e}"))?),

@@ -105,7 +105,7 @@ A comb in standalone mode serves Cells, Exec, Files and Verify itself, on a Unix
 - `Exec.Signal` reaches processes started with `Exec.Start` on the same comb. `user` is a uid or `uid:gid`.
 - `ExtendTtl` sets the hard TTL to run out a given time from now and replaces the idle TTL, leaving either alone when it is unset.
 - `UpdatePolicy` only takes `ready` so far, which ends the cell's setup boost. A network profile or limits in it get `UNIMPLEMENTED`.
-- `Verify.Run` checks a subject cell's changes in a new cell on the same comb, as section 5 of `11_rl_integration.md` tells. The gate does not route it yet.
+- `Verify.Run` checks a subject cell's changes in a new cell on the same comb, as section 5 of `11_rl_integration.md` tells. Through the gate, a verify goes to the comb that owns the subject, so the diff never leaves the node, and one with no subject goes where waggle would put the verifier cell, then to another node if that one has no room. A token is checked for the `verify` op on the subject, and the verifier cell counts against the project's quota like any other cell.
 - Not served yet: `SessionInteract`, terminals on `Start`, idempotency keys on `Run`, and snapshots on `Stop`. `ExposePort` needs a gate and will not be served here.
 
 ## 2. Error model
