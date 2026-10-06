@@ -60,6 +60,9 @@ pub struct Config {
     /// pause and it is not in the latency class, and paused cells have their memory reclaimed at
     /// once instead of after `reclaim_after`. Zero leaves cells alone.
     pub pressure_idle: Duration,
+    /// A running cell idle this long gives back the page cache it has not used lately, and again
+    /// each time it stays idle that long more. Latency cells keep theirs. Zero turns it off.
+    pub trim_idle: Duration,
     /// Gives each CPU class a core scheduling cookie of its own, so the two threads of a core never
     /// run cells of different classes at once. It does nothing on a host without SMT.
     pub core_scheduling: bool,
@@ -272,6 +275,7 @@ impl Default for Config {
             psi_stop_admit: 0.20,
             psi_source: None,
             pressure_idle: Duration::from_secs(30),
+            trim_idle: Duration::from_secs(30),
             core_scheduling: true,
             setup_boost: 4,
             cpu_burst_tenths: 20,
@@ -308,6 +312,7 @@ impl Config {
     /// [density]
     /// psi_stop_admit = 0.20
     /// pressure_idle = "30s"
+    /// trim_idle = "30s"
     /// core_scheduling = true
     /// setup_boost = 4
     /// cpu_burst = 2.0
@@ -404,10 +409,15 @@ impl Config {
         if let Some(path) = file.density.psi_source {
             c.psi_source = (!path.as_os_str().is_empty()).then_some(path);
         }
-        if let Some(v) = file.density.pressure_idle {
-            c.pressure_idle = duration(&v).ok_or_else(|| {
-                format!("density.pressure_idle = {v:?} is not a duration like 500ms, 30s or 10m")
-            })?;
+        for (field, value, name) in [
+            (&mut c.pressure_idle, file.density.pressure_idle, "pressure_idle"),
+            (&mut c.trim_idle, file.density.trim_idle, "trim_idle"),
+        ] {
+            if let Some(v) = value {
+                *field = duration(&v).ok_or_else(|| {
+                    format!("density.{name} = {v:?} is not a duration like 500ms, 30s or 10m")
+                })?;
+            }
         }
         set(&mut c.core_scheduling, file.density.core_scheduling);
         set(&mut c.setup_boost, file.density.setup_boost);
@@ -677,6 +687,7 @@ struct DensityFile {
     psi_stop_admit: Option<f64>,
     psi_source: Option<PathBuf>,
     pressure_idle: Option<String>,
+    trim_idle: Option<String>,
     core_scheduling: Option<bool>,
     setup_boost: Option<u32>,
     cpu_burst: Option<f64>,
@@ -723,6 +734,7 @@ mod tests {
         assert!((c.psi_stop_admit - 0.20).abs() < 1e-9);
         assert_eq!(c.psi_source, None);
         assert_eq!(c.pressure_idle, Duration::from_secs(30));
+        assert_eq!(c.trim_idle, Duration::from_secs(30));
         assert!(c.core_scheduling);
         assert_eq!(c.setup_boost, 4);
         assert_eq!(c.cpu_burst_tenths, 20);
@@ -756,6 +768,7 @@ mod tests {
             psi_stop_admit = 0.35
             psi_source = "/proc/pressure/memory"
             pressure_idle = "2m"
+            trim_idle = "0s"
             core_scheduling = false
             setup_boost = 8
             cpu_burst = 1.5
@@ -803,6 +816,7 @@ mod tests {
         assert!((c.psi_stop_admit - 0.35).abs() < 1e-9);
         assert_eq!(c.psi_source, Some(PathBuf::from("/proc/pressure/memory")));
         assert_eq!(c.pressure_idle, Duration::from_secs(120));
+        assert_eq!(c.trim_idle, Duration::ZERO);
         assert!(!c.core_scheduling);
         assert_eq!(c.setup_boost, 8);
         assert_eq!(c.cpu_burst_tenths, 15);

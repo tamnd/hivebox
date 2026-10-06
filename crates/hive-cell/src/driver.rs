@@ -43,6 +43,8 @@ pub struct DriverCaps {
     pub resize: bool,
     /// Pass a GPU through.
     pub gpu: bool,
+    /// Give back the page cache a running cell has not used lately.
+    pub trim: bool,
 }
 
 /// Whether this node can run the driver's cells, found by [`CellDriver::probe`].
@@ -203,6 +205,13 @@ pub trait CellDriver: Send + Sync + 'static {
     fn resume<'a>(&'a self, h: &'a CellHandle) -> BoxFuture<'a, Result<()>> {
         let _ = h;
         Box::pin(async { Err(unsupported("resume")) })
+    }
+
+    /// Gives back the page cache a running cell has not used lately and returns how many bytes its
+    /// memory went down by. The cell keeps running and keeps its own memory.
+    fn trim<'a>(&'a self, h: &'a CellHandle) -> BoxFuture<'a, Result<u64>> {
+        let _ = h;
+        Box::pin(async { Err(unsupported("trim")) })
     }
 
     /// Changes a running cell's resources.

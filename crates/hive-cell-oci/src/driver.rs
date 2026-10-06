@@ -23,6 +23,8 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Where cgroup v2 is mounted. A cell's cgroup is given to libcontainer relative to it.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+/// Less cold page cache than this in a cell is not worth a trim.
+const TRIM_FLOOR: u64 = 1 << 20;
 
 /// How one node runs its container cells.
 #[derive(Clone, Debug)]
@@ -218,6 +220,7 @@ impl CellDriver for OciDriver {
             fork: false,
             resize: false,
             gpu: false,
+            trim: true,
         }
     }
 
@@ -351,6 +354,16 @@ impl CellDriver for OciDriver {
             // Pages already in swap stay there until touched, and new ones stop going out.
             cgroup::swap(&h.cgroup, false);
             Ok(())
+        })
+    }
+
+    fn trim<'a>(&'a self, h: &'a CellHandle) -> BoxFuture<'a, Result<u64>> {
+        Box::pin(async move {
+            // A reclaim writes dirty pages out before it returns, so it stays off the runtime.
+            let dir = h.cgroup.clone();
+            tokio::task::spawn_blocking(move || cgroup::trim(&dir, TRIM_FLOOR))
+                .await
+                .map_err(|e| Error::new(Reason::Internal, format!("trimming: {e}")))
         })
     }
 

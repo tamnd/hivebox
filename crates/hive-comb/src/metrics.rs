@@ -29,6 +29,7 @@ pub struct Metrics {
     stall: GaugeVec,
     reclaimed: CounterVec,
     squeezed: CounterVec,
+    trimmed: CounterVec,
 }
 
 impl Default for Metrics {
@@ -75,6 +76,11 @@ impl Default for Metrics {
                 "Idle cells the pressure brake paused.",
                 &[],
             ),
+            trimmed: registry.counter(
+                "hive_memory_trimmed_bytes_total",
+                "Page cache idle running cells gave back.",
+                &[],
+            ),
             registry,
         }
     }
@@ -118,6 +124,10 @@ impl Metrics {
     pub(crate) fn squeezed(&self) {
         self.squeezed.with(&[]).inc();
     }
+
+    pub(crate) fn trimmed(&self, bytes: u64) {
+        self.trimmed.with(&[]).add(bytes);
+    }
 }
 
 #[cfg(test)]
@@ -132,11 +142,13 @@ mod tests {
         m.exec("run", Duration::from_millis(2));
         m.stopped(Backend::Container, "driver", Duration::from_millis(4));
         m.snapshot("read", Duration::from_millis(5));
+        m.trimmed(4096);
         let text = m.registry().render();
         assert!(text.contains(r#"hive_create_seconds_count{backend="container",stage="pool"} 1"#));
         assert!(text.contains(r#"hive_create_total{backend="container",result="ok"} 1"#));
         assert!(text.contains(r#"hive_exec_seconds_count{op="run"} 1"#));
         assert!(text.contains(r#"hive_stop_seconds_count{backend="container",stage="driver"} 1"#));
         assert!(text.contains(r#"hive_snapshot_seconds_count{stage="read"} 1"#));
+        assert!(text.contains("hive_memory_trimmed_bytes_total 4096"));
     }
 }

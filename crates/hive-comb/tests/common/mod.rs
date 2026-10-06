@@ -32,6 +32,7 @@ pub struct Guest {
     pub links: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
     pub paused: bool,
     pub reclaimed: bool,
+    pub trims: u32,
     pub exit: Option<ExitInfo>,
 }
 
@@ -94,7 +95,7 @@ impl CellDriver for Fake {
     }
 
     fn caps(&self) -> DriverCaps {
-        DriverCaps { pause: true, ..DriverCaps::default() }
+        DriverCaps { pause: true, trim: true, ..DriverCaps::default() }
     }
 
     fn probe(&self) -> BoxFuture<'_, Result<NodeFit, Error>> {
@@ -119,6 +120,7 @@ impl CellDriver for Fake {
                 links: Arc::default(),
                 paused: false,
                 reclaimed: false,
+                trims: 0,
                 exit: None,
             };
             self.guests.lock().unwrap().insert(id, guest);
@@ -190,6 +192,13 @@ impl CellDriver for Fake {
             }
             h.pid = Some(std::process::id());
             Ok(())
+        })
+    }
+
+    fn trim<'a>(&'a self, h: &'a CellHandle) -> BoxFuture<'a, Result<u64, Error>> {
+        Box::pin(async move {
+            self.with(h.id, |g| g.trims += 1);
+            Ok(4096)
         })
     }
 

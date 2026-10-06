@@ -205,6 +205,8 @@ pub(crate) struct Actor {
     veth: Option<Veth>,
     /// Whether the paused cell's memory has been reclaimed, so the reclaim timer is done.
     reclaimed: bool,
+    /// When the running cell last gave back its cold page cache.
+    trimmed: Option<SystemTime>,
     /// When the setup boost ends, while the cell has one.
     boost_until: Option<SystemTime>,
 }
@@ -230,6 +232,7 @@ impl Actor {
             netns: None,
             veth: None,
             reclaimed: false,
+            trimmed: None,
             boost_until: None,
         }
     }
@@ -608,6 +611,12 @@ impl Actor {
                             }
                             self.reclaim().await;
                         }
+                        Timer::Trim => {
+                            if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
+                                continue;
+                            }
+                            self.trim().await;
+                        }
                         Timer::Squeeze => {
                             if !*self.inner.pressure.borrow()
                                 || self.next_timer().is_some_and(|(at, _)| at > Instant::now())
@@ -653,7 +662,7 @@ impl Actor {
         let hard = ttls.hard.map(|ttl| (at(self.cell.created + ttl), Timer::Hard));
         let cfg = &self.inner.cfg;
         let pressed = *self.inner.pressure.borrow();
-        let (idle, squeeze, reclaim, pause_ttl) = match self.cell.state() {
+        let (idle, squeeze, trim, reclaim, pause_ttl) = match self.cell.state() {
             CellState::Running => {
                 let last = time(self.cell.last_active_ms.load(Ordering::Relaxed));
                 let idle = ttls.idle.map(|ttl| (at(last + ttl), Timer::Idle));
@@ -665,7 +674,15 @@ impl Actor {
                     && self.cell.spec.qos != Qos::Latency
                     && self.driver.caps().pause)
                     .then(|| (at(last + cfg.pressure_idle), Timer::Squeeze));
-                (idle, squeeze, None, None)
+                // Latency cells keep their page cache warm too.
+                let trim = (!cfg.trim_idle.is_zero()
+                    && self.cell.spec.qos != Qos::Latency
+                    && self.driver.caps().trim)
+                    .then(|| {
+                        let since = self.trimmed.map_or(last, |t| t.max(last));
+                        (at(since + cfg.trim_idle), Timer::Trim)
+                    });
+                (idle, squeeze, trim, None, None)
             }
             CellState::Paused => {
                 let since = self.cell.status.borrow().changed;
@@ -676,12 +693,12 @@ impl Actor {
                 };
                 let reclaim = (!self.reclaimed && self.driver.caps().pause)
                     .then(|| (at(since + wait), Timer::Reclaim));
-                (None, None, reclaim, Some((at(since + cfg.pause_ttl), Timer::PauseTtl)))
+                (None, None, None, reclaim, Some((at(since + cfg.pause_ttl), Timer::PauseTtl)))
             }
-            _ => (None, None, None, None),
+            _ => (None, None, None, None, None),
         };
         let boost = self.boost_until.map(|t| (at(t), Timer::Boost));
-        [hard, idle, squeeze, reclaim, pause_ttl, boost]
+        [hard, idle, squeeze, trim, reclaim, pause_ttl, boost]
             .into_iter()
             .flatten()
             .min_by_key(|(at, _)| *at)
@@ -693,6 +710,16 @@ impl Actor {
         self.reclaimed = true;
         let handle = self.handle.clone().expect("a live cell has a handle");
         let _ = self.driver.pause(&handle, PauseMode::Reclaim).await;
+    }
+
+    /// Has the driver give back the page cache the idle cell has not used lately. The cell runs on
+    /// either way, and a trim that failed waits its turn again like one that worked.
+    async fn trim(&mut self) {
+        self.trimmed = Some(SystemTime::now());
+        let handle = self.handle.clone().expect("a live cell has a handle");
+        if let Ok(bytes) = self.driver.trim(&handle).await {
+            self.inner.metrics.trimmed(bytes);
+        }
     }
 
     async fn extend_ttl(
@@ -1006,6 +1033,8 @@ enum Timer {
     Idle,
     /// Idle for `pressure_idle` while the brake is on.
     Squeeze,
+    /// Idle for `trim_idle` since it was last used or trimmed.
+    Trim,
     Reclaim,
     PauseTtl,
 }

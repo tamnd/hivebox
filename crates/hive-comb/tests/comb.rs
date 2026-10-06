@@ -393,6 +393,44 @@ async fn idle_cells_pause_while_the_node_is_short_of_memory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn idle_cells_give_back_their_page_cache() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let cfg = Config { trim_idle: Duration::from_millis(300), ..config(&s.0) };
+    let comb = open(cfg, &fake).await;
+    let idle = comb.create(request(spec("python"))).await.unwrap().id;
+    let mut warm = spec("python");
+    warm.qos = Qos::Latency;
+    let warm = comb.create(request(warm)).await.unwrap().id;
+    let busy = comb.create(request(spec("python"))).await.unwrap().id;
+    let paused = comb.create(request(spec("python"))).await.unwrap().id;
+    comb.pause(paused).await.unwrap();
+
+    // An idle cell is trimmed once it has been idle long enough, and again while it stays idle.
+    let until = Instant::now() + Duration::from_secs(10);
+    while fake.with(idle, |g| g.trims) < 3 {
+        assert!(Instant::now() < until, "the idle cell was not trimmed again and again");
+        echo(&comb, busy, "busy").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A latency cell, a cell in use and a paused cell keep their page cache.
+    for id in [warm, busy, paused] {
+        assert_eq!(fake.with(id, |g| g.trims), 0, "{id}");
+    }
+    let text = comb.metrics().registry().render();
+    let line = text.lines().find(|l| l.starts_with("hive_memory_trimmed_bytes_total ")).unwrap();
+    let bytes: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(bytes >= 3 * 4096 && bytes.is_multiple_of(4096), "{line}");
+
+    // Using a cell puts its next trim off.
+    echo(&comb, idle, "awake").await;
+    let trims = fake.with(idle, |g| g.trims);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(fake.with(idle, |g| g.trims), trims);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pause_and_resume_by_hand() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());
