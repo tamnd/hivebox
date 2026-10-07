@@ -1,10 +1,10 @@
 //! The userfaultfd calls, the mapping the pages come from, and passing a file descriptor over a
 //! Unix socket. Every `unsafe` block in the crate is in this file.
 
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 
 const UFFD_API: u64 = 0xaa;
 const UFFDIO_API: libc::c_ulong = 0xc018_aa3f;
@@ -12,10 +12,17 @@ const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
 const UFFDIO_WAKE: libc::c_ulong = 0x8010_aa02;
 const UFFDIO_COPY: libc::c_ulong = 0xc028_aa03;
 const UFFDIO_ZEROPAGE: libc::c_ulong = 0xc020_aa04;
+const UFFDIO_CONTINUE: libc::c_ulong = 0xc020_aa07;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+const UFFDIO_REGISTER_MODE_MINOR: u64 = 1 << 2;
 /// Asks the kernel to say when the process gives pages back with `madvise(MADV_DONTNEED)`, which
 /// is how the balloon frees guest memory.
 pub(crate) const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
+/// Asks for minor faults on shared memory: a page that is in the page cache but not mapped yet.
+pub(crate) const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
+const UFFD_PAGEFAULT_FLAG_MINOR: u64 = 1 << 2;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFD_EVENT_REMOVE: u8 = 0x15;
 const MSG_SIZE: usize = 32;
@@ -50,6 +57,13 @@ struct Copy {
 }
 
 #[repr(C)]
+struct Continue {
+    range: Range,
+    mode: u64,
+    mapped: i64,
+}
+
+#[repr(C)]
 struct Zeropage {
     range: Range,
     mode: u64,
@@ -59,8 +73,9 @@ struct Zeropage {
 /// What a userfaultfd has to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Event {
-    /// A thread touched a page that is not there yet and waits for it.
-    Fault { addr: u64 },
+    /// A thread touched a page that is not mapped yet and waits for it. A minor fault is on a
+    /// page that is in the page cache already, so it only needs mapping.
+    Fault { addr: u64, minor: bool },
     /// The process gave back `start..end`, so a later touch there wants a zero page.
     Remove { start: u64, end: u64 },
     /// An event this server does not ask for.
@@ -93,10 +108,11 @@ impl Uffd {
         self.ioctl(UFFDIO_API, (&raw mut api).cast())
     }
 
-    /// Has faults on pages missing in `start..start + len` come here.
-    pub(crate) fn register(&self, start: u64, len: u64) -> io::Result<()> {
-        let mut reg =
-            Register { range: Range { start, len }, mode: UFFDIO_REGISTER_MODE_MISSING, ioctls: 0 };
+    /// Has faults on pages in `start..start + len` come here: pages missing from anonymous
+    /// memory, or with `minor`, pages of shared memory that are in the page cache and not mapped.
+    pub(crate) fn register(&self, start: u64, len: u64, minor: bool) -> io::Result<()> {
+        let mode = if minor { UFFDIO_REGISTER_MODE_MINOR } else { UFFDIO_REGISTER_MODE_MISSING };
+        let mut reg = Register { range: Range { start, len }, mode, ioctls: 0 };
         self.ioctl(UFFDIO_REGISTER, (&raw mut reg).cast())
     }
 
@@ -110,6 +126,20 @@ impl Uffd {
             Ok(()) => Ok(len),
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                 Ok(u64::try_from(c.copy).unwrap_or(0))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Maps the page cache pages behind `dst..dst + len` in, read only in a private mapping so a
+    /// write copies the page, and wakes whatever waits there. Returns the bytes mapped, which is
+    /// short of `len` when a page in the range was mapped already.
+    pub(crate) fn map_in(&self, dst: u64, len: u64) -> io::Result<u64> {
+        let mut c = Continue { range: Range { start: dst, len }, mode: 0, mapped: 0 };
+        match self.ioctl(UFFDIO_CONTINUE, (&raw mut c).cast()) {
+            Ok(()) => Ok(len),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                Ok(u64::try_from(c.mapped).unwrap_or(0))
             }
             Err(e) => Err(e),
         }
@@ -146,7 +176,9 @@ impl Uffd {
         Ok(Some(match msg[0] {
             // The pagefault arm is flags then address, and the remove arm is start then end,
             // both after the 8 byte header.
-            UFFD_EVENT_PAGEFAULT => Event::Fault { addr: word(16) },
+            UFFD_EVENT_PAGEFAULT => {
+                Event::Fault { addr: word(16), minor: word(8) & UFFD_PAGEFAULT_FLAG_MINOR != 0 }
+            }
             UFFD_EVENT_REMOVE => Event::Remove { start: word(8), end: word(16) },
             other => Event::Other(other),
         }))
@@ -185,14 +217,20 @@ unsafe impl Send for Map {}
 unsafe impl Sync for Map {}
 
 impl Map {
-    /// Maps all of the file at `path` read only, shared with the page cache.
-    pub(crate) fn file(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
-        if len == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the memory file is empty"));
-        }
-        Self::mmap(len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd())
+    /// Maps all of `file` read only, shared with the page cache.
+    pub(crate) fn file(file: &File) -> io::Result<Self> {
+        Self::mmap(len(file)?, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd())
+    }
+
+    /// Maps all of `file` for reading and writing, private, the way a VMM maps guest memory from a
+    /// template: reads see the file and the first write to a page copies it.
+    pub(crate) fn private(file: &File) -> io::Result<Self> {
+        Self::mmap(
+            len(file)?,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+            file.as_raw_fd(),
+        )
     }
 
     /// Maps `len` bytes of fresh anonymous memory, the way a VMM maps guest memory.
@@ -233,6 +271,15 @@ impl Map {
         unsafe { std::slice::from_raw_parts(self.addr.add(at), len) }
     }
 
+    /// Writes `b` at `at`, which faults its page in if it is not there and copies it if it is
+    /// mapped from a file.
+    pub(crate) fn poke(&mut self, at: usize, b: u8) {
+        assert!(at < self.len, "past the mapping");
+        // SAFETY: `at` is inside the mapping, which is writable whenever a `&mut` exists, since
+        // only the read only file map is ever shared and it is never borrowed mutably.
+        unsafe { std::ptr::write_volatile(self.addr.add(at), b) };
+    }
+
     /// Reads the byte at `at`, which faults its page in if it is not there. The read is volatile,
     /// so the compiler cannot drop a touch whose value goes unused.
     pub(crate) fn touch(&self, at: usize) -> u8 {
@@ -256,6 +303,41 @@ impl Drop for Map {
         // SAFETY: the mapping was made by `map` with this length and is not used after this.
         unsafe { libc::munmap(self.addr.cast(), self.len) };
     }
+}
+
+fn len(file: &File) -> io::Result<usize> {
+    let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+    if len == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "the memory file is empty"));
+    }
+    Ok(len)
+}
+
+/// Whether `file` lives in memory, on tmpfs or hugetlbfs, where its pages can be mapped into a
+/// VM in minor fault mode.
+pub(crate) fn in_memory(file: &File) -> io::Result<bool> {
+    // SAFETY: an all zero statfs is valid, and the kernel fills it for an open descriptor.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a writable statfs, and the descriptor is open.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &raw mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let kind = st.f_type as u64 & 0xffff_ffff;
+    Ok(kind == TMPFS_MAGIC || kind == HUGETLBFS_MAGIC)
+}
+
+/// Makes an anonymous file in memory, the kind `memfd_create` makes, closed on exec.
+pub(crate) fn memfd(name: &str) -> io::Result<File> {
+    let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `name` is a C string that outlives the call, and a non-negative result is a new
+    // descriptor nothing else owns.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Sends `data` and the descriptor `fd` in one message, the way Firecracker hands over its
