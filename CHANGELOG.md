@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.32
+
+An audit log on every node, with every API call in it and its roots held by the keeper.
+
 - An audit log in `hive_telemetry::audit`: a node's events as a hash chain cut into hourly files, each sealed with its count and root when the hour turns, written in batches with one sync each. `hivectl audit verify DIR` says where a chain breaks. On server3 at load 80, 8 threads recorded 32,000 to 42,000 events a second, and verifying ran at 71,000 to 171,000 a second.
 - The comb records every API call in its audit log: cells, exec, files, snapshots, verify and the LLM gateway, with the principal the gate stamps in `x-hive-principal` (`local` on the comb's own socket), a hash of the arguments, the result and the W3C trace id. It is on by default under the data directory and set with `[audit] dir`, and an empty `dir` turns it off. Syncs are at least `[audit] sync_gap` apart, 1 s unless set, since syncing every batch slowed file writes from cells by about 40 percent on server3. With the gap, at load 84 to 108, `exec.run` through the python SDK ran at 469 to 568 calls a second with the log on against 459 to 553 off, and file writes at 532 to 569 against 508 to 720.
 - The comb publishes its audit chain's sealed hour roots and its tip to the keeper with each lease renewal, in the same Raft entry. The keeper takes them only if they follow on from the ones it holds, keeps 30 days of hours per node, and serves them over `GetAuditChain`. `hivectl audit verify DIR --keeper HOST:PORT` checks a chain on disk against them, so a chain rewritten and hashed again from some line on is caught. On server3 with 1,000 combs renewing once a second, each with a new tip, renewals took 103 to 147 ms at p50 against 88 to 95 ms without roots, with none failing.
