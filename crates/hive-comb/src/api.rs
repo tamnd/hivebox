@@ -36,9 +36,13 @@ use tonic::codegen::{BoxFuture, Service, http};
 use tonic::server::NamedService;
 use tonic::{Request, Response, Status, Streaming};
 
+mod audit;
 mod llm;
 mod snapshots;
 mod verify;
+
+use audit::{Args, Call, failed};
+pub use audit::{DEFAULT_PRINCIPAL, PRINCIPAL_HEADER};
 
 /// The header that names the caller's project.
 pub const PROJECT_HEADER: &str = "x-hive-project";
@@ -224,6 +228,57 @@ impl Api {
         Ok((id, self.comb.drone(id).await.map_err(status)?))
     }
 
+    /// Writes the file `h` names with what comes on `input`, adding the bytes to `sent`.
+    async fn write_file(
+        &self,
+        project: &str,
+        h: v1::WriteFileHeader,
+        mut input: Streaming<v1::WriteFileChunk>,
+        sent: &mut u64,
+    ) -> Result<drone::FileInfo, Status> {
+        use v1::write_file_chunk::Part;
+        let (_, drone) = self.drone(project, &h.cell_id).await?;
+        let Who { uid, gid, .. } = user(&drone, &h.user).await?;
+        let mut write = drone::FsWrite {
+            path: h.path,
+            data: bytes::Bytes::new(),
+            mode: h.mode,
+            make_parents: h.make_parents,
+            append: h.append,
+            uid,
+            gid,
+        };
+        // Most writes are small files, which go in one message. Past that the file is streamed,
+        // with what came so far as its start.
+        let mut head = bytes::BytesMut::new();
+        let mut next = None;
+        while let Some(m) = input.message().await? {
+            let Some(Part::Data(b)) = m.part else {
+                return Err(invalid("only the first message may be a header"));
+            };
+            *sent += b.len() as u64;
+            if head.len() + b.len() > SMALL_WRITE {
+                next = Some(b);
+                break;
+            }
+            head.extend_from_slice(&b);
+        }
+        write.data = head.freeze();
+        let Some(first) = next else {
+            return drone.fs_write(&write).await.map_err(status);
+        };
+        let mut w = drone.fs_create(&write).await.map_err(status)?;
+        w.write(first).await.map_err(status)?;
+        while let Some(m) = input.message().await? {
+            let Some(Part::Data(b)) = m.part else {
+                return Err(invalid("only the first message may be a header"));
+            };
+            *sent += b.len() as u64;
+            w.write(b).await.map_err(status)?;
+        }
+        w.finish().await.map_err(status)
+    }
+
     /// The cells a selector picks in `project`, and whether it picked them by id. A selector by
     /// id that names no cell of the project fails as a whole.
     fn select(
@@ -251,9 +306,12 @@ impl Api {
 
     /// Runs `f` on every cell `sel` picks, all at once. Cells picked by label are only the ones
     /// `wanted` accepts, so stopping by label does not count cells that already ended.
+    /// Each cell goes into the audit log as `call` with `args`, and a call that picked none
+    /// goes in once with no cell.
     async fn bulk<F, Fut>(
         &self,
-        project: &str,
+        call: &Call,
+        args: &Args,
         sel: Option<v1::CellSelector>,
         wanted: fn(CellState) -> bool,
         f: F,
@@ -262,7 +320,7 @@ impl Api {
         F: Fn(Comb, CellId) -> Fut,
         Fut: Future<Output = Result<CellInfo, Error>> + Send + 'static,
     {
-        let (cells, by_id) = self.select(project, sel)?;
+        let (cells, by_id) = call.check("", args, self.select(&call.project, sel))?;
         let ids: Vec<CellId> =
             cells.into_iter().filter(|c| by_id || wanted(c.status.state)).map(|c| c.id).collect();
         // Each one runs on its own task, so a caller that goes away does not leave the batch
@@ -274,12 +332,21 @@ impl Api {
                 .await
                 .unwrap_or_else(|_| Err(Error::new(Reason::Internal, "the call panicked")));
             match outcome {
-                Ok(_) => result.succeeded += 1,
-                Err(e) => result.failures.push(v1::BulkFailure {
-                    cell_id: id.to_string(),
-                    error: Some(convert::error_to_v1(&e)),
-                }),
+                Ok(_) => {
+                    call.record(&id.to_string(), args, "ok".into());
+                    result.succeeded += 1;
+                }
+                Err(e) => {
+                    call.record(&id.to_string(), args, failed(&convert::error_to_status(&e)));
+                    result.failures.push(v1::BulkFailure {
+                        cell_id: id.to_string(),
+                        error: Some(convert::error_to_v1(&e)),
+                    });
+                }
             }
+        }
+        if result.matched == 0 {
+            call.record("", args, "ok".into());
         }
         Ok(result)
     }
@@ -294,16 +361,205 @@ impl Cells for Api {
         &self,
         req: Request<v1::CreateRequest>,
     ) -> Result<Response<Self::CreateStream>, Status> {
-        let project = project(&req)?;
+        self.make(req, "cell.create").await
+    }
+
+    async fn get(&self, req: Request<v1::GetCellRequest>) -> Result<Response<v1::Cell>, Status> {
+        let call = Call::new(self, &req, "cell.get")?;
+        let id = &req.get_ref().id;
+        let r = parse_id(id).and_then(|i| self.owned(&call.project, i).map_err(status));
+        call.done(id, &Args::default().str(id), &r);
+        Ok(Response::new(cell_to_v1(&r?)))
+    }
+
+    async fn list(
+        &self,
+        req: Request<v1::ListCellsRequest>,
+    ) -> Result<Response<v1::ListCellsResponse>, Status> {
+        let call = Call::new(self, &req, "cell.list")?;
+        let req = req.into_inner();
+        let args = Args::default()
+            .bytes(&req.states.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>())
+            .str(&req.page_token)
+            .num(req.page_size.into());
+        let args = req.selector.as_ref().map_or(args.clone(), |l| args.map(&l.r#match));
+        let r = self.list_cells(&call.project, req);
+        call.done("", &args, &r);
+        r.map(Response::new)
+    }
+
+    async fn watch(
+        &self,
+        req: Request<v1::WatchCellsRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let call = Call::new(self, &req, "cell.watch")?;
+        let selector = req.into_inner().selector;
+        let (cell, args) = picked(selector.as_ref());
+        let labels = match selector.as_ref().and_then(|s| s.by.as_ref()) {
+            Some(v1::cell_selector::By::Labels(l)) => Some(l.clone()),
+            _ => None,
+        };
+        // Subscribed before the current states are read, so no change falls between the two.
+        let rx = self.comb.subscribe();
+        let (cells, by_id) = call.check(&cell, &args, self.select(&call.project, selector))?;
+        call.record(&cell, &args, "ok".into());
+        let mut watch = Watch {
+            comb: self.comb.clone(),
+            project: call.project,
+            only: by_id.then(|| cells[0].id),
+            labels,
+            rx,
+            seen: HashMap::new(),
+            pending: VecDeque::new(),
+            done: false,
+        };
+        for c in &cells {
+            watch.push(c, c.status.clone());
+        }
+        let stop = self.stop.clone();
+        let events = stream::unfold(watch, Watch::next).take_until(stop.cancelled_owned());
+        Ok(Response::new(events.boxed()))
+    }
+
+    async fn pause(
+        &self,
+        req: Request<v1::CellSelector>,
+    ) -> Result<Response<v1::BulkResult>, Status> {
+        let call = Call::new(self, &req, "cell.pause")?;
+        let sel = req.into_inner();
+        let (_, args) = picked(Some(&sel));
+        let running = |s| s == CellState::Running;
+        let r = self
+            .bulk(&call, &args, Some(sel), running, |comb, id| async move { comb.pause(id).await })
+            .await?;
+        Ok(Response::new(r))
+    }
+
+    async fn resume(
+        &self,
+        req: Request<v1::CellSelector>,
+    ) -> Result<Response<v1::BulkResult>, Status> {
+        let call = Call::new(self, &req, "cell.resume")?;
+        let sel = req.into_inner();
+        let (_, args) = picked(Some(&sel));
+        let paused = |s| s == CellState::Paused;
+        let r = self
+            .bulk(&call, &args, Some(sel), paused, |comb, id| async move { comb.resume(id).await })
+            .await?;
+        Ok(Response::new(r))
+    }
+
+    async fn stop(
+        &self,
+        req: Request<v1::StopRequest>,
+    ) -> Result<Response<v1::BulkResult>, Status> {
+        let call = Call::new(self, &req, "cell.stop")?;
+        let req = req.into_inner();
+        let (cell, args) = picked(req.selector.as_ref());
+        let args = args.num(req.snapshot.into());
+        if req.snapshot {
+            return call.check(&cell, &args, Err(invalid("snapshots are not supported yet")));
+        }
+        let live = |s: CellState| !s.is_terminal();
+        let r =
+            self.bulk(&call, &args, req.selector, live, |comb, id| async move {
+                comb.stop(id, None).await
+            })
+            .await?;
+        Ok(Response::new(r))
+    }
+
+    async fn extend_ttl(
+        &self,
+        req: Request<v1::ExtendTtlRequest>,
+    ) -> Result<Response<v1::Cell>, Status> {
+        let call = Call::new(self, &req, "cell.extend_ttl")?;
+        let req = req.into_inner();
+        let args = Args::default().str(&format!("{:?} {:?}", req.hard_ttl, req.idle_ttl));
+        let r = async {
+            let id = parse_id(&req.id)?;
+            let hard = convert::duration_from_v1(req.hard_ttl, "hard_ttl").map_err(status)?;
+            let idle = convert::duration_from_v1(req.idle_ttl, "idle_ttl").map_err(status)?;
+            self.owned(&call.project, id).map_err(status)?;
+            self.comb.extend_ttl(id, hard, idle).await.map_err(status)
+        }
+        .await;
+        call.done(&req.id, &args, &r);
+        Ok(Response::new(cell_to_v1(&r?)))
+    }
+
+    async fn update_policy(
+        &self,
+        req: Request<v1::UpdatePolicyRequest>,
+    ) -> Result<Response<v1::Cell>, Status> {
+        let call = Call::new(self, &req, "cell.update_policy")?;
+        let req = req.into_inner();
+        let args = Args::default()
+            .num(req.ready.into())
+            .str(&req.network_profile)
+            .str(&format!("{:?}", req.limits));
+        let r = async {
+            if !req.network_profile.is_empty() || req.limits.is_some() {
+                return Err(Status::unimplemented(
+                    "UpdatePolicy can only mark a cell ready so far, not change its network or limits",
+                ));
+            }
+            let id = parse_id(&req.id)?;
+            let mut info = self.owned(&call.project, id).map_err(status)?;
+            if req.ready {
+                info = self.comb.ready(id).await.map_err(status)?;
+            }
+            Ok(info)
+        }
+        .await;
+        call.done(&req.id, &args, &r);
+        Ok(Response::new(cell_to_v1(&r?)))
+    }
+
+    async fn expose_port(
+        &self,
+        req: Request<v1::ExposePortRequest>,
+    ) -> Result<Response<v1::PortEndpoint>, Status> {
+        let call = Call::new(self, &req, "cell.expose_port")?;
+        let r = req.get_ref();
+        let args = Args::default().num(r.port.into()).str(&format!("{:?}", r));
+        call.check(
+            &r.id,
+            &args,
+            Err(Status::unimplemented(
+                "ExposePort needs a gate, which standalone mode has none of",
+            )),
+        )
+    }
+}
+
+impl Api {
+    /// Makes the cells `req` asks for, and records each one as `op`.
+    pub(super) async fn make(
+        &self,
+        req: Request<v1::CreateRequest>,
+        op: &'static str,
+    ) -> Result<Response<BoxStream<'static, Result<v1::CreateEvent, Status>>>, Status> {
+        let call = Call::new(self, &req, op)?;
         let anyway = req.metadata().contains_key(ANYWAY_HEADER);
         let req = req.into_inner();
         let count = req.count.max(1);
+        let args = Args::default().num(count.into()).str(&req.idempotency_key);
         if count > MAX_COUNT {
-            return Err(invalid(format!(
-                "count is {count}, and one call makes at most {MAX_COUNT}"
-            )));
+            return call.check(
+                "",
+                &args,
+                Err(invalid(format!("count is {count}, and one call makes at most {MAX_COUNT}"))),
+            );
         }
-        let spec = convert::spec_from_v1(req.spec.unwrap_or_default()).map_err(status)?;
+        let spec = call.check(
+            "",
+            &args,
+            convert::spec_from_v1(req.spec.unwrap_or_default()).map_err(status),
+        )?;
+        // The spec as the comb reads it, whose maps are in key order.
+        let args = args.str(&format!("{spec:?}"));
+        let project = call.project.clone();
         let creates: FuturesUnordered<_> = (0..count)
             .map(|index| {
                 let idem_key = match (req.idempotency_key.as_str(), count) {
@@ -323,13 +579,20 @@ impl Cells for Api {
                     let comb = self.comb.clone();
                     async move { comb.create(req).await }
                 });
+                let (call, args) = (call.clone(), args.clone());
                 async move {
-                    let result = match task.await {
-                        Ok(Ok(info)) => v1::create_event::Result::Cell(cell_to_v1(&info)),
-                        Ok(Err(e)) => v1::create_event::Result::Error(convert::error_to_v1(&e)),
-                        Err(_) => v1::create_event::Result::Error(convert::error_to_v1(
-                            &Error::new(Reason::Internal, "the create panicked"),
-                        )),
+                    let made = task.await.unwrap_or_else(|_| {
+                        Err(Error::new(Reason::Internal, "the create panicked"))
+                    });
+                    let result = match made {
+                        Ok(info) => {
+                            call.record(&info.id.to_string(), &args, "ok".into());
+                            v1::create_event::Result::Cell(cell_to_v1(&info))
+                        }
+                        Err(e) => {
+                            call.record("", &args, failed(&convert::error_to_status(&e)));
+                            v1::create_event::Result::Error(convert::error_to_v1(&e))
+                        }
                     };
                     Ok(v1::CreateEvent { index, result: Some(result) })
                 }
@@ -338,18 +601,12 @@ impl Cells for Api {
         Ok(Response::new(creates.boxed()))
     }
 
-    async fn get(&self, req: Request<v1::GetCellRequest>) -> Result<Response<v1::Cell>, Status> {
-        let project = project(&req)?;
-        let info = self.owned(&project, parse_id(&req.get_ref().id)?).map_err(status)?;
-        Ok(Response::new(cell_to_v1(&info)))
-    }
-
-    async fn list(
+    /// One page of the cells of `project` that `req` picks.
+    fn list_cells(
         &self,
-        req: Request<v1::ListCellsRequest>,
-    ) -> Result<Response<v1::ListCellsResponse>, Status> {
-        let project = project(&req)?;
-        let req = req.into_inner();
+        project: &str,
+        req: v1::ListCellsRequest,
+    ) -> Result<v1::ListCellsResponse, Status> {
         let states: Vec<CellState> = req.states().filter_map(convert::state_from_v1).collect();
         let after = match req.page_token.as_str() {
             "" => None,
@@ -371,122 +628,7 @@ impl Cells for Api {
             (Some(_), Some(last)) => last.id.clone(),
             _ => String::new(),
         };
-        Ok(Response::new(v1::ListCellsResponse { cells, next_page_token }))
-    }
-
-    async fn watch(
-        &self,
-        req: Request<v1::WatchCellsRequest>,
-    ) -> Result<Response<Self::WatchStream>, Status> {
-        let project = project(&req)?;
-        let selector = req.into_inner().selector;
-        let labels = match selector.as_ref().and_then(|s| s.by.as_ref()) {
-            Some(v1::cell_selector::By::Labels(l)) => Some(l.clone()),
-            _ => None,
-        };
-        // Subscribed before the current states are read, so no change falls between the two.
-        let rx = self.comb.subscribe();
-        let (cells, by_id) = self.select(&project, selector)?;
-        let mut watch = Watch {
-            comb: self.comb.clone(),
-            project,
-            only: by_id.then(|| cells[0].id),
-            labels,
-            rx,
-            seen: HashMap::new(),
-            pending: VecDeque::new(),
-            done: false,
-        };
-        for c in &cells {
-            watch.push(c, c.status.clone());
-        }
-        let stop = self.stop.clone();
-        let events = stream::unfold(watch, Watch::next).take_until(stop.cancelled_owned());
-        Ok(Response::new(events.boxed()))
-    }
-
-    async fn pause(
-        &self,
-        req: Request<v1::CellSelector>,
-    ) -> Result<Response<v1::BulkResult>, Status> {
-        let project = project(&req)?;
-        let running = |s| s == CellState::Running;
-        let r = self
-            .bulk(&project, Some(req.into_inner()), running, |comb, id| async move {
-                comb.pause(id).await
-            })
-            .await?;
-        Ok(Response::new(r))
-    }
-
-    async fn resume(
-        &self,
-        req: Request<v1::CellSelector>,
-    ) -> Result<Response<v1::BulkResult>, Status> {
-        let project = project(&req)?;
-        let paused = |s| s == CellState::Paused;
-        let r = self
-            .bulk(&project, Some(req.into_inner()), paused, |comb, id| async move {
-                comb.resume(id).await
-            })
-            .await?;
-        Ok(Response::new(r))
-    }
-
-    async fn stop(
-        &self,
-        req: Request<v1::StopRequest>,
-    ) -> Result<Response<v1::BulkResult>, Status> {
-        let project = project(&req)?;
-        let req = req.into_inner();
-        if req.snapshot {
-            return Err(invalid("snapshots are not supported yet"));
-        }
-        let live = |s: CellState| !s.is_terminal();
-        let r = self
-            .bulk(&project, req.selector, live, |comb, id| async move { comb.stop(id, None).await })
-            .await?;
-        Ok(Response::new(r))
-    }
-
-    async fn extend_ttl(
-        &self,
-        req: Request<v1::ExtendTtlRequest>,
-    ) -> Result<Response<v1::Cell>, Status> {
-        let project = project(&req)?;
-        let req = req.into_inner();
-        let id = parse_id(&req.id)?;
-        let hard = convert::duration_from_v1(req.hard_ttl, "hard_ttl").map_err(status)?;
-        let idle = convert::duration_from_v1(req.idle_ttl, "idle_ttl").map_err(status)?;
-        self.owned(&project, id).map_err(status)?;
-        let info = self.comb.extend_ttl(id, hard, idle).await.map_err(status)?;
-        Ok(Response::new(cell_to_v1(&info)))
-    }
-
-    async fn update_policy(
-        &self,
-        req: Request<v1::UpdatePolicyRequest>,
-    ) -> Result<Response<v1::Cell>, Status> {
-        let project = project(&req)?;
-        let req = req.into_inner();
-        if !req.network_profile.is_empty() || req.limits.is_some() {
-            return Err(Status::unimplemented(
-                "UpdatePolicy can only mark a cell ready so far, not change its network or limits",
-            ));
-        }
-        let id = parse_id(&req.id)?;
-        let mut info = self.owned(&project, id).map_err(status)?;
-        if req.ready {
-            info = self.comb.ready(id).await.map_err(status)?;
-        }
-        Ok(Response::new(cell_to_v1(&info)))
-    }
-
-    async fn expose_port(
-        &self,
-        _: Request<v1::ExposePortRequest>,
-    ) -> Result<Response<v1::PortEndpoint>, Status> {
-        Err(Status::unimplemented("ExposePort needs a gate, which standalone mode has none of"))
+        Ok(v1::ListCellsResponse { cells, next_page_token })
     }
 }
 
@@ -563,27 +705,38 @@ impl Exec for Api {
 
     async fn run(&self, req: Request<v1::RunRequest>) -> Result<Response<v1::RunResult>, Status> {
         let started = Instant::now();
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "exec.run")?;
         let r = req.into_inner();
-        if !r.idempotency_key.is_empty() {
-            return Err(invalid("idempotency keys on exec are not supported yet"));
+        let cell = r.cell_id.clone();
+        let args = command_args(&r.argv, &r.shell, &r.cwd, &r.env, &r.user)
+            .bytes(&r.stdin)
+            .str(&format!("{:?}", r.timeout))
+            .num(r.max_output_bytes)
+            .str(&r.idempotency_key);
+        let out = async {
+            if !r.idempotency_key.is_empty() {
+                return Err(invalid("idempotency keys on exec are not supported yet"));
+            }
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let who = user(&drone, &r.user).await?;
+            let command = drone::Command {
+                argv: r.argv,
+                shell: r.shell,
+                cwd: r.cwd,
+                env: who.env(r.env),
+                timeout_ms: millis(r.timeout)?,
+                max_output_bytes: r.max_output_bytes,
+                uid: who.uid,
+                gid: who.gid,
+            };
+            drone
+                .run(&drone::RunRequest { command: Some(command), stdin: r.stdin })
+                .await
+                .map_err(status)
         }
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let who = user(&drone, &r.user).await?;
-        let command = drone::Command {
-            argv: r.argv,
-            shell: r.shell,
-            cwd: r.cwd,
-            env: who.env(r.env),
-            timeout_ms: millis(r.timeout)?,
-            max_output_bytes: r.max_output_bytes,
-            uid: who.uid,
-            gid: who.gid,
-        };
-        let out = drone
-            .run(&drone::RunRequest { command: Some(command), stdin: r.stdin })
-            .await
-            .map_err(status)?;
+        .await;
+        let out = call.check(&cell, &args, out)?;
+        call.record(&cell, &args, ran(&out, out.stdout_bytes, out.stderr_bytes));
         self.comb.metrics().exec("run", started.elapsed());
         Ok(Response::new(result_to_v1(out)))
     }
@@ -592,28 +745,41 @@ impl Exec for Api {
         &self,
         req: Request<Streaming<v1::ProcessInput>>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "exec.start")?;
         let mut input = req.into_inner();
-        let first = input.message().await?.and_then(|m| m.input);
+        let first = input.message().await;
+        let first = call.check("", &Args::default(), first)?.and_then(|m| m.input);
         let Some(v1::process_input::Input::Start(s)) = first else {
-            return Err(invalid("the first message must be a start"));
+            return call.check(
+                "",
+                &Args::default(),
+                Err(invalid("the first message must be a start")),
+            );
         };
-        if s.pty.is_some() {
-            return Err(invalid("terminals are not supported yet"));
+        let cell = s.cell_id.clone();
+        let args = command_args(&s.argv, &s.shell, &s.cwd, &s.env, &s.user)
+            .str(&format!("{:?} {:?}", s.timeout, s.pty));
+        let started = async {
+            if s.pty.is_some() {
+                return Err(invalid("terminals are not supported yet"));
+            }
+            let (id, drone) = self.drone(&call.project, &s.cell_id).await?;
+            let who = user(&drone, &s.user).await?;
+            let command = drone::Command {
+                argv: s.argv,
+                shell: s.shell,
+                cwd: s.cwd,
+                env: who.env(s.env),
+                timeout_ms: millis(s.timeout)?,
+                max_output_bytes: 0,
+                uid: who.uid,
+                gid: who.gid,
+            };
+            Ok((id, drone.start(&command).await.map_err(status)?))
         }
-        let (id, drone) = self.drone(&project, &s.cell_id).await?;
-        let who = user(&drone, &s.user).await?;
-        let command = drone::Command {
-            argv: s.argv,
-            shell: s.shell,
-            cwd: s.cwd,
-            env: who.env(s.env),
-            timeout_ms: millis(s.timeout)?,
-            max_output_bytes: 0,
-            uid: who.uid,
-            gid: who.gid,
-        };
-        let (mut tx, rx) = drone.start(&command).await.map_err(status)?.split();
+        .await;
+        let (id, process) = call.check(&cell, &args, started)?;
+        let (mut tx, rx) = process.split();
         let (signal_tx, mut signals) = mpsc::channel::<i32>(8);
         let exited = CancellationToken::new();
         // The caller's input goes to the process until the caller closes its side, and signals
@@ -661,60 +827,89 @@ impl Exec for Api {
             table: self.signals.clone(),
             exited,
             done: false,
+            audit: Some((call, args)),
+            bytes: (0, 0),
         };
         Ok(Response::new(stream::unfold(out, Started::next).boxed()))
     }
 
     async fn signal(&self, req: Request<v1::SignalRequest>) -> Result<Response<v1::Empty>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "exec.signal")?;
         let r = req.into_inner();
-        let id = parse_id(&r.cell_id)?;
-        self.owned(&project, id).map_err(status)?;
-        let tx = lock(&self.signals).get(&(id, r.pid)).cloned();
-        let Some(tx) = tx else {
-            return Err(invalid(format!(
-                "no process {} started with Exec.Start is running",
-                r.pid
-            )));
-        };
-        tx.send(r.signal).await.map_err(|_| invalid("the process has exited"))?;
-        Ok(Response::new(v1::Empty {}))
+        let args = Args::default().num(r.pid.into()).str(&r.signal.to_string());
+        let sent = async {
+            let id = parse_id(&r.cell_id)?;
+            self.owned(&call.project, id).map_err(status)?;
+            let tx = lock(&self.signals).get(&(id, r.pid)).cloned();
+            let Some(tx) = tx else {
+                return Err(invalid(format!(
+                    "no process {} started with Exec.Start is running",
+                    r.pid
+                )));
+            };
+            tx.send(r.signal).await.map_err(|_| invalid("the process has exited"))
+        }
+        .await;
+        call.done(&r.cell_id, &args, &sent);
+        sent.map(|()| Response::new(v1::Empty {}))
     }
 
     async fn session_create(
         &self,
         req: Request<v1::SessionCreateRequest>,
     ) -> Result<Response<v1::Session>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "exec.session_create")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let who = user(&drone, &r.user).await?;
-        let spec = drone::SessionCreate {
-            shell: r.shell,
-            cwd: r.cwd,
-            env: who.env(r.env),
-            uid: who.uid,
-            gid: who.gid,
-        };
-        let info = drone.session_create(&spec).await.map_err(status)?;
-        Ok(Response::new(v1::Session { cell_id: r.cell_id, id: info.id }))
+        let cell = r.cell_id.clone();
+        let args = command_args(&[], &r.shell, &r.cwd, &r.env, &r.user);
+        let made = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let who = user(&drone, &r.user).await?;
+            let spec = drone::SessionCreate {
+                shell: r.shell,
+                cwd: r.cwd,
+                env: who.env(r.env),
+                uid: who.uid,
+                gid: who.gid,
+            };
+            drone.session_create(&spec).await.map_err(status)
+        }
+        .await;
+        let info = call.check(&cell, &args, made)?;
+        call.record(&cell, &args, format!("ok session={}", info.id));
+        Ok(Response::new(v1::Session { cell_id: cell, id: info.id }))
     }
 
     async fn session_run(
         &self,
         req: Request<v1::SessionRunRequest>,
     ) -> Result<Response<v1::SessionRunResult>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "exec.session_run")?;
         let r = req.into_inner();
-        let session = r.session.ok_or_else(|| invalid("the request names no session"))?;
-        let (_, drone) = self.drone(&project, &session.cell_id).await?;
-        let run = drone::SessionRun {
-            id: session.id,
-            command: r.command,
-            timeout_ms: millis(r.timeout)?,
-            max_output_bytes: r.max_output_bytes,
-        };
-        let out = drone.session_run(&run).await.map_err(status)?;
+        let session = r.session.unwrap_or_default();
+        let cell = session.cell_id.clone();
+        let args = Args::default()
+            .str(&session.id)
+            .str(&r.command)
+            .str(&format!("{:?}", r.timeout))
+            .num(r.max_output_bytes);
+        let out = async {
+            if session.id.is_empty() {
+                return Err(invalid("the request names no session"));
+            }
+            let (_, drone) = self.drone(&call.project, &session.cell_id).await?;
+            let run = drone::SessionRun {
+                id: session.id,
+                command: r.command,
+                timeout_ms: millis(r.timeout)?,
+                max_output_bytes: r.max_output_bytes,
+            };
+            drone.session_run(&run).await.map_err(status)
+        }
+        .await;
+        let out = call.check(&cell, &args, out)?;
+        let how = if out.timed_out { " timed_out" } else { "" };
+        call.record(&cell, &args, format!("exit={}{how} out={}", out.exit_code, out.output.len()));
         Ok(Response::new(v1::SessionRunResult {
             exit_code: out.exit_code,
             output: out.output,
@@ -726,20 +921,29 @@ impl Exec for Api {
 
     async fn session_interact(
         &self,
-        _: Request<Streaming<v1::SessionInput>>,
+        req: Request<Streaming<v1::SessionInput>>,
     ) -> Result<Response<Self::SessionInteractStream>, Status> {
-        Err(Status::unimplemented("SessionInteract is not built yet"))
+        let call = Call::new(self, &req, "exec.session_interact")?;
+        call.check(
+            "",
+            &Args::default(),
+            Err(Status::unimplemented("SessionInteract is not built yet")),
+        )
     }
 
     async fn session_close(
         &self,
         req: Request<v1::SessionRef>,
     ) -> Result<Response<v1::Empty>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "exec.session_close")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        drone.session_close(&r.id).await.map_err(status)?;
-        Ok(Response::new(v1::Empty {}))
+        let closed = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            drone.session_close(&r.id).await.map_err(status)
+        }
+        .await;
+        call.done(&r.cell_id, &Args::default().str(&r.id), &closed);
+        closed.map(|()| Response::new(v1::Empty {}))
     }
 }
 
@@ -752,11 +956,18 @@ impl Files for Api {
         &self,
         req: Request<v1::ReadFileRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.read")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let read = drone::FsRead { path: r.path, offset: r.offset, length: r.length };
-        let reader = drone.fs_open(&read).await.map_err(status)?;
+        let cell = r.cell_id.clone();
+        let args = Args::default().str(&r.path).num(r.offset).num(r.length);
+        let opened = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let read = drone::FsRead { path: r.path, offset: r.offset, length: r.length };
+            drone.fs_open(&read).await.map_err(status)
+        }
+        .await;
+        call.done(&cell, &args, &opened);
+        let reader = opened?;
         let chunks = stream::try_unfold(reader, |mut reader| async move {
             let chunk = reader.next().await.map_err(status)?;
             Ok(chunk.map(|data| (v1::Chunk { data }, reader)))
@@ -769,71 +980,60 @@ impl Files for Api {
         req: Request<Streaming<v1::WriteFileChunk>>,
     ) -> Result<Response<v1::FileInfo>, Status> {
         use v1::write_file_chunk::Part;
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.write")?;
         let mut input = req.into_inner();
-        let Some(Part::Header(h)) = input.message().await?.and_then(|m| m.part) else {
-            return Err(invalid("the first message must be a header"));
+        let first = input.message().await;
+        let Some(Part::Header(h)) = call.check("", &Args::default(), first)?.and_then(|m| m.part)
+        else {
+            return call.check(
+                "",
+                &Args::default(),
+                Err(invalid("the first message must be a header")),
+            );
         };
-        let (_, drone) = self.drone(&project, &h.cell_id).await?;
-        let Who { uid, gid, .. } = user(&drone, &h.user).await?;
-        let mut write = drone::FsWrite {
-            path: h.path,
-            data: bytes::Bytes::new(),
-            mode: h.mode,
-            make_parents: h.make_parents,
-            append: h.append,
-            uid,
-            gid,
-        };
-        // Most writes are small files, which go in one message. Past that the file is streamed,
-        // with what came so far as its start.
-        let mut head = bytes::BytesMut::new();
-        let mut next = None;
-        while let Some(m) = input.message().await? {
-            let Some(Part::Data(b)) = m.part else {
-                return Err(invalid("only the first message may be a header"));
-            };
-            if head.len() + b.len() > SMALL_WRITE {
-                next = Some(b);
-                break;
-            }
-            head.extend_from_slice(&b);
-        }
-        write.data = head.freeze();
-        let Some(first) = next else {
-            let info = drone.fs_write(&write).await.map_err(status)?;
-            return Ok(Response::new(info_to_v1(info)));
-        };
-        let mut w = drone.fs_create(&write).await.map_err(status)?;
-        w.write(first).await.map_err(status)?;
-        while let Some(m) = input.message().await? {
-            let Some(Part::Data(b)) = m.part else {
-                return Err(invalid("only the first message may be a header"));
-            };
-            w.write(b).await.map_err(status)?;
-        }
-        let info = w.finish().await.map_err(status)?;
-        Ok(Response::new(info_to_v1(info)))
+        let cell = h.cell_id.clone();
+        let args = Args::default()
+            .str(&h.path)
+            .num(h.mode.into())
+            .num(h.make_parents.into())
+            .num(h.append.into())
+            .str(&h.user);
+        let mut sent = 0;
+        let wrote = self.write_file(&call.project, h, input, &mut sent).await;
+        let wrote = call.check(&cell, &args, wrote)?;
+        call.record(&cell, &args, format!("ok bytes={sent}"));
+        Ok(Response::new(info_to_v1(wrote)))
     }
 
     async fn stat(&self, req: Request<v1::PathRequest>) -> Result<Response<v1::FileInfo>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.stat")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let path = drone::FsPath { path: r.path, follow: false, recursive: false };
-        let info = drone.fs_stat(&path).await.map_err(status)?;
-        Ok(Response::new(info_to_v1(info)))
+        let args = Args::default().str(&r.path);
+        let info = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let path = drone::FsPath { path: r.path.clone(), follow: false, recursive: false };
+            drone.fs_stat(&path).await.map_err(status)
+        }
+        .await;
+        call.done(&r.cell_id, &args, &info);
+        Ok(Response::new(info_to_v1(info?)))
     }
 
     async fn list(
         &self,
         req: Request<v1::ListDirRequest>,
     ) -> Result<Response<v1::ListDirResponse>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.list")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let list = drone.fs_list(&drone::FsList { path: r.path, depth: r.depth }).await;
-        let list = list.map_err(status)?;
+        let args = Args::default().str(&r.path).num(r.depth.into());
+        let list = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let list = drone.fs_list(&drone::FsList { path: r.path.clone(), depth: r.depth }).await;
+            list.map_err(status)
+        }
+        .await;
+        call.done(&r.cell_id, &args, &list);
+        let list = list?;
         Ok(Response::new(v1::ListDirResponse {
             entries: list.entries.into_iter().map(info_to_v1).collect(),
             truncated: list.truncated,
@@ -841,23 +1041,36 @@ impl Files for Api {
     }
 
     async fn remove(&self, req: Request<v1::PathRequest>) -> Result<Response<v1::Empty>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.remove")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let path = drone::FsPath { path: r.path, follow: false, recursive: r.recursive };
-        drone.fs_remove(&path).await.map_err(status)?;
-        Ok(Response::new(v1::Empty {}))
+        let args = Args::default().str(&r.path).num(r.recursive.into());
+        let removed = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let path =
+                drone::FsPath { path: r.path.clone(), follow: false, recursive: r.recursive };
+            drone.fs_remove(&path).await.map_err(status)
+        }
+        .await;
+        call.done(&r.cell_id, &args, &removed);
+        removed.map(|()| Response::new(v1::Empty {}))
     }
 
     async fn watch(
         &self,
         req: Request<v1::WatchDirRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.watch")?;
         let r = req.into_inner();
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let path = drone::FsPath { path: r.path, follow: false, recursive: r.recursive };
-        let watcher = drone.fs_watch(&path).await.map_err(status)?;
+        let args = Args::default().str(&r.path).num(r.recursive.into());
+        let watcher = async {
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let path =
+                drone::FsPath { path: r.path.clone(), follow: false, recursive: r.recursive };
+            drone.fs_watch(&path).await.map_err(status)
+        }
+        .await;
+        call.done(&r.cell_id, &args, &watcher);
+        let watcher = watcher?;
         // The drone sends changes in batches, and the caller gets them one at a time.
         let events = stream::try_unfold(watcher, |mut w| async move {
             let batch = w.next().await.map_err(status)?;
@@ -869,23 +1082,42 @@ impl Files for Api {
         Ok(Response::new(events.boxed()))
     }
 
-    async fn diff(&self, _: Request<v1::DiffRequest>) -> Result<Response<v1::DiffResult>, Status> {
-        Err(Status::unimplemented("Diff is not built yet"))
+    async fn diff(
+        &self,
+        req: Request<v1::DiffRequest>,
+    ) -> Result<Response<v1::DiffResult>, Status> {
+        let call = Call::new(self, &req, "file.diff")?;
+        let r = req.get_ref();
+        let args = Args::default().num(u64::try_from(r.mode).unwrap_or(0)).str(&r.path);
+        call.check(&r.cell_id, &args, Err(Status::unimplemented("Diff is not built yet")))
     }
 
     async fn apply(&self, req: Request<v1::ApplyRequest>) -> Result<Response<v1::Empty>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "file.apply")?;
         let r = req.into_inner();
-        let tar = match r.content {
-            Some(v1::apply_request::Content::Tar(t)) => t,
-            Some(v1::apply_request::Content::Patch(_)) => {
-                return Err(Status::unimplemented("applying a patch is not built yet"));
-            }
-            None => return Err(invalid("the request has no patch or tar")),
-        };
-        let (_, drone) = self.drone(&project, &r.cell_id).await?;
-        let upload = drone::FsUpload { path: r.path, make_parents: true, uid: None, gid: None };
-        drone.fs_upload(&upload, tar).await.map_err(status)?;
+        let cell = r.cell_id.clone();
+        let args = match &r.content {
+            Some(v1::apply_request::Content::Tar(t)) => Args::default().str("tar").bytes(t),
+            Some(v1::apply_request::Content::Patch(p)) => Args::default().str("patch").bytes(p),
+            None => Args::default(),
+        }
+        .str(&r.path);
+        let applied = async {
+            let tar = match r.content {
+                Some(v1::apply_request::Content::Tar(t)) => t,
+                Some(v1::apply_request::Content::Patch(_)) => {
+                    return Err(Status::unimplemented("applying a patch is not built yet"));
+                }
+                None => return Err(invalid("the request has no patch or tar")),
+            };
+            let (_, drone) = self.drone(&call.project, &r.cell_id).await?;
+            let upload = drone::FsUpload { path: r.path, make_parents: true, uid: None, gid: None };
+            drone.fs_upload(&upload, tar).await.map_err(status)
+        }
+        .await;
+        let up = call.check(&cell, &args, applied)?;
+        let result = format!("ok entries={} bytes={} skipped={}", up.entries, up.bytes, up.skipped);
+        call.record(&cell, &args, result);
         Ok(Response::new(v1::Empty {}))
     }
 }
@@ -899,9 +1131,20 @@ struct Started {
     table: Signals,
     exited: CancellationToken,
     done: bool,
+    /// The call and its arguments, until the process ends and goes into the audit log.
+    audit: Option<(Call, Args)>,
+    /// Bytes to stdout and stderr so far.
+    bytes: (u64, u64),
 }
 
 impl Started {
+    /// Records how the process ended, once.
+    fn record(&mut self, result: impl FnOnce() -> String) {
+        if let Some((call, args)) = self.audit.take() {
+            call.record(&self.id.to_string(), &args, result());
+        }
+    }
+
     async fn next(mut self) -> Option<(Result<v1::ProcessOutput, Status>, Self)> {
         use v1::process_output::Output as Out;
         if self.done {
@@ -915,16 +1158,29 @@ impl Started {
                 self.pid = Some(pid);
                 Ok(Out::Pid(pid))
             }
-            Ok(Some(Output::Stdout(b))) => Ok(Out::Stdout(b)),
-            Ok(Some(Output::Stderr(b))) => Ok(Out::Stderr(b)),
+            Ok(Some(Output::Stdout(b))) => {
+                self.bytes.0 += b.len() as u64;
+                Ok(Out::Stdout(b))
+            }
+            Ok(Some(Output::Stderr(b))) => {
+                self.bytes.1 += b.len() as u64;
+                Ok(Out::Stderr(b))
+            }
             Ok(Some(Output::Exit(r))) => {
                 self.done = true;
+                let (out, err) = self.bytes;
+                self.record(|| ran(&r, out, err));
                 Ok(Out::Exit(result_to_v1(r)))
             }
-            Ok(None) => return None,
+            Ok(None) => {
+                self.record(|| "ended with no exit".into());
+                return None;
+            }
             Err(e) => {
                 self.done = true;
-                Err(status(e))
+                let e = status(e);
+                self.record(|| failed(&e));
+                Err(e)
             }
         };
         Some((out.map(|o| v1::ProcessOutput { output: Some(o) }), self))
@@ -933,6 +1189,8 @@ impl Started {
 
 impl Drop for Started {
     fn drop(&mut self) {
+        // The caller went away before the process ended, which kills it.
+        self.record(|| "Cancelled".into());
         if let Some(pid) = self.pid {
             lock(&self.table).remove(&(self.id, pid));
         }
@@ -952,6 +1210,17 @@ fn project<T>(req: &Request<T>) -> Result<String, Status> {
             Ok(p) if is_name(p) => Ok(p.to_string()),
             _ => Err(invalid(format!("{PROJECT_HEADER} is not a project name"))),
         },
+    }
+}
+
+/// The cell a selector names by id, or none, and the selector as arguments for the audit log.
+fn picked(sel: Option<&v1::CellSelector>) -> (String, Args) {
+    match sel.and_then(|s| s.by.as_ref()) {
+        Some(v1::cell_selector::By::Id(id)) => (id.clone(), Args::default().str("id").str(id)),
+        Some(v1::cell_selector::By::Labels(l)) => {
+            (String::new(), Args::default().str("labels").map(&l.r#match))
+        }
+        None => (String::new(), Args::default()),
     }
 }
 
@@ -980,6 +1249,27 @@ fn set_status(cell: &mut v1::Cell, s: &CellStatus) {
     cell.state = convert::state_to_v1(s.state).into();
     cell.cause = s.cause.map_or(v1::Cause::Unspecified, convert::cause_to_v1).into();
     cell.state_since = Some(prost_types::Timestamp::from(s.changed.max(SystemTime::UNIX_EPOCH)));
+}
+
+/// The arguments every way of running a command shares, for the audit log.
+fn command_args(
+    argv: &[String],
+    shell: &str,
+    cwd: &str,
+    env: &HashMap<String, String>,
+    user: &str,
+) -> Args {
+    Args::default().strs(argv).str(shell).str(cwd).map(env).str(user)
+}
+
+/// How a process ended, for the audit log, with the bytes it wrote to stdout and stderr.
+fn ran(r: &drone::RunResult, out: u64, err: u64) -> String {
+    let end = match r.signal {
+        0 => format!("exit={}", r.exit_code),
+        n => format!("signal={n}"),
+    };
+    let how = if r.timed_out { " timed_out" } else { "" };
+    format!("{end}{how} out={out} err={err}")
 }
 
 fn result_to_v1(r: drone::RunResult) -> v1::RunResult {

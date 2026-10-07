@@ -7,7 +7,7 @@
 //! The verifier cell gets no network, then the diff, then the caller's files such as hidden tests,
 //! and runs the command as many times as asked. It is stopped when the call ends, however it ends.
 
-use super::{Api, invalid, millis, parse_id, project, status};
+use super::{Api, Args, Call, invalid, millis, parse_id, status};
 use crate::comb::CreateRequest;
 use bytes::Bytes;
 use hive_drone::Client;
@@ -43,36 +43,59 @@ impl Verify for Api {
         &self,
         req: Request<v1::VerifyRequest>,
     ) -> Result<Response<v1::VerifyResult>, Status> {
-        let project = project(&req)?;
+        let call = Call::new(self, &req, "verify.run")?;
         let r = req.into_inner();
-        let subject = match r.subject_cell_id.as_str() {
-            "" => None,
-            id => {
-                let id = parse_id(id)?;
-                self.owned(&project, id).map_err(status)?;
-                Some(id)
+        let cell = r.subject_cell_id.clone();
+        let mut files: Vec<_> = r.files.iter().collect();
+        files.sort_unstable();
+        let args = files
+            .into_iter()
+            .fold(Args::default().num(r.files.len() as u64), |a, (k, v)| a.str(k).bytes(v))
+            .str(&r.subject_cell_id)
+            .strs(&r.argv)
+            .str(&format!("{:?}", r.timeout))
+            .str(&r.workdir)
+            .strs(&r.protected_paths)
+            .num(r.repeats.into());
+        let job = async {
+            let subject = match r.subject_cell_id.as_str() {
+                "" => None,
+                id => {
+                    let id = parse_id(id)?;
+                    self.owned(&call.project, id).map_err(status)?;
+                    Some(id)
+                }
+            };
+            if subject.is_some() && r.workdir.is_empty() {
+                return Err(invalid("a subject needs a workdir to take the diff in"));
             }
+            if r.argv.is_empty() {
+                return Err(invalid("the verifier needs a command"));
+            }
+            if r.repeats > MAX_REPEATS {
+                return Err(invalid(format!("at most {MAX_REPEATS} repeats")));
+            }
+            let mut spec =
+                convert::spec_from_v1(r.verifier.clone().unwrap_or_default()).map_err(status)?;
+            spec.network_profile = "none".into();
+            let timeout_ms = millis(r.timeout)?;
+            Ok((spec, Job { api: self, subject, timeout_ms, scores: BTreeMap::new(), req: r }))
+        }
+        .await;
+        let (spec, job) = call.check(&cell, &args, job)?;
+        // The verifier's spec as the comb reads it, whose maps are in key order.
+        let args = args.str(&format!("{spec:?}"));
+        let result = job.run(call.project.clone(), spec).await;
+        let how = match &result.error {
+            Some(e) => format!("error={}", e.reason),
+            None => format!(
+                "passed={} flaky={} runs_passed={} exit={}",
+                result.passed, result.flaky, result.runs_passed, result.exit_code
+            ),
         };
-        if subject.is_some() && r.workdir.is_empty() {
-            return Err(invalid("a subject needs a workdir to take the diff in"));
-        }
-        if r.argv.is_empty() {
-            return Err(invalid("the verifier needs a command"));
-        }
-        if r.repeats > MAX_REPEATS {
-            return Err(invalid(format!("at most {MAX_REPEATS} repeats")));
-        }
-        let mut spec =
-            convert::spec_from_v1(r.verifier.clone().unwrap_or_default()).map_err(status)?;
-        spec.network_profile = "none".into();
-        let job = Job {
-            api: self,
-            subject,
-            timeout_ms: millis(r.timeout)?,
-            scores: BTreeMap::new(),
-            req: r,
-        };
-        Ok(Response::new(job.run(project, spec).await))
+        let tampered = if result.tampered.is_empty() { "" } else { " tampered" };
+        call.record(&cell, &args, format!("ok {how}{tampered}"));
+        Ok(Response::new(result))
     }
 }
 

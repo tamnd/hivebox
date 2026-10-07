@@ -1,7 +1,7 @@
 //! The `Llm` service, which the trainer uses to steer the node's LLM gateway for its project: where
 //! the calls go, holding them while the engine loads new weights, and the token ids of each call.
 
-use super::{Api, invalid, parse_id, project};
+use super::{Api, Args, Call, invalid, parse_id};
 use crate::llm::{Gateway, Route, Turn};
 use hive_proto::v1;
 use hive_proto::v1::llm_server::Llm;
@@ -69,53 +69,70 @@ fn turn(t: Turn) -> v1::LlmTurn {
 #[tonic::async_trait]
 impl Llm for Api {
     async fn set_route(&self, req: Request<v1::LlmRoute>) -> Result<Response<v1::Empty>, Status> {
-        let project = project(&req)?;
-        let gw = self.gateway()?;
+        let call = Call::new(self, &req, "llm.set_route")?;
         let r = req.into_inner();
-        let route = match r.upstream.as_str() {
-            "" => None,
-            up => Some(Route::new(up, Some(&r.api_key)).map_err(invalid)?),
-        };
-        gw.set_route(&project, route);
-        Ok(Response::new(v1::Empty {}))
+        // The key stays out, even as a digest.
+        let args = Args::default().str(&r.upstream).num((!r.api_key.is_empty()).into());
+        let set = (|| {
+            let gw = self.gateway()?;
+            let route = match r.upstream.as_str() {
+                "" => None,
+                up => Some(Route::new(up, Some(&r.api_key)).map_err(invalid)?),
+            };
+            gw.set_route(&call.project, route);
+            Ok(())
+        })();
+        call.done("", &args, &set);
+        set.map(|()| Response::new(v1::Empty {}))
     }
 
     async fn hold(
         &self,
         req: Request<v1::LlmHoldRequest>,
     ) -> Result<Response<v1::LlmHoldResult>, Status> {
-        let project = project(&req)?;
-        let gw = self.gateway()?;
+        let call = Call::new(self, &req, "llm.hold")?;
         let r = req.into_inner();
-        let in_flight = if r.release {
-            gw.release(&project)
-        } else {
+        let args = Args::default()
+            .num(r.release.into())
+            .str(&format!("{:?} {:?} {:?}", r.retry_after, r.ttl, r.drain));
+        let held = async {
+            let gw = self.gateway()?;
+            if r.release {
+                return Ok(gw.release(&call.project));
+            }
             let retry_after = duration(r.retry_after, RETRY_AFTER, "retry_after")?;
             let ttl = duration(r.ttl, TTL, "ttl")?;
             let drain = duration(r.drain, Duration::ZERO, "drain")?;
             if ttl.is_zero() {
                 return Err(invalid("a hold needs a ttl above 0"));
             }
-            gw.hold(&project, retry_after, ttl, drain).await
-        };
-        Ok(Response::new(v1::LlmHoldResult { in_flight }))
+            Ok(gw.hold(&call.project, retry_after, ttl, drain).await)
+        }
+        .await;
+        call.done("", &args, &held);
+        held.map(|in_flight| Response::new(v1::LlmHoldResult { in_flight }))
     }
 
     async fn turns(
         &self,
         req: Request<v1::LlmTurnsRequest>,
     ) -> Result<Response<v1::LlmTurnsResponse>, Status> {
-        let project = project(&req)?;
-        let gw = self.gateway()?;
+        let call = Call::new(self, &req, "llm.turns")?;
         let r = req.into_inner();
-        let cell = match r.cell_id.as_str() {
-            "" => None,
-            id => Some(parse_id(id)?),
-        };
-        if cell.is_none() && r.rollout_id.is_empty() {
-            return Err(invalid("name a rollout id, a cell, or both"));
-        }
-        let (turns, dropped) = gw.turns(&project, &r.rollout_id, cell, r.take);
+        let args = Args::default().str(&r.rollout_id).num(r.take.into());
+        let found = (|| {
+            let gw = self.gateway()?;
+            let cell = match r.cell_id.as_str() {
+                "" => None,
+                id => Some(parse_id(id)?),
+            };
+            if cell.is_none() && r.rollout_id.is_empty() {
+                return Err(invalid("name a rollout id, a cell, or both"));
+            }
+            Ok(gw.turns(&call.project, &r.rollout_id, cell, r.take))
+        })();
+        call.done(&r.cell_id, &args, &found);
+        let (turns, dropped) = found?;
         Ok(Response::new(v1::LlmTurnsResponse {
             turns: turns.into_iter().map(turn).collect(),
             dropped,

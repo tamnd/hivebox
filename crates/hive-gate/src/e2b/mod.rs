@@ -30,7 +30,7 @@ use tonic::body::Body;
 use tonic::codegen::http;
 use tonic::transport::Channel;
 
-use crate::{Credential, Gate, Grant, PROJECT_HEADER, config, connect};
+use crate::{Credential, Gate, Grant, PRINCIPAL_HEADER, PROJECT_HEADER, config, connect};
 
 /// The header that names the sandbox of an envd call.
 const SANDBOX_HEADER: &str = "e2b-sandbox-id";
@@ -109,11 +109,13 @@ pub(crate) async fn call(
         }
     };
     gate.calls.with(&["e2b", "ok"]).inc();
+    let principal = credential.principal();
     let grant = match credential {
         Credential::Token(g) => Some(g),
         Credential::Key(_) => None,
     };
-    let caller = Caller { gate, e2b, project, grant, secret: secret.unwrap_or_default() };
+    let secret = secret.unwrap_or_default();
+    let caller = Caller { gate, e2b, project, principal, grant, secret };
     match kind {
         Kind::Api => sandboxes::serve(&caller, req).await,
         Kind::Envd => envd::serve(&caller, req).await,
@@ -125,6 +127,8 @@ struct Caller {
     gate: Gate,
     e2b: Arc<E2b>,
     project: Arc<str>,
+    /// Who the audit log says made the call.
+    principal: String,
     grant: Option<Grant>,
     /// The key or token the call came with, which create gives back as the envd token.
     secret: String,
@@ -136,6 +140,9 @@ impl Caller {
         let mut r = tonic::Request::new(msg);
         if let Ok(v) = self.project.parse() {
             r.metadata_mut().insert(PROJECT_HEADER, v);
+        }
+        if let Ok(v) = self.principal.parse() {
+            r.metadata_mut().insert(PRINCIPAL_HEADER, v);
         }
         if let Some(g) = &self.grant {
             r.extensions_mut().insert(g.clone());
