@@ -4,14 +4,20 @@
 //!
 //! When the snapshot's memory is kept in memory, on tmpfs or hugetlbfs or loaded with [`Memory::load`], a VMM can map it privately and register for minor faults. Each fault and each prefetch then maps the page cache page in with no copy, so every VM restored from the snapshot shares its clean pages, and a page is copied only when its VM first writes to it.
 //!
+//! The `hive-uffd` binary serves VMs from a worker process. The process that accepts them keeps a copy of each [`Hello`], with its userfaultfd, and when the worker dies it starts another and hands it every VM still running. [`Session::start`] wakes any thread whose fault the old worker read and never answered, so it faults again and the new worker sees it. The worker sends a [`Report`] for each range the guest gives back, and the next worker gets them with the VM, so those pages still read as zeros.
+//!
 //! Streaming a remote snapshot in chunks comes later.
 
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "linux")]
+mod hand;
+#[cfg(target_os = "linux")]
 mod server;
 #[cfg(target_os = "linux")]
 mod sys;
 
+#[cfg(target_os = "linux")]
+pub use hand::{Hello, Report, pair};
 #[cfg(target_os = "linux")]
 pub use server::{Guest, Memory, Region, Session, Stats, Trace};

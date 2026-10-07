@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-uffd` runs under a watchdog. The process that listens keeps a copy of each VM's regions and userfaultfd and hands the VM to a worker process, and when the worker dies it starts another and hands it every VM still running. A fault the dead worker read and never answered is raised again, and memory the guest gave back still reads as zeros. On server3 the first page a VM touched after its worker was killed came in 2.9 to 6.3 ms in 7 of 10 runs, and in 21.0 to 62.1 ms in the other three.
+
 ## 0.0.30
 
 Layers built in process, and VMs served from shared template memory.
