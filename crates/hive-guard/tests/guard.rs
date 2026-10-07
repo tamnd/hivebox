@@ -161,6 +161,7 @@ fn a_cell_reaches_only_what_its_profile_and_dns_allow() {
     net.send(CELL, DENIED, 9);
     assert!(!got(&denied));
     let deny = guard.denies().into_iter().find(|d| d.ip == DENIED).expect("the drop was reported");
+    assert_eq!(guard.lost().unwrap(), 0, "a few drops all fit in the ring");
     assert_eq!((deny.cell, deny.reason, deny.port, deny.proto), (41, Reason::Policy, 9, 17));
 
     // What the DNS proxy resolved is reachable until it expires.

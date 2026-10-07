@@ -20,6 +20,9 @@ static OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/guard.o"));
 const PROGRAM: &str = "guard_cell_egress";
 /// Profiles are indexes into an array this long.
 const PROFILES: u32 = 65536;
+/// The most drops [`Guard::denies`] reads at once. The ring is 1 MiB and each drop takes 24
+/// bytes of it, so a full ring holds about 44,000.
+const DENIES: usize = 1 << 16;
 
 fn failed(what: impl Display, e: impl Display) -> io::Error {
     io::Error::other(format!("{what}: {e}"))
@@ -36,6 +39,7 @@ pub struct Guard {
     dns: HashMap<MapData, DnsKey, u64>,
     stats: PerCpuArray<MapData, u64>,
     events: RingBuf<MapData>,
+    lost: PerCpuArray<MapData, u64>,
 }
 
 impl std::fmt::Debug for Guard {
@@ -63,7 +67,7 @@ impl Guard {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(dir.join("links"))?;
         let paths: Vec<(&str, PathBuf)> =
-            ["cells", "rules", "profiles", "dns_allow", "stats", "events"]
+            ["cells", "rules", "profiles", "dns_allow", "stats", "events", "lost"]
                 .map(|m| (m, dir.join(m)))
                 .into();
         let mut loader = EbpfLoader::new();
@@ -84,7 +88,8 @@ impl Guard {
         let dns = HashMap::try_from(take("dns_allow")?).map_err(|e| failed("dns_allow", e))?;
         let stats = PerCpuArray::try_from(take("stats")?).map_err(|e| failed("stats", e))?;
         let events = RingBuf::try_from(take("events")?).map_err(|e| failed("events", e))?;
-        let guard = Self { ebpf, dir, cells, rules, profiles, dns, stats, events };
+        let lost = PerCpuArray::try_from(take("lost")?).map_err(|e| failed("lost", e))?;
+        let guard = Self { ebpf, dir, cells, rules, profiles, dns, stats, events, lost };
         guard.sweep()?;
         Ok(guard)
     }
@@ -311,10 +316,24 @@ impl Guard {
         Ok(stats)
     }
 
-    /// The drops reported since the last call, oldest first.
+    /// Drops the ring had no room to report, since the maps were first pinned, summed over the
+    /// CPUs.
+    ///
+    /// # Errors
+    ///
+    /// The kernel refused a read.
+    pub fn lost(&self) -> io::Result<u64> {
+        let values = self.lost.get(&0, 0).map_err(|e| failed("lost", e))?;
+        Ok(values.iter().sum())
+    }
+
+    /// The drops reported since the last call, oldest first. One call reads at most a full
+    /// ring's worth, so a cell sending as fast as it can does not keep the caller reading.
     pub fn denies(&mut self) -> Vec<Deny> {
         let mut out = Vec::new();
-        while let Some(item) = self.events.next() {
+        while out.len() < DENIES
+            && let Some(item) = self.events.next()
+        {
             out.extend(Deny::parse(&item));
         }
         out

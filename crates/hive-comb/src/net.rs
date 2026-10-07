@@ -10,7 +10,7 @@
 use hive_guard::dns::{self, Cells, Host, Policy, Proxy, Settings};
 use hive_guard::link::Netlink;
 use hive_guard::wire::{self, Veth};
-use hive_guard::{CellNet, DNS_VIP, DnsAllow, Guard, LLM_HOST, LLM_VIP, Profile, Rule};
+use hive_guard::{CellNet, DNS_VIP, Deny, DnsAllow, Guard, LLM_HOST, LLM_VIP, Profile, Rule};
 use hive_types::CellId;
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,6 +38,24 @@ struct State {
     guard: Guard,
     nl: Netlink,
     ips: Ips,
+    /// The cell each `idx` on an interface is, quarantined ones too, so a drop the guard reports
+    /// can be put down to its cell.
+    seats: HashMap<u32, CellId>,
+}
+
+/// The most different names [`Book::refused`] counts between two calls of [`Net::drain`]. Past
+/// that, a refused name is counted under the empty name.
+const NAMES: usize = 1024;
+
+/// The cells' drops and refused lookups since the last [`Net::drain`].
+#[derive(Debug, Default)]
+pub(crate) struct Drained {
+    /// Each drop the guard reported, with its cell when that is still on its interface.
+    pub(crate) denies: Vec<(Option<CellId>, Deny)>,
+    /// Each name the DNS proxy refused a cell, why, and how many times.
+    pub(crate) refused: Vec<(CellId, String, &'static str, u64)>,
+    /// The drops the guard's ring had no room to report, all told, if it could be read.
+    pub(crate) lost: Option<u64>,
 }
 
 impl std::fmt::Debug for Net {
@@ -82,14 +100,18 @@ impl Net {
         if upstream.is_empty() {
             eprintln!("hive-comb: no resolvers to ask, so every lookup a cell makes fails");
         }
-        let book =
-            Arc::new(Book { cells: RwLock::default(), allow: Mutex::new(guard.dns_allow()?) });
+        let book = Arc::new(Book {
+            cells: RwLock::default(),
+            allow: Mutex::new(guard.dns_allow()?),
+            refused: Mutex::default(),
+        });
         let hosts = vec![Host { name: LLM_HOST.into(), ip: LLM_VIP, profiles: vec![Profile::LLM] }];
         let settings = Settings { upstream, policies, hosts, ..Settings::default() };
         let proxy = Arc::new(Proxy::new(settings, book.clone()));
         let mut nl = Netlink::open()?;
         wire::vips(&mut nl)?;
-        Ok(Self { state: Mutex::new(State { guard, nl, ips }), book, profiles, proxy })
+        let state = State { guard, nl, ips, seats: HashMap::new() };
+        Ok(Self { state: Mutex::new(state), book, profiles, proxy })
     }
 
     /// The DNS proxy on the guard's DNS address, to run until the comb stops. The comb before a
@@ -153,7 +175,9 @@ impl Net {
     pub(crate) fn assign(&self, veth: &Veth, id: CellId, profile: Profile) -> io::Result<()> {
         let idx = idx(id);
         let cell = CellNet { idx, ip: veth.ip, mac: Some(veth.mac), profile };
-        self.state().guard.set_cell(veth.ifindex, &cell)?;
+        let mut s = self.state();
+        s.guard.set_cell(veth.ifindex, &cell)?;
+        s.seats.insert(idx, id);
         self.book.set(veth.ip, Some(Seat { idx, profile, id }));
         Ok(())
     }
@@ -181,6 +205,9 @@ impl Net {
     pub(crate) fn release(&self, veth: &Veth) {
         self.book.set(veth.ip, None);
         let mut s = self.state();
+        if let Ok(Some(cell)) = s.guard.cell(veth.ifindex) {
+            s.seats.remove(&cell.idx);
+        }
         let _ = s.guard.remove_cell(veth.ifindex);
         let _ = s.guard.detach(veth.ifindex);
         s.ips.free(veth.ip);
@@ -195,6 +222,7 @@ impl Net {
         let mut s = self.state();
         let cell = s.guard.cell(ifindex).ok()??;
         s.ips.claim(cell.ip);
+        s.seats.insert(cell.idx, id);
         // A quarantined cell stays out of the book, so the node's services do not know it.
         if cell.profile != Profile::QUARANTINE {
             self.book.set(cell.ip, Some(Seat { idx: cell.idx, profile: cell.profile, id }));
@@ -212,6 +240,7 @@ impl Net {
             let mut s = self.state();
             if let Ok(Some(cell)) = s.guard.cell(ifindex) {
                 self.book.set(cell.ip, None);
+                s.seats.remove(&cell.idx);
             }
             let _ = s.guard.remove_cell(ifindex);
             let _ = s.guard.detach(ifindex);
@@ -221,6 +250,20 @@ impl Net {
     /// Where cells send DNS queries.
     pub(crate) fn nameserver() -> Ipv4Addr {
         DNS_VIP
+    }
+
+    /// The drops the guard reported and the names the DNS proxy refused since the last call.
+    pub(crate) fn drain(&self) -> Drained {
+        let (denies, lost) = {
+            let mut s = self.state();
+            let denies = s.guard.denies();
+            let lost = s.guard.lost().ok();
+            (denies.into_iter().map(|d| (s.seats.get(&d.cell).copied(), d)).collect(), lost)
+        };
+        let refused =
+            std::mem::take(&mut *self.book.refused.lock().unwrap_or_else(PoisonError::into_inner));
+        let refused = refused.into_iter().map(|((id, name, why), n)| (id, name, why, n)).collect();
+        Drained { denies, refused, lost }
     }
 }
 
@@ -235,6 +278,8 @@ fn idx(id: CellId) -> u32 {
 struct Book {
     cells: RwLock<HashMap<Ipv4Addr, Seat>>,
     allow: Mutex<DnsAllow>,
+    /// How many times each cell was refused each name, and why, since the last drain.
+    refused: Mutex<HashMap<(CellId, String, &'static str), u64>>,
 }
 
 /// A cell on an address.
@@ -272,6 +317,16 @@ impl Cells for Book {
             return Err(io::Error::new(io::ErrorKind::NotFound, "the cell is no longer there"));
         }
         ips.iter().try_for_each(|&ip| allow.allow(idx, ip, ttl))
+    }
+
+    fn refused(&self, from: Ipv4Addr, name: &str, why: &'static str) {
+        let Some(seat) = self.seat(from) else { return };
+        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut key = (seat.id, name.to_string(), why);
+        if refused.len() >= NAMES && !refused.contains_key(&key) {
+            key.1 = String::new();
+        }
+        *refused.entry(key).or_default() += 1;
     }
 }
 

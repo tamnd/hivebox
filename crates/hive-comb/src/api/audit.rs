@@ -1,9 +1,11 @@
 //! What the API tells the audit log: an event for each call, with who made it, the project, the
-//! cell, a digest of what was asked and how it went, from `spec/10_security.md`, section 7.
+//! cell, a digest of what was asked and how it went, from `spec/10_security.md`, section 7. A call
+//! refused for want of a right, and every quarantine, goes to the SIEM as well, from section 10.
 
 use super::{Api, invalid, project};
 use crate::comb::Comb;
 use hive_telemetry::AuditEvent;
+use hive_telemetry::siem::{SecurityEvent, Severity};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Status};
 
@@ -47,6 +49,11 @@ impl Call {
 
     /// Records the call as having touched `cell` with arguments `args` and come to `result`.
     pub(super) fn record(&self, cell: &str, args: &Args, result: String) {
+        if let Some(siem) = self.comb.siem()
+            && let Some(e) = self.security(cell, &result)
+        {
+            siem.emit(e);
+        }
         let Some(log) = self.comb.audit() else { return };
         log.record(AuditEvent {
             ts: self.ts,
@@ -58,6 +65,25 @@ impl Call {
             result,
             trace: self.trace.clone(),
         });
+    }
+
+    /// The call as a security event, if it is one.
+    fn security(&self, cell: &str, result: &str) -> Option<SecurityEvent> {
+        let (kind, severity) = match (self.op, result) {
+            ("cell.quarantine", r) if r == "ok" || r.starts_with("ok ") => {
+                ("cell.quarantined", Severity::Critical)
+            }
+            ("cell.quarantine", _) => ("cell.quarantine_failed", Severity::Error),
+            (_, "PermissionDenied" | "Unauthenticated") => ("api.denied", Severity::Warning),
+            _ => return None,
+        };
+        let mut e = SecurityEvent::new(kind, severity)
+            .project(self.project.clone())
+            .cell(cell)
+            .principal(self.principal.clone())
+            .detail(format!("op={} result={result}", self.op));
+        e.ts = self.ts;
+        Some(e)
     }
 
     /// Records `r` if it is an error, and passes it on.

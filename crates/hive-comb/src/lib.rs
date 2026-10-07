@@ -22,9 +22,10 @@ mod pool;
 mod pressure;
 mod record;
 pub mod report;
+mod siem;
 mod wal;
 
 pub use cell::{CellInfo, Cutoff, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, Quarantined, WalStats};
-pub use config::{Config, ContainerBackend, Images, KeeperLink, Llm, Network, ScoutLink};
+pub use config::{Config, ContainerBackend, Images, KeeperLink, Llm, Network, ScoutLink, SiemLink};
 pub use metrics::Metrics;

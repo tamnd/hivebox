@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Security events go to a SIEM with `[siem] sink` in the comb and gate configs: a file, syslog over UDP or TCP, or HTTP. The comb sends the packets the guard dropped and the names the DNS proxy refused, each put down to its cell, along with calls refused for want of a right and quarantines. The gate sends callers with bad keys. Repeats are counted into one line a window, and drops the guard's ring had no room for are counted as `net.unreported`, so nothing goes unsaid. On server3, 400,000 packets flooded from one cell in about 2 s were all counted, in 4 lines, and a scan of 3,000 ports came as 17 lines. The first line for a flood, a scan, a spoof or a lookup reached the listener 139 to 1,417 ms after the cell began, 550 ms or less in 11 of 12.
 - `hivectl quarantine ID... | -l KEY=VALUE... [--reason TEXT]`, `Quarantine` on the API and the gate, and `quarantine` in the Python SDK freeze a cell, cut it off the network, not even DNS, and keep an unscrubbed disk snapshot of it. It stays paused and cut off until it is stopped, across comb restarts too, and resume, exec and file calls on it are refused. On server3 the freeze and the cut took 8 to 319 ms, 40 ms or less in 6 of 10, the snapshot of a cell that had written 64 MiB took 2.5 to 4.9 s, and the cell could no longer resolve names or reach the address it had resolved before.
 
 ## 0.0.32
