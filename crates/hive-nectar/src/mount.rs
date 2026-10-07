@@ -171,7 +171,7 @@ impl Drop for Mounted {
 }
 
 /// Mounts the layer made of `meta` and `data` at `target`, an empty directory. `data` is `None`
-/// for a layer with no file contents, which `mkfs.erofs` builds with no extra device. With an
+/// for a layer with no file contents, whose extra device has no blocks. With an
 /// `idmap`, files the image has owned by id `n` show up as owned by `base + n`, and ids outside
 /// the map show up as the overflow id.
 ///

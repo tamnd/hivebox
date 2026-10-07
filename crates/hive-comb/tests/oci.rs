@@ -3,7 +3,8 @@
 //! Needs root, cgroup v2, a static drone in `HIVE_OCI_DRONE`, and an image: either one made by
 //! `hive-oci import` in `HIVE_OCI_IMAGE`, or a `hive-nectar` store in `HIVE_NECTAR_STORE` and the id
 //! of an image in it in `HIVE_NECTAR_IMAGE`. Passes without doing anything when one is missing.
-//! The snapshot test also needs the store and `mkfs.erofs` in `HIVE_MKFS_EROFS`.
+//! The snapshot test also needs the store, and builds its layers with `HIVE_MKFS_EROFS` when that is
+//! set.
 
 #![cfg(target_os = "linux")]
 
@@ -103,7 +104,7 @@ impl Node {
                     store: Some(store.into()),
                     cache_dir: scratch.0.join("cache"),
                     layers_dir: scratch.0.join("layers"),
-                    mkfs: std::env::var_os("HIVE_MKFS_EROFS").map_or(images.mkfs, PathBuf::from),
+                    mkfs: std::env::var_os("HIVE_MKFS_EROFS").map(PathBuf::from),
                     ..images
                 };
             }
@@ -476,10 +477,8 @@ async fn restore(comb: &Comb, snap: hive_nectar::BlobId) -> CellId {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
-    if std::env::var_os("HIVE_NECTAR_STORE").is_none()
-        || std::env::var_os("HIVE_MKFS_EROFS").is_none()
-    {
-        eprintln!("skipped: set HIVE_NECTAR_STORE and HIVE_MKFS_EROFS to run it");
+    if std::env::var_os("HIVE_NECTAR_STORE").is_none() {
+        eprintln!("skipped: set HIVE_NECTAR_STORE to run it");
         return;
     }
     let Some(mut node) = Node::new(4).await else { return };

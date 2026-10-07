@@ -4,7 +4,7 @@
 //!
 //! Overlay marks a deleted file with a character device 0:0 and a directory that hides everything
 //! below it with the `overlay.opaque` xattr. A layer says the same with an empty `.wh.NAME` file
-//! and a `.wh..wh..opq` file in the directory, which `mkfs.erofs --aufs` turns back into the
+//! and a `.wh..wh..opq` file in the directory, which the layer builder turns back into the
 //! overlay form, so the tar uses those. The upper holds files as the host sees them, so owners are
 //! shifted back down by the cells' id base. A renamed directory (`overlay.redirect`) or a file
 //! copied up without its data (`overlay.metacopy`) cannot be said in a layer, so they fail the

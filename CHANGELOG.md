@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Layers are built in process. `hive-nectar` has its own EROFS writer that reads the tar as it streams in and writes the metadata and data blobs in the same format as `mkfs.erofs --tar=f --blobdev`, so imports and snapshots no longer need erofs-utils on the node. `mkfs.erofs` can still be used with `[images] mkfs` in the comb config or `--mkfs` on `hive-nectar`. On server3, the 11 layers of python:3.12 and python:3.12-slim mount as the same trees from both builders, down to modes, owners, times, links, devices, xattrs and contents, and `fsck.erofs` passes on every one. The data blobs come out byte for byte the same. Importing the largest python:3.12 layer, 642.5 MiB of data, took 10.8 to 13.9 s from a plain tar against 20.3 to 26.4 s with `mkfs.erofs`, and 10.3 to 17.7 s from the gzipped tar against 27.8 to 32.8 s, with the host at a load of 62 to 81.
+
 ## 0.0.29
 
 Idle trimming that backs off for cells that need their page cache back.

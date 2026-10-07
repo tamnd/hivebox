@@ -1,6 +1,7 @@
 //! Committing a cell's changes on a real overlay: the image the commit makes must show what the
-//! cell saw, less what scrubbing took out. It needs root, a kernel with EROFS, overlayfs and loop
-//! devices, and `HIVE_MKFS_EROFS`, and passes without doing anything otherwise.
+//! cell saw, less what scrubbing took out. It needs root and a kernel with EROFS, overlayfs and
+//! loop devices, and passes without doing anything otherwise. Layers are built with
+//! `HIVE_MKFS_EROFS` when that is set.
 
 #![cfg(target_os = "linux")]
 
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
+use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
 use hive_nectar::mount::{IdMap, Layers};
 use hive_nectar::oci::{Commit, Importer};
 use hive_nectar::upper::{Scrub, SecretsFound, Shift};
@@ -136,10 +137,6 @@ fn tree(root: &Path) -> BTreeMap<String, String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_shows_what_the_cell_saw_less_its_secrets() {
-    let Some(program) = std::env::var_os("HIVE_MKFS_EROFS") else {
-        eprintln!("skipped: set HIVE_MKFS_EROFS to run it");
-        return;
-    };
     if !rustix::process::geteuid().is_root() {
         eprintln!("skipped: needs root");
         return;
@@ -148,8 +145,7 @@ async fn a_commit_shows_what_the_cell_saw_less_its_secrets() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn BlobStore> = Arc::new(PosixStore::open(dir.join("store")).unwrap());
-    let importer =
-        Importer::new(Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap(), dir.join("work")).unwrap();
+    let importer = Importer::new(builder(), dir.join("work")).unwrap();
     base_tar(&dir.join("base.tar"));
     let base = importer.import_tar(&*store, &dir.join("base.tar")).await.unwrap();
     let cache = Cache::open(dir.join("l1"), 1 << 30).unwrap();
@@ -246,4 +242,11 @@ async fn a_commit_shows_what_the_cell_saw_less_its_secrets() {
     drop(mounted);
     drop(layers);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn builder() -> Builder {
+    match std::env::var_os("HIVE_MKFS_EROFS") {
+        Some(program) => Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap().into(),
+        None => Writer::new(DEFAULT_CHUNK_SIZE).unwrap().into(),
+    }
 }

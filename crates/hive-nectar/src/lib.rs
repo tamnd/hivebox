@@ -3,7 +3,7 @@
 //! The design is in `spec/06_storage_images.md`. This is version 0 of it:
 //!
 //! - [`oci::Importer`] turns an OCI image layout, or a flat root filesystem tar, into EROFS layers
-//!   with `mkfs.erofs`, each split into a metadata blob and a data blob, and stores them with a
+//!   with its own writer or `mkfs.erofs`, each split into a metadata blob and a data blob, and stores them with a
 //!   [`Manifest`] that names them.
 //! - [`PosixStore`] keeps blobs in a directory, local or shared, and [`S3Store`] keeps them in an S3
 //!   bucket.

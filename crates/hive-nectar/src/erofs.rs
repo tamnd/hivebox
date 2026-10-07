@@ -1,5 +1,5 @@
-//! Turning tar streams into EROFS layers with `mkfs.erofs`, and the few superblock fields we check
-//! or fix afterwards.
+//! Turning tar streams into EROFS layers, in process with [`Writer`] or with `mkfs.erofs`, and the
+//! few superblock fields we check or fix afterwards.
 //!
 //! A layer is two files. The metadata blob has the superblock, inodes, directories, xattrs and
 //! chunk indexes, and every node that may run the image keeps it. The data blob has file contents
@@ -20,6 +20,10 @@ use std::process::{Child, Command, Stdio};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
+mod write;
+
+pub use write::Writer;
+
 /// Where the superblock starts.
 const SUPER_OFFSET: usize = 1024;
 const MAGIC: u32 = 0xE0F5_E1E2;
@@ -30,6 +34,62 @@ const INCOMPAT_DEVICE_TABLE: u32 = 0x8;
 /// The chunk size layers are built with unless asked otherwise. It is also what the cache fetches
 /// in, so it trades fetch round trips against bytes fetched that nobody reads.
 pub const DEFAULT_CHUNK_SIZE: u32 = 256 << 10;
+
+/// What builds layers.
+#[derive(Clone, Debug)]
+pub enum Builder {
+    /// The [`Writer`] in this crate.
+    Native(Writer),
+    /// A `mkfs.erofs`.
+    Mkfs(Mkfs),
+}
+
+impl Builder {
+    /// The chunk size layers are built with.
+    #[must_use]
+    pub const fn chunk_size(&self) -> u32 {
+        match self {
+            Self::Native(w) => w.chunk_size(),
+            Self::Mkfs(m) => m.chunk_size(),
+        }
+    }
+
+    /// Builds a layer from the tar stream `src` into `dir`, as [`Writer::build`] and
+    /// [`Mkfs::build`] do.
+    ///
+    /// # Errors
+    ///
+    /// `src` is not a tar, or the build fails.
+    pub fn build(&self, src: impl Read, dir: &Path) -> io::Result<Built> {
+        match self {
+            Self::Native(w) => w.build(src, dir),
+            Self::Mkfs(m) => m.build(src, dir),
+        }
+    }
+}
+
+impl From<Writer> for Builder {
+    fn from(w: Writer) -> Self {
+        Self::Native(w)
+    }
+}
+
+impl From<Mkfs> for Builder {
+    fn from(m: Mkfs) -> Self {
+        Self::Mkfs(m)
+    }
+}
+
+/// Checks that `chunk_size` is a power of two from 4 KiB to 64 MiB.
+fn check_chunk_size(chunk_size: u32) -> io::Result<()> {
+    if !chunk_size.is_power_of_two() || !(4 << 10..=64 << 20).contains(&chunk_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("chunk size {chunk_size} is not a power of two from 4 KiB to 64 MiB"),
+        ));
+    }
+    Ok(())
+}
 
 /// A `mkfs.erofs` that is new enough.
 #[derive(Clone, Debug)]
@@ -69,12 +129,7 @@ impl Mkfs {
     /// It cannot be run, is too old, or `chunk_size` is not a power of two from 4 KiB to 64 MiB.
     pub fn new(program: impl Into<PathBuf>, chunk_size: u32) -> io::Result<Self> {
         let program = program.into();
-        if !chunk_size.is_power_of_two() || !(4 << 10..=64 << 20).contains(&chunk_size) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("chunk size {chunk_size} is not a power of two from 4 KiB to 64 MiB"),
-            ));
-        }
+        check_chunk_size(chunk_size)?;
         // 1.8 answers -V with its version. 1.7 has no -V and complains, but then prints the same
         // line before its usage.
         let out = Command::new(&program)
