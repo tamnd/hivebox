@@ -165,8 +165,16 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 18);
+	__uint(max_entries, 1 << 20);
 } events SEC(".maps");
+
+// Drops the ring had no room to report.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} lost SEC(".maps");
 
 static always_inline int count(__u32 reason)
 {
@@ -179,8 +187,13 @@ static always_inline int count(__u32 reason)
 static always_inline int deny(__u32 cell, __u32 reason, __u32 ip, __u16 port, __u8 proto)
 {
 	struct deny d = { .cell = cell, .reason = reason, .ip = ip, .port = port, .proto = proto };
-	// A full ring loses the event, never the drop.
-	bpf_ringbuf_output(&events, &d, sizeof(d), 0);
+	// A full ring loses the event, never the drop, and the event lost is counted.
+	if (bpf_ringbuf_output(&events, &d, sizeof(d), 0)) {
+		__u32 zero = 0;
+		__u64 *n = bpf_map_lookup_elem(&lost, &zero);
+		if (n)
+			*n += 1;
+	}
 	return count(reason);
 }
 

@@ -25,6 +25,8 @@ pub struct Config {
     pub name: String,
     /// The E2B API, served when the file has an `[e2b]` table.
     pub e2b: Option<E2b>,
+    /// Where security events, such as a caller with a bad key, go, if anywhere.
+    pub siem: Option<hive_telemetry::siem::Link>,
 }
 
 /// How E2B sandboxes become cells.
@@ -99,6 +101,9 @@ impl Config {
     /// templates = { base = "docker.io/library/python:3.12" }
     /// sizes = { md = { vcpu_milli = 2000, mem_mib = 4096 } }
     /// backend = "container"
+    ///
+    /// [siem]
+    /// sink = "udp://10.0.0.9:514"
     /// ```
     ///
     /// With `keeper`, the gate takes the keys the keeper holds, and `[[key]]` is for keys that
@@ -181,7 +186,8 @@ impl Config {
                 return Err("[e2b] needs image_key or templates, or no sandbox has an image".into());
             }
         }
-        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper, name, e2b })
+        let siem = file.siem.link()?;
+        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper, name, e2b, siem })
     }
 }
 
@@ -233,6 +239,8 @@ struct File {
     #[serde(default)]
     key: Vec<Key>,
     e2b: Option<E2bFile>,
+    #[serde(default)]
+    siem: hive_telemetry::siem::Table,
 }
 
 #[derive(Deserialize)]

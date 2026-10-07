@@ -95,7 +95,12 @@ pub struct Config {
     /// The keeper group this comb registers with and holds a lease from. With one, the node
     /// index and the epoch come from the keeper and not from `node.node` and `node.epoch`.
     pub keeper: Option<KeeperLink>,
+    /// Where security events go, if anywhere.
+    pub siem: Option<SiemLink>,
 }
+
+/// Where the comb sends security events, and how.
+pub use hive_telemetry::siem::Link as SiemLink;
 
 /// Where the comb sends its reports, and how it says it can be reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,6 +299,7 @@ impl Default for Config {
             network: Network::default(),
             scout: None,
             keeper: None,
+            siem: None,
         }
     }
 }
@@ -370,6 +376,11 @@ impl Config {
     /// [keeper]
     /// members = ["10.0.0.1:7430", "10.0.0.2:7430", "10.0.0.3:7430"]
     /// name = "node-7"
+    ///
+    /// [siem]
+    /// sink = "udp://10.0.0.9:514"
+    /// window = "10s"
+    /// header_file = "/etc/hivebox/siem.header"
     /// ```
     ///
     /// An empty `cgroup_root` or `netns_dir` turns that pool off, and an empty `audit.dir` turns
@@ -578,6 +589,7 @@ impl Config {
         } else if k.name.is_some() {
             return Err("keeper.name needs keeper.members".into());
         }
+        c.siem = file.siem.link()?;
         if c.node == 0 {
             return Err("node.node must not be 0".into());
         }
@@ -619,6 +631,7 @@ struct File {
     scout: ScoutFile,
     keeper: KeeperFile,
     audit: AuditFile,
+    siem: hive_telemetry::siem::Table,
 }
 
 #[derive(Default, Deserialize)]
@@ -781,6 +794,30 @@ mod tests {
         let c = Config::from_toml("[audit]\nsync_gap = \"100ms\"").unwrap();
         assert_eq!(c.audit_sync_gap, Duration::from_millis(100));
         assert!(Config::from_toml("[audit]\nsync_gap = \"soon\"").is_err());
+    }
+
+    #[test]
+    fn security_events_go_nowhere_unless_a_sink_is_named() {
+        use hive_telemetry::siem::Sink;
+        assert_eq!(Config::from_toml("").unwrap().siem, None);
+        assert_eq!(Config::from_toml("[siem]\nsink = \"\"").unwrap().siem, None);
+        let c = Config::from_toml("[siem]\nsink = \"udp://10.0.0.9:514\"").unwrap();
+        let s = c.siem.unwrap();
+        assert_eq!(s.sink, Sink::Udp("10.0.0.9:514".into()));
+        assert_eq!(s.window, Duration::from_secs(10));
+        let text = "[siem]\nsink = \"http://c:8088/in\"\nwindow = \"1m\"\nheader_file = \"/k\"";
+        let s = Config::from_toml(text).unwrap().siem.unwrap();
+        assert_eq!(s.window, Duration::from_secs(60));
+        assert_eq!(s.header_file, Some(PathBuf::from("/k")));
+        for bad in [
+            "[siem]\nsink = \"https://c/\"",
+            "[siem]\nsink = \"syslog\"",
+            "[siem]\nsink = \"/x\"\nwindow = \"0s\"",
+            "[siem]\nwindow = \"10s\"",
+            "[siem]\nsinc = \"/x\"",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

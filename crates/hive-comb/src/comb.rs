@@ -24,6 +24,7 @@ use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 use hive_proto::convert;
 use hive_rt::{OsRng, Rng};
 use hive_telemetry::AuditLog;
+use hive_telemetry::siem::Siem;
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Source, is_name};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -115,6 +116,8 @@ pub(crate) struct Inner {
     pub(crate) metrics: Metrics,
     /// The audit log, which every API call goes into, when there is one. Shutting down takes it.
     audit: Mutex<Option<Arc<AuditLog>>>,
+    /// Where security events go, when anywhere.
+    pub(crate) siem: Option<Arc<Siem>>,
     /// Whether the pressure brake is on, which pauses idle cells and reclaims paused ones early.
     pub(crate) pressure: watch::Sender<bool>,
     pub(crate) shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
@@ -252,18 +255,18 @@ impl Comb {
             None => None,
         };
         let images = Nectar::open(&cfg)?;
+        // The keeper's name for the node stays the same when its index does not.
+        let node =
+            cfg.keeper.as_ref().map_or_else(|| format!("node-{}", cfg.node), |k| k.name.clone());
+        let siem = match &cfg.siem {
+            Some(link) => Some(Arc::new(Siem::open(link.options(&node, "hive-comb")?)?)),
+            None => None,
+        };
         let audit = match &cfg.audit_dir {
-            Some(dir) => {
-                // The keeper's name for the node stays the same when its index does not.
-                let node = cfg
-                    .keeper
-                    .as_ref()
-                    .map_or_else(|| format!("node-{}", cfg.node), |k| k.name.clone());
-                Some(Arc::new(
-                    AuditLog::open_with_gap(dir, &node, cfg.audit_sync_gap)
-                        .map_err(at("opening the audit log in", dir))?,
-                ))
-            }
+            Some(dir) => Some(Arc::new(
+                AuditLog::open_with_gap(dir, &node, cfg.audit_sync_gap)
+                    .map_err(at("opening the audit log in", dir))?,
+            )),
             None => None,
         };
         let mut records = replay.records;
@@ -281,6 +284,7 @@ impl Comb {
             images,
             metrics: Metrics::default(),
             audit: Mutex::new(audit),
+            siem,
             pressure: watch::Sender::new(false),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
@@ -311,6 +315,12 @@ impl Comb {
                 if let Some(llm) = &comb.inner.llm {
                     let stop = comb.inner.shutdown.clone();
                     tokio::spawn(llm.clone().serve(comb.inner.clone(), net.clone(), stop));
+                }
+                if let (Some(s), Some(link)) = (&comb.inner.siem, &comb.inner.cfg.siem) {
+                    let (inner, stop) = (comb.inner.clone(), comb.inner.shutdown.clone());
+                    let watch =
+                        crate::siem::watch(inner, s.clone(), net.clone(), link.window, stop);
+                    tokio::spawn(watch);
                 }
             }
         }
@@ -796,6 +806,15 @@ impl Comb {
         if let Some(log) = audit {
             let _ = tokio::task::spawn_blocking(move || drop(log)).await;
         }
+        // What the window counted goes out before the comb does.
+        if let Some(s) = self.inner.siem.clone() {
+            let _ = tokio::task::spawn_blocking(move || s.flush()).await;
+        }
+    }
+
+    /// Where security events go, when anywhere.
+    pub(crate) fn siem(&self) -> Option<&Arc<Siem>> {
+        self.inner.siem.as_ref()
     }
 }
 

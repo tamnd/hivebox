@@ -36,6 +36,7 @@ use hive_proto::v1::cells_server::CellsServer;
 use hive_proto::v1::llm_server::LlmServer;
 use hive_proto::v1::tokens_server::TokensServer;
 use hive_proto::v1::verify_server::VerifyServer;
+use hive_telemetry::siem::{SecurityEvent, Severity, Siem};
 use hive_telemetry::{CounterVec, Registry};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -93,6 +94,7 @@ pub struct Gate {
     tokens: Option<TokensServer<tokens::Api>>,
     e2b: Option<Arc<e2b::E2b>>,
     calls: CounterVec,
+    siem: Option<Arc<Siem>>,
 }
 
 impl Gate {
@@ -115,6 +117,7 @@ impl Gate {
             api,
             tokens: None,
             e2b: None,
+            siem: None,
             calls: registry.counter(
                 "hive_gate_calls_total",
                 "Calls the gate took, by method and whether the key was good.",
@@ -135,6 +138,26 @@ impl Gate {
     pub fn with_e2b(mut self, cfg: config::E2b) -> Self {
         self.e2b = Some(Arc::new(e2b::E2b::new(cfg)));
         self
+    }
+
+    /// The gate telling `siem` of the callers it turns away.
+    #[must_use]
+    pub fn with_siem(mut self, siem: Arc<Siem>) -> Self {
+        self.siem = Some(siem);
+        self
+    }
+
+    /// Tells the SIEM, if there is one, that the caller of `req` was turned away from `op`, and
+    /// why. The address it came from is in the detail, and the key it tried is not.
+    fn refused(&self, req: &http::Request<Body>, op: &str, why: &str) {
+        let Some(siem) = &self.siem else { return };
+        let from = req
+            .extensions()
+            .get::<tonic::transport::server::TcpConnectInfo>()
+            .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+            .map_or_else(String::new, |a| a.ip().to_string());
+        let detail = format!("from={from} op={op} why={why}");
+        siem.emit(SecurityEvent::new("auth.failed", Severity::Warning).detail(detail));
     }
 
     /// Who the `authorization: Bearer KEY` header says the caller is: the project, and the
@@ -213,6 +236,7 @@ impl Service<http::Request<Body>> for Gate {
             Ok(c) => c,
             Err(why) => {
                 self.calls.with(&[op, "denied"]).inc();
+                self.refused(&req, op, &why);
                 let status = Status::unauthenticated(why);
                 return Box::pin(async move { Ok(status.into_http()) });
             }

@@ -105,6 +105,7 @@ pub(crate) async fn call(
         Ok(w) => w,
         Err(why) => {
             gate.calls.with(&["e2b", "denied"]).inc();
+            gate.refused(&req, "e2b", &why);
             return error(http::StatusCode::UNAUTHORIZED, &why);
         }
     };

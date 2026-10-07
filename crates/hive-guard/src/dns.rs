@@ -52,6 +52,13 @@ pub trait Cells: Send + Sync {
     /// The addresses could not be allowed, or `from` is no longer that cell's, and the answer
     /// must not go out.
     fn allow(&self, from: Ipv4Addr, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()>;
+
+    /// Hears that the cell at `from` was refused `name`, `why` being `policy` for a name its
+    /// profile may not look up and `rate` for a query past its rate. It must not block, since
+    /// the answer waits for it.
+    fn refused(&self, from: Ipv4Addr, name: &str, why: &'static str) {
+        let _ = (from, name, why);
+    }
 }
 
 /// The names a profile may look up. `example.com` is that name only, and `*.example.com` is any
@@ -328,6 +335,7 @@ impl Proxy {
         let name = q.name.to_ascii().trim_end_matches('.').to_ascii_lowercase();
         if let Some(host) = self.settings.hosts.iter().find(|h| h.name == name) {
             if !host.profiles.contains(&profile) {
+                self.cells.refused(from, &name, "policy");
                 return reply(ResponseCode::NXDomain);
             }
             return match q.query_type {
@@ -351,10 +359,12 @@ impl Proxy {
             };
         }
         if !self.take(cell) {
+            self.cells.refused(from, &name, "rate");
             return reply(ResponseCode::Refused);
         }
         let allowed = self.settings.policies.get(&profile).is_some_and(|p| p.allows(&name));
         if !allowed {
+            self.cells.refused(from, &name, "policy");
             return reply(ResponseCode::NXDomain);
         }
         match q.query_type {
@@ -480,6 +490,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         allowed: Mutex<Vec<(u32, Vec<Ipv4Addr>, Duration)>>,
+        refused: Mutex<Vec<(Ipv4Addr, String, &'static str)>>,
     }
 
     impl Cells for Fake {
@@ -494,6 +505,10 @@ mod tests {
         fn allow(&self, _: Ipv4Addr, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
             self.allowed.lock().unwrap().push((idx, ips.to_vec(), ttl));
             Ok(())
+        }
+
+        fn refused(&self, from: Ipv4Addr, name: &str, why: &'static str) {
+            self.refused.lock().unwrap().push((from, name.to_string(), why));
         }
     }
 
@@ -613,6 +628,16 @@ mod tests {
         assert_eq!(seen.load(Ordering::Relaxed), 0);
         assert!(fake.allowed.lock().unwrap().is_empty());
         assert_eq!(p.answer(CELL, b"not dns").await, None);
+        // The names the policy refused are heard of, and the record types it does not take and
+        // the stranger are not.
+        let refused = fake.refused.lock().unwrap();
+        let names: Vec<_> = refused.iter().map(|(_, n, why)| (n.as_str(), *why)).collect();
+        assert_eq!(
+            names[..3],
+            [("example.com", "policy"), ("pythonhosted.org", "policy"), ("evilpypi.org", "policy")]
+        );
+        assert_eq!(names.len(), 5);
+        assert!(refused.iter().all(|(from, _, _)| *from == CELL));
     }
 
     #[tokio::test]
@@ -633,19 +658,23 @@ mod tests {
         assert_eq!(code(txt), ResponseCode::Refused);
         let other = ask(&p, OTHER, "svc.hive.internal", RecordType::A).await;
         assert_eq!(code(other), ResponseCode::NXDomain);
+        let refused = fake.refused.lock().unwrap().clone();
+        assert_eq!(refused, [(OTHER, "svc.hive.internal".to_string(), "policy")]);
         assert_eq!(seen.load(Ordering::Relaxed), 0);
         assert!(fake.allowed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn a_cell_past_its_rate_is_refused() {
-        let (p, _, _) = proxy(5).await;
+        let (p, fake, _) = proxy(5).await;
         let mut codes = Vec::new();
         for _ in 0..7 {
             codes.push(ask(&p, CELL, "example.com", RecordType::A).await.metadata.response_code);
         }
         assert_eq!(codes[..5], [ResponseCode::NXDomain; 5]);
         assert_eq!(codes[5..], [ResponseCode::Refused; 2]);
+        let why: Vec<_> = fake.refused.lock().unwrap().iter().map(|r| r.2).collect();
+        assert_eq!(why, ["policy", "policy", "policy", "policy", "policy", "rate", "rate"]);
         for _ in 0..20 {
             let own = ask(&p, CELL, "svc.hive.internal", RecordType::A).await;
             assert_eq!(own.metadata.response_code, ResponseCode::NoError);

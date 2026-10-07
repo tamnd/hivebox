@@ -125,6 +125,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     if let Some(e2b) = cfg.e2b {
         gate = gate.with_e2b(e2b);
     }
+    if let Some(link) = &cfg.siem {
+        let siem = hive_telemetry::siem::Siem::open(link.options(&cfg.name, "hive-gate")?)?;
+        gate = gate.with_siem(std::sync::Arc::new(siem));
+    }
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     tokio::spawn({

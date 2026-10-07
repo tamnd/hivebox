@@ -605,6 +605,15 @@ impl Cluster {
 
     /// The same, with the gate serving E2B as `e2b` says.
     async fn with(room: u32, e2b: Option<hive_gate::config::E2b>) -> Self {
+        Self::telling(room, e2b, None).await
+    }
+
+    /// The same, with the gate telling `siem` of the callers it turns away.
+    async fn telling(
+        room: u32,
+        e2b: Option<hive_gate::config::E2b>,
+        siem: Option<Arc<hive_telemetry::siem::Siem>>,
+    ) -> Self {
         let stop = CancellationToken::new();
         let scout = hive_scout::Service::new();
         tokio::spawn(scout.clone().run(stop.clone()));
@@ -653,6 +662,9 @@ impl Cluster {
         let mut gate = Gate::new(keys, nodes, None, &hive_telemetry::Registry::new());
         if let Some(e2b) = e2b {
             gate = gate.with_e2b(e2b);
+        }
+        if let Some(siem) = siem {
+            gate = gate.with_siem(siem);
         }
         let (gl, gaddr) = listen().await;
         tokio::spawn(hive_gate::serve(gate, gl, stop.clone()));
@@ -739,6 +751,41 @@ async fn a_call_without_a_good_key_is_turned_away() {
     let mut r = Request::new(v1::ListCellsRequest::default());
     r.metadata_mut().insert("authorization", "Bearer hb_wrong".parse().unwrap());
     assert_eq!(c.cells().list(r).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_turned_away_is_told_to_the_siem_without_its_key() {
+    use hive_telemetry::siem::{Options, Siem, Sink};
+    let path = std::env::temp_dir().join(format!("hive-gate-siem-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let siem =
+        Arc::new(Siem::open(Options::new(Sink::File(path.clone()), "g1", "hive-gate")).unwrap());
+    let c = Cluster::telling(100, None, Some(siem.clone())).await;
+    for _ in 0..3 {
+        let mut r = Request::new(v1::ListCellsRequest::default());
+        r.metadata_mut().insert("authorization", "Bearer hb_wrong".parse().unwrap());
+        assert_eq!(c.cells().list(r).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+    // A good key is not news.
+    c.cells().list(authed(v1::ListCellsRequest::default())).await.unwrap();
+    tokio::task::spawn_blocking(move || siem.flush()).await.unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let lines: Vec<serde_json::Value> =
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    // The first at once, and the two after it counted into one line when the window ends.
+    assert_eq!(lines.len(), 2, "{text}");
+    let counts: Vec<u64> = lines.iter().map(|l| l["count"].as_u64().unwrap()).collect();
+    assert_eq!(counts, [1, 2]);
+    for l in &lines {
+        assert_eq!(l["kind"], "auth.failed");
+        assert_eq!(l["severity"], "warning");
+        assert_eq!(l["node"], "g1");
+        assert_eq!(l["source"], "hive-gate");
+        let detail = l["detail"].as_str().unwrap();
+        assert!(detail.starts_with("from=127.0.0.1 op="), "{detail}");
+        assert!(!text.contains("hb_wrong"), "the key it tried stays out");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
