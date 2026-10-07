@@ -75,6 +75,58 @@ pub struct Node {
     pub expires_ms: u64,
 }
 
+/// How many sealed hours of each node's audit chain the keeper holds. Older ones are dropped as
+/// new ones come, 30 days of them.
+pub const AUDIT_HOURS: usize = 24 * 30;
+
+/// The most sealed hours one command may bring.
+pub const AUDIT_BATCH: usize = 64;
+
+/// A sealed hour of a node's audit chain, from its seal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditHour {
+    /// The sequence number of its first event.
+    pub first_seq: u64,
+    /// How many events it holds.
+    pub count: u64,
+    /// The hash its first line points back at.
+    pub prev: [u8; 32],
+    /// The hash of its last line.
+    pub root: [u8; 32],
+}
+
+impl AuditHour {
+    /// The sequence number after its last event.
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.first_seq.saturating_add(self.count)
+    }
+}
+
+/// How far a node said its audit chain had got.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditTip {
+    /// The hour its last event fell in.
+    pub hour: String,
+    /// How many events the chain held.
+    pub seq: u64,
+    /// The hash of the last event's line.
+    pub root: [u8; 32],
+    /// When the node said so.
+    pub at_ms: u64,
+}
+
+/// What the keeper holds of a node's audit chain: the roots of its last sealed hours, each one
+/// following on from the one before, and the furthest point it said the chain had reached.
+/// Neither may change once held, so a node that rewrites or cuts back its chain is refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditChain {
+    /// The sealed hours by hour, as the files are named, such as `2026-10-07T06`.
+    pub hours: BTreeMap<String, AuditHour>,
+    /// The furthest point the node said its chain had reached.
+    pub tip: Option<AuditTip>,
+}
+
 /// A change to the state. The member that takes the call fills in `now_ms` and anything
 /// random, so applying it is the same everywhere.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +212,21 @@ pub enum Command {
         /// The Ed25519 private key.
         private: [u8; 32],
     },
+    /// A comb publishing its audit chain: the hours it sealed since the last one the keeper
+    /// holds, oldest first, and how far the chain has got. Only the comb holding the node's
+    /// lease may.
+    Audit {
+        /// Its index.
+        node: u16,
+        /// The epoch it runs in.
+        epoch: u16,
+        /// The time of the call.
+        now_ms: u64,
+        /// Sealed hours, by hour.
+        hours: Vec<(String, AuditHour)>,
+        /// How far the chain has got, as the tip's hour, sequence number and root.
+        tip: Option<(String, u64, [u8; 32])>,
+    },
     /// Several commands in one log entry, applied in order. Calls that arrive together are
     /// sent this way so they cost one round of disk writes instead of one each.
     Batch(Vec<Command>),
@@ -185,6 +252,8 @@ pub enum Reply {
     Refused(Refusal),
     /// The replies to a batch, in its order.
     Batch(Vec<Reply>),
+    /// The audit roots were taken, and this is the last sealed hour now held, or empty.
+    Audit(String),
 }
 
 /// Why a command was refused.
@@ -203,6 +272,9 @@ pub enum Refusal {
     /// The node's lease is live in a newer epoch than the comb asked with, so the comb waits for
     /// it to run out.
     Held(String),
+    /// Audit roots that do not follow on from the ones held, so the node's chain was rewritten,
+    /// cut back or lost.
+    Conflict(String),
 }
 
 /// Everything the keeper agrees on.
@@ -217,6 +289,10 @@ pub struct State {
     /// The Ed25519 private key tokens are signed with, made on the first token.
     #[serde(default)]
     pub root: Option<[u8; 32]>,
+    /// The audit chains of the nodes, by node name, which stays the same when the index does
+    /// not.
+    #[serde(default)]
+    pub audit: BTreeMap<String, AuditChain>,
 }
 
 impl State {
@@ -360,6 +436,22 @@ impl State {
                 n.expires_ms = now_ms.saturating_add(ttl_ms);
                 (Reply::Node(n.clone()), Some(Changed::Node(node)))
             }
+            Command::Audit { node, epoch, now_ms, hours, tip } => {
+                let name = match self.nodes.get(&node) {
+                    None => return refused(Refusal::NotFound(format!("no node {node}"))),
+                    Some(n) if n.epoch != epoch || n.expires_ms <= now_ms => {
+                        return refused(Refusal::LeaseLost(format!(
+                            "node {node} in epoch {epoch} holds no lease"
+                        )));
+                    }
+                    Some(n) => n.name.clone(),
+                };
+                let tip = tip.map(|(hour, seq, root)| AuditTip { hour, seq, root, at_ms: now_ms });
+                match self.audit(&name, hours, tip) {
+                    Ok((last, changed)) => (Reply::Audit(last), changed),
+                    Err(r) => refused(r),
+                }
+            }
             Command::TakeQuota { project, gate, cells, creates_per_s, live, now_ms, ttl_ms } => {
                 if !hive_types::is_name(&gate) {
                     return refused(Refusal::Invalid(format!("{gate:?} is not a gate name")));
@@ -406,6 +498,107 @@ impl State {
         }
     }
 
+    /// Takes the hours and the tip node `name` sent, if they follow on from what is held, and
+    /// says the last hour held after and what changed. Nothing changes when any of it is
+    /// refused.
+    fn audit(
+        &mut self,
+        name: &str,
+        hours: Vec<(String, AuditHour)>,
+        tip: Option<AuditTip>,
+    ) -> Result<(String, Option<Changed>), Refusal> {
+        if hours.len() > AUDIT_BATCH {
+            return Err(Refusal::Invalid(format!("more than {AUDIT_BATCH} audit hours at once")));
+        }
+        let empty = AuditChain::default();
+        let chain = self.audit.get(name).unwrap_or(&empty);
+        let mut last = chain.hours.iter().next_back();
+        let first = chain.hours.keys().next();
+        let mut new = Vec::new();
+        for (hour, h) in &hours {
+            if !is_hour(hour) || h.count == 0 {
+                return Err(Refusal::Invalid(format!("{hour:?} is not a sealed audit hour")));
+            }
+            if let Some(held) = chain.hours.get(hour) {
+                if held != h {
+                    return Err(conflict(name, format!("hour {hour} has another root held")));
+                }
+                continue;
+            }
+            // An hour from before the oldest held was dropped, or came before the first one
+            // published, so there is nothing to check it against.
+            if first.is_some_and(|f| hour < f) {
+                continue;
+            }
+            if let Some((lh, l)) = last {
+                if hour <= lh {
+                    return Err(conflict(name, format!("hour {hour} is missing before {lh}")));
+                }
+                if h.first_seq != l.end() || h.prev != l.root {
+                    return Err(conflict(
+                        name,
+                        format!("hour {hour} does not follow on from {lh}"),
+                    ));
+                }
+            }
+            for t in chain.tip.iter().chain(&tip) {
+                agrees(name, hour, h, t)?;
+            }
+            new.push((hour, h));
+            last = Some((hour, h));
+        }
+        let mut keep_tip = None;
+        if let Some(t) = tip {
+            if !is_hour(&t.hour) {
+                return Err(Refusal::Invalid(format!("{:?} is not an audit hour", t.hour)));
+            }
+            for (hour, h) in chain.hours.get_key_value(&t.hour).into_iter().chain(last) {
+                agrees(name, hour, h, &t)?;
+            }
+            match &chain.tip {
+                Some(o) if t.seq < o.seq => {
+                    return Err(conflict(
+                        name,
+                        format!("its chain went back from {} to {} events", o.seq, t.seq),
+                    ));
+                }
+                Some(o) if t.seq == o.seq && t.root != o.root => {
+                    return Err(conflict(
+                        name,
+                        format!("the first {} events have another root held", t.seq),
+                    ));
+                }
+                Some(o) if t.seq > o.seq && t.hour < o.hour => {
+                    return Err(conflict(name, format!("hour {} came after {}", t.hour, o.hour)));
+                }
+                Some(o) if t.seq == o.seq => {}
+                _ => keep_tip = Some(t),
+            }
+        }
+        // Everything checks out, so it all goes in.
+        let added: Vec<String> = new.iter().map(|(h, _)| (*h).clone()).collect();
+        let chain = self.audit.entry(name.to_string()).or_default();
+        for (hour, h) in hours.into_iter().filter(|(hour, _)| added.contains(hour)) {
+            chain.hours.insert(hour, h);
+        }
+        let mut gone = Vec::new();
+        while chain.hours.len() > AUDIT_HOURS {
+            gone.extend(chain.hours.pop_first().map(|(h, _)| h));
+        }
+        let tip = keep_tip.is_some();
+        if keep_tip.is_some() {
+            chain.tip = keep_tip;
+        }
+        let last = chain.hours.keys().next_back().cloned().unwrap_or_default();
+        let changed = (tip || !added.is_empty()).then(|| Changed::Audit {
+            node: name.to_string(),
+            added,
+            gone,
+            tip,
+        });
+        Ok((last, changed))
+    }
+
     /// The lowest node index not handed out. Index 0 never is, so a zero in a message means
     /// none.
     fn free_node(&self) -> Option<u16> {
@@ -437,6 +630,56 @@ pub enum Changed {
     Node(u16),
     /// The signing key.
     Root,
+    /// A node's audit chain: the hours added and dropped, and whether the tip moved.
+    Audit {
+        /// The node's name.
+        node: String,
+        /// The hours added.
+        added: Vec<String>,
+        /// The hours dropped.
+        gone: Vec<String>,
+        /// Whether the tip moved.
+        tip: bool,
+    },
+}
+
+/// Whether `s` names an hour the way audit files are named, such as `2026-10-07T06`.
+fn is_hour(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 13
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            4 | 7 => c == b'-',
+            10 => c == b'T',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+fn conflict(node: &str, why: String) -> Refusal {
+    Refusal::Conflict(format!("the audit chain of node {node} does not match the keeper's: {why}"))
+}
+
+/// Whether sealed hour `hour` and tip `t` can both be of one chain. A tip in an hour before the
+/// sealed one is at or before its start, one in the same hour is within it, and one in an hour
+/// after is at or past its end. A tip right at the start or the end has the root there.
+fn agrees(node: &str, hour: &str, h: &AuditHour, t: &AuditTip) -> Result<(), Refusal> {
+    let (a, b) = (h.first_seq, h.end());
+    let within = match t.hour.as_str().cmp(hour) {
+        std::cmp::Ordering::Less => t.seq <= a,
+        std::cmp::Ordering::Equal => a <= t.seq && t.seq <= b,
+        std::cmp::Ordering::Greater => t.seq >= b,
+    };
+    let root = (t.seq != a || t.root == h.prev) && (t.seq != b || t.root == h.root);
+    if within && root {
+        Ok(())
+    } else {
+        Err(conflict(
+            node,
+            format!(
+                "hour {hour} does not agree with the tip at sequence {} in hour {}",
+                t.seq, t.hour
+            ),
+        ))
+    }
 }
 
 fn refused(r: Refusal) -> (Reply, Option<Changed>) {
@@ -649,5 +892,118 @@ mod tests {
         let (r, row) = s.apply(Command::SetRoot { private: [2; 32] });
         assert_eq!((r, row), (Reply::Root([1; 32]), None));
         assert_eq!(s.root, Some([1; 32]));
+    }
+
+    const T: [&str; 4] = ["2026-10-07T00", "2026-10-07T01", "2026-10-07T02", "2026-10-07T03"];
+
+    /// The root after hour `i` of a chain of ten events an hour.
+    fn at(i: u64) -> [u8; 32] {
+        [(i % 251 + 1) as u8; 32]
+    }
+
+    /// Hour `i` of a chain of ten events an hour, from 2026-10-07T00 on.
+    fn hour(i: u64) -> (String, AuditHour) {
+        let prev = if i == 0 { [0; 32] } else { at(i - 1) };
+        let name = format!("2026-10-{:02}T{:02}", 7 + i / 24, i % 24);
+        (name, AuditHour { first_seq: i * 10, count: 10, prev, root: at(i) })
+    }
+
+    fn audit(
+        s: &mut State,
+        hours: Vec<(String, AuditHour)>,
+        tip: Option<(&str, u64, [u8; 32])>,
+    ) -> (Reply, Option<Changed>) {
+        let tip = tip.map(|(h, seq, root)| (h.to_string(), seq, root));
+        s.apply(Command::Audit { node: 1, epoch: 1, now_ms: 2, hours, tip })
+    }
+
+    fn conflict((r, _): (Reply, Option<Changed>)) -> String {
+        match r {
+            Reply::Refused(Refusal::Conflict(m)) => m,
+            other => panic!("not a conflict: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_roots_have_to_follow_on_from_the_ones_held() {
+        let mut s = State::default();
+        // Only the comb holding the node's lease may publish its roots.
+        let r = audit(&mut s, vec![hour(0)], None).0;
+        assert!(matches!(r, Reply::Refused(Refusal::NotFound(_))), "{r:?}");
+        register(&mut s, "node-a", 0, 1);
+        let cmd =
+            |epoch, now_ms| Command::Audit { node: 1, epoch, now_ms, hours: vec![], tip: None };
+        for c in [cmd(2, 2), cmd(1, 40_000)] {
+            let r = s.apply(c).0;
+            assert!(matches!(r, Reply::Refused(Refusal::LeaseLost(_))), "{r:?}");
+        }
+
+        let (r, row) = audit(&mut s, vec![hour(0), hour(1)], Some((T[2], 25, [9; 32])));
+        assert_eq!(r, Reply::Audit(T[1].into()));
+        let added = vec![T[0].to_string(), T[1].to_string()];
+        assert_eq!(
+            row,
+            Some(Changed::Audit { node: "node-a".into(), added, gone: vec![], tip: true })
+        );
+        // The same again changes nothing.
+        let again = audit(&mut s, vec![hour(0), hour(1)], Some((T[2], 25, [9; 32])));
+        assert_eq!(again, (Reply::Audit(T[1].into()), None));
+
+        // Another root for an hour held, an hour that does not point back at the last one or
+        // leaves one out, a seal that ends before the tip said its hour had got to, and a tip
+        // that goes back are all refused, and change nothing.
+        let before = s.clone();
+        let mut forged = hour(1);
+        forged.1.root = [7; 32];
+        assert!(conflict(audit(&mut s, vec![forged], None)).contains("another root"));
+        let mut off = hour(2);
+        off.1.prev = [7; 32];
+        assert!(conflict(audit(&mut s, vec![off], None)).contains("follow on"));
+        assert!(conflict(audit(&mut s, vec![hour(3)], None)).contains("follow on"));
+        let mut cut = hour(2);
+        cut.1.count = 4;
+        assert!(conflict(audit(&mut s, vec![cut], None)).contains("does not agree"));
+        assert!(conflict(audit(&mut s, vec![], Some((T[2], 24, [9; 32])))).contains("went back"));
+        assert!(
+            conflict(audit(&mut s, vec![], Some((T[2], 25, [8; 32])))).contains("another root")
+        );
+        // A tip right at the end of a sealed hour has that hour's root.
+        let r = audit(&mut s, vec![], Some((T[1], 20, [8; 32])));
+        assert!(conflict(r).contains("does not agree"));
+        assert_eq!(s, before);
+
+        // Hour 2 sealed with the tip inside it goes in, and so does a tip at the end of hour 3.
+        let (r, _) = audit(&mut s, vec![hour(2)], Some((T[3], 31, [5; 32])));
+        assert_eq!(r, Reply::Audit(T[2].into()));
+        let (r, _) = audit(&mut s, vec![hour(3)], Some((T[3], 40, at(3))));
+        assert_eq!(r, Reply::Audit(T[3].into()));
+        let chain = &s.audit["node-a"];
+        assert_eq!(chain.hours.len(), 4);
+        assert_eq!(chain.tip.as_ref().map(|t| (t.seq, t.root)), Some((40, at(3))));
+    }
+
+    #[test]
+    fn the_keeper_holds_the_last_30_days_of_audit_hours() {
+        let mut s = State::default();
+        register(&mut s, "node-a", 0, 1);
+        let all = AUDIT_HOURS as u64 + 10;
+        let mut gone = Vec::new();
+        for from in (0..all).step_by(AUDIT_BATCH) {
+            let hours = (from..all.min(from + AUDIT_BATCH as u64)).map(hour).collect();
+            match audit(&mut s, hours, None) {
+                (Reply::Audit(_), Some(Changed::Audit { gone: g, .. })) => gone.extend(g),
+                other => panic!("{other:?}"),
+            }
+        }
+        let chain = &s.audit["node-a"];
+        assert_eq!(chain.hours.len(), AUDIT_HOURS);
+        assert_eq!(chain.hours.keys().next(), Some(&hour(10).0));
+        assert_eq!(gone, (0..10).map(|i| hour(i).0).collect::<Vec<_>>());
+        // An hour from before the oldest held has nothing to be checked against, and is left out.
+        let r = audit(&mut s, vec![hour(3)], None);
+        assert_eq!(r, (Reply::Audit(hour(all - 1).0), None));
+        let many = (all..all + AUDIT_BATCH as u64 + 1).map(hour).collect();
+        let r = audit(&mut s, many, None).0;
+        assert!(matches!(r, Reply::Refused(Refusal::Invalid(_))), "{r:?}");
     }
 }

@@ -77,6 +77,19 @@ struct Line {
     hash: String,
 }
 
+/// How far a chain has got: how many events it holds, the hash of the last of them and the hour
+/// that one fell in. A keeper holding a tip can tell later whether the chain was cut back or
+/// written over before that point.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tip {
+    /// The hour of the last event, or empty for a chain with none.
+    pub hour: String,
+    /// How many events the chain holds, which is the sequence number of the next one.
+    pub seq: u64,
+    /// The hash of the last event's line, or [`GENESIS`].
+    pub root: [u8; 32],
+}
+
 /// What a sealed hour holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seal {
@@ -121,11 +134,13 @@ fn hex32(b: &[u8; 32]) -> [u8; 64] {
     out
 }
 
-fn hex(b: &[u8; 32]) -> String {
+/// A hash in hex, the way lines and seals hold it.
+pub fn hex(b: &[u8; 32]) -> String {
     String::from_utf8_lossy(&hex32(b)).into_owned()
 }
 
-fn unhex(s: &str) -> Option<[u8; 32]> {
+/// A hash from hex in lower case, the way lines and seals hold it.
+pub fn unhex(s: &str) -> Option<[u8; 32]> {
     let b = s.as_bytes();
     if b.len() != 64 {
         return None;
@@ -218,6 +233,43 @@ fn hours(dir: &Path) -> io::Result<Vec<String>> {
     Ok(out)
 }
 
+/// The seals in `dir` of the hours after `after`, oldest first, up to `max` of them. Pass an
+/// empty `after` for all of them.
+///
+/// # Errors
+///
+/// The directory or a seal cannot be read.
+pub fn seals(dir: &Path, after: &str, max: usize) -> io::Result<Vec<Seal>> {
+    let mut out = Vec::new();
+    for hour in hours(dir)?.into_iter().filter(|h| h.as_str() > after) {
+        if out.len() == max {
+            break;
+        }
+        // Only the last hour has no seal, so the sealed ones end at the first without.
+        match read_seal(dir, &hour)? {
+            Some(s) => out.push(s),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The node whose chain is in `dir`, from its first line, or `None` when it has none.
+///
+/// # Errors
+///
+/// The directory or the first file cannot be read, or its first line is not an audit line.
+pub fn node_of(dir: &Path) -> io::Result<Option<String>> {
+    let Some(first) = hours(dir)?.into_iter().next() else { return Ok(None) };
+    let mut buf = Vec::new();
+    BufReader::new(File::open(dir.join(format!("{first}.log")))?).read_until(b'\n', &mut buf)?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let line: Line = serde_json::from_slice(&buf).map_err(io::Error::other)?;
+    Ok(Some(line.node))
+}
+
 fn read_seal(dir: &Path, hour: &str) -> io::Result<Option<Seal>> {
     match std::fs::read(dir.join(format!("{hour}.seal"))) {
         Ok(b) => serde_json::from_slice(&b).map(Some).map_err(io::Error::other),
@@ -234,6 +286,9 @@ struct Walk {
     count: u64,
     /// The byte length of the lines that checked out.
     good: u64,
+    /// Roots held elsewhere, as how many events they cover and the hash of the last, with the
+    /// next one due last.
+    anchors: Vec<(u64, [u8; 32])>,
 }
 
 /// Checks the lines of one hour file, carrying on from `walk`. A line that fails stops it with
@@ -276,6 +331,19 @@ fn walk_file(path: &Path, walk: &mut Walk) -> io::Result<Option<(usize, String)>
         walk.prev = h;
         walk.count += 1;
         walk.good += len as u64;
+        while let Some(&(seq, root)) = walk.anchors.last()
+            && seq == walk.seq
+        {
+            walk.anchors.pop();
+            if root != h {
+                let why = format!(
+                    "the first {seq} events end in {}, not in the root published for them, {}",
+                    hex(&h),
+                    hex(&root)
+                );
+                return Ok(Some((n, why)));
+            }
+        }
     }
 }
 
@@ -286,8 +354,26 @@ fn walk_file(path: &Path, walk: &mut Walk) -> io::Result<Option<(usize, String)>
 ///
 /// `Ok(Err(..))` says where the chain breaks, and `Err` is a file that could not be read.
 pub fn verify(dir: &Path) -> io::Result<Result<Verified, Broken>> {
+    verify_with(dir, &[])
+}
+
+/// [`verify`], and checks the chain against roots published elsewhere, such as at the keeper:
+/// each anchor is how many events a root covers and the hash of the last of them. The chain has
+/// to reach every anchor and hold the same hash there, so a chain cut back or written over
+/// before a published root is broken even when every line in it checks out.
+///
+/// # Errors
+///
+/// As for [`verify`].
+pub fn verify_with(
+    dir: &Path,
+    anchors: &[(u64, [u8; 32])],
+) -> io::Result<Result<Verified, Broken>> {
     let all = hours(dir)?;
-    let mut walk = Walk { seq: 0, prev: GENESIS, node: None, count: 0, good: 0 };
+    // An anchor at 0 covers no events, and there is nothing to check it against.
+    let mut due: Vec<_> = anchors.iter().copied().filter(|a| a.0 > 0).collect();
+    due.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+    let mut walk = Walk { seq: 0, prev: GENESIS, node: None, count: 0, good: 0, anchors: due };
     let mut events = 0;
     let mut sealed = false;
     for (i, hour) in all.iter().enumerate() {
@@ -320,6 +406,10 @@ pub fn verify(dir: &Path) -> io::Result<Result<Verified, Broken>> {
                 }
             }
         }
+    }
+    if let Some(&(seq, _)) = walk.anchors.first() {
+        let why = format!("a root covers {seq} events and the chain holds {}", walk.seq);
+        return Ok(Err(Broken { file: dir.to_path_buf(), line: 0, why }));
     }
     Ok(Ok(Verified {
         node: walk.node.unwrap_or_default(),
@@ -363,7 +453,7 @@ pub struct AuditLog {
     urgent: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
-    root: Arc<Mutex<(u64, [u8; 32])>>,
+    tip: Arc<Mutex<Tip>>,
 }
 
 impl std::fmt::Debug for AuditLog {
@@ -393,7 +483,8 @@ impl Writer {
     fn open(dir: &Path, node: &str) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let all = hours(dir)?;
-        let mut walk = Walk { seq: 0, prev: GENESIS, node: None, count: 0, good: 0 };
+        let mut walk =
+            Walk { seq: 0, prev: GENESIS, node: None, count: 0, good: 0, anchors: Vec::new() };
         let mut w = Self {
             dir: dir.to_path_buf(),
             node: node.to_string(),
@@ -530,6 +621,11 @@ impl Writer {
         Ok(())
     }
 
+    fn tip(&self) -> Tip {
+        let hour = self.hour.as_ref().map(|(h, _, _)| h.clone()).unwrap_or_default();
+        Tip { hour, seq: self.seq, root: self.prev }
+    }
+
     fn sync(&mut self) -> io::Result<()> {
         if let Some(out) = &mut self.out {
             out.flush()?;
@@ -560,14 +656,14 @@ impl AuditLog {
         let mut w = Writer::open(dir, node)?;
         let counters = Arc::new(Counters::default());
         counters.events.store(w.seq, Ordering::Relaxed);
-        let root = Arc::new(Mutex::new((w.seq, w.prev)));
+        let tip = Arc::new(Mutex::new(w.tip()));
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let urgent = Arc::new(AtomicBool::new(false));
-        let (c, r, u) = (counters.clone(), root.clone(), urgent.clone());
+        let (c, t, u) = (counters.clone(), tip.clone(), urgent.clone());
         let thread = std::thread::Builder::new()
             .name("hive-audit".into())
-            .spawn(move || run(&mut w, &rx, gap, &u, &c, &r))?;
-        Ok(Self { tx: Some(tx), urgent, thread: Some(thread), counters, root })
+            .spawn(move || run(&mut w, &rx, gap, &u, &c, &t))?;
+        Ok(Self { tx: Some(tx), urgent, thread: Some(thread), counters, tip })
     }
 
     /// Queues `event`. It blocks only while the writer is a whole queue behind.
@@ -595,7 +691,13 @@ impl AuditLog {
 
     /// The number of events on disk and the hash of the last of them.
     pub fn root(&self) -> (u64, [u8; 32]) {
-        *self.root.lock().unwrap_or_else(PoisonError::into_inner)
+        let t = self.tip.lock().unwrap_or_else(PoisonError::into_inner);
+        (t.seq, t.root)
+    }
+
+    /// How far the chain on disk has got.
+    pub fn tip(&self) -> Tip {
+        self.tip.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// How much the log has written.
@@ -635,7 +737,7 @@ fn run(
     gap: Duration,
     urgent: &AtomicBool,
     counters: &Counters,
-    root: &Mutex<(u64, [u8; 32])>,
+    tip: &Mutex<Tip>,
 ) {
     let mut waiting = Vec::new();
     let mut failed: Option<String> = None;
@@ -677,7 +779,7 @@ fn run(
             recover(w, counters);
         }
         counters.syncs.fetch_add(1, Ordering::Relaxed);
-        publish(w, counters, root);
+        publish(w, counters, tip);
         // A failure is kept until a flush can report it.
         if !waiting.is_empty() {
             let failed = failed.take();
@@ -689,7 +791,7 @@ fn run(
     if w.sync().is_err() {
         recover(w, counters);
     }
-    publish(w, counters, root);
+    publish(w, counters, tip);
 }
 
 /// Sleeps until `due`, or until a flush or a close says not to wait.
@@ -703,10 +805,14 @@ fn nap(due: Instant, urgent: &AtomicBool) {
     }
 }
 
-fn publish(w: &Writer, counters: &Counters, root: &Mutex<(u64, [u8; 32])>) {
+fn publish(w: &Writer, counters: &Counters, tip: &Mutex<Tip>) {
     counters.events.store(w.seq, Ordering::Relaxed);
     counters.sealed.store(w.sealed, Ordering::Relaxed);
-    *root.lock().unwrap_or_else(PoisonError::into_inner) = (w.seq, w.prev);
+    let mut t = tip.lock().unwrap_or_else(PoisonError::into_inner);
+    // The hour changes only when the chain does, so a sync with nothing new copies nothing.
+    if t.seq != w.seq || t.root != w.prev {
+        *t = w.tip();
+    }
 }
 
 /// After a failed write, finds the end of the chain on disk again, so the next line follows the
@@ -801,6 +907,61 @@ mod tests {
         log.flush().unwrap();
         drop(log);
         assert_eq!(verify(&d.0).unwrap().unwrap().events, 151);
+    }
+
+    #[test]
+    fn the_tip_seals_and_node_say_where_the_chain_is() {
+        let d = Scratch::new("tip");
+        std::fs::create_dir_all(&d.0).unwrap();
+        assert_eq!(node_of(&d.0).unwrap(), None);
+        fill(&d.0, 3, 50);
+        let v = verify(&d.0).unwrap().unwrap();
+        let log = AuditLog::open(&d.0, "n1").unwrap();
+        assert_eq!(log.tip(), Tip { hour: "2026-10-07T08".into(), seq: 150, root: v.root });
+        drop(log);
+        assert_eq!(node_of(&d.0).unwrap().as_deref(), Some("n1"));
+        let all = seals(&d.0, "", 64).unwrap();
+        let hours: Vec<_> = all.iter().map(|s| (s.hour.as_str(), s.first_seq, s.count)).collect();
+        assert_eq!(hours, [("2026-10-07T06", 0, 50), ("2026-10-07T07", 50, 50)]);
+        assert_eq!(seals(&d.0, "2026-10-07T06", 64).unwrap(), all[1..]);
+        assert_eq!(seals(&d.0, "", 1).unwrap(), all[..1]);
+        assert_eq!(unhex(&all[1].prev), unhex(&all[0].root));
+    }
+
+    #[test]
+    fn a_chain_rebuilt_whole_does_not_match_the_roots_published() {
+        let d = Scratch::new("anchor");
+        fill(&d.0, 3, 50);
+        let tip = AuditLog::open(&d.0, "n1").unwrap().tip();
+        let mut anchors: Vec<_> = seals(&d.0, "", 64)
+            .unwrap()
+            .iter()
+            .map(|s| (s.first_seq + s.count, unhex(&s.root).unwrap()))
+            .collect();
+        anchors.push((tip.seq, tip.root));
+        assert_eq!(verify_with(&d.0, &anchors).unwrap().unwrap().events, 150);
+
+        // The same events with one changed, written as a fresh chain: every hash and seal checks
+        // out, and only the published roots tell.
+        let forged = Scratch::new("anchor-forged");
+        let log = AuditLog::open(&forged.0, "n1").unwrap();
+        for i in 0..150 {
+            let mut e = event(T0 + (i / 50) * HOUR + i % 50, i);
+            if i == 70 {
+                e.result = "ok, nothing to see".into();
+            }
+            log.record(e);
+        }
+        drop(log);
+        assert!(verify(&forged.0).unwrap().is_ok());
+        let b = verify_with(&forged.0, &anchors).unwrap().unwrap_err();
+        assert_eq!((b.file, b.line), (forged.0.join("2026-10-07T07.log"), 50), "{}", b.why);
+
+        // A chain cut back before the tip.
+        let cut = Scratch::new("anchor-cut");
+        fill(&cut.0, 2, 50);
+        let b = verify_with(&cut.0, &anchors).unwrap().unwrap_err();
+        assert!(b.why.contains("covers 150 events and the chain holds 100"), "{}", b.why);
     }
 
     #[test]

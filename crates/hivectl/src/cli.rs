@@ -2,6 +2,7 @@
 //! arguments or after them, and `--` ends the flags, so `hivectl run ID -- ls -la` passes `-la`
 //! to `ls`.
 
+use hive_proto::internal as pb;
 use hive_proto::v1;
 use hive_sdk::{Cell, Client, Command, Output, Selector};
 use hive_types::{Backend, CellSpec, IdleAction, Resources, Source};
@@ -48,7 +49,9 @@ Files:
   rm ID PATH [-r]
 
 Audit:
-  audit verify DIR    checks a node's audit chain in DIR and prints its root, or where it breaks
+  audit verify DIR [--keeper HOST:PORT]...
+                      checks a node's audit chain in DIR and prints its root, or where it breaks.
+                      With --keeper, it also checks the chain against the roots the keeper holds
 
 The socket is $HIVE_SOCKET, or /run/hivebox/comb.sock. The project is $HIVE_PROJECT, or local.
 Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out. `verify` exits 0 when every run passed, 1 when one failed, and 2 when hivebox could not tell. `audit verify` exits 1 when the chain is broken.
@@ -147,7 +150,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
             println!("hivectl {}", env!("CARGO_PKG_VERSION"));
             return Ok(0);
         }
-        "audit" => return audit(&args),
+        "audit" => return audit(&args).await,
         _ => {}
     }
     let endpoint = match (endpoint, socket) {
@@ -752,16 +755,28 @@ fn table<const N: usize>(header: &[&str; N], rows: &[[String; N]]) {
     }
 }
 
-/// `audit verify DIR`, which needs no comb.
-fn audit(args: &Args) -> Result<i32, String> {
-    args.check(&[])?;
+/// `audit verify DIR [--keeper HOST:PORT]...`, which needs no comb.
+async fn audit(args: &Args) -> Result<i32, String> {
+    use hive_telemetry::audit;
+    args.check(&["--keeper"])?;
     let [what, dir] = &args.rest[..] else {
-        return Err("usage: hivectl audit verify DIR".into());
+        return Err("usage: hivectl audit verify DIR [--keeper HOST:PORT]...".into());
     };
     if what != "verify" {
         return Err(format!("audit {what} is not a command"));
     }
-    match hive_telemetry::audit::verify(std::path::Path::new(dir)) {
+    let path = std::path::Path::new(dir);
+    let members = args.all(&["--keeper"]);
+    let (anchors, held) = if members.is_empty() {
+        (Vec::new(), None)
+    } else {
+        let node = audit::node_of(path)
+            .map_err(|e| format!("{dir}: {e}"))?
+            .ok_or_else(|| format!("{dir} holds no audit chain"))?;
+        let chain = keeper_chain(&members, &node).await?;
+        (anchors(&chain)?, Some(chain))
+    };
+    match audit::verify_with(path, &anchors) {
         Err(e) => Err(format!("{dir}: {e}")),
         Ok(Err(broken)) => {
             println!("broken: {broken}");
@@ -770,15 +785,78 @@ fn audit(args: &Args) -> Result<i32, String> {
         Ok(Ok(v)) => {
             let last = if v.sealed { "sealed" } else { "open" };
             println!(
-                "node {}: {} events in {} hours, the last {last}, root {}",
+                "node {}: {} events in {}, the last {last}, root {}",
                 v.node,
                 v.events,
-                v.hours,
+                hours(v.hours),
                 v.root_hex()
             );
+            if let Some(c) = held {
+                println!("the keeper holds {}, and the chain matches them", held_roots(&c));
+            }
             Ok(0)
         }
     }
+}
+
+/// `n` hours, with the plural only where it goes.
+fn hours(n: usize) -> String {
+    if n == 1 { "1 hour".to_string() } else { format!("{n} hours") }
+}
+
+/// What the keeper holds of a chain, said the way `audit verify` prints it.
+fn held_roots(c: &pb::AuditChain) -> String {
+    let sealed = match &c.hours[..] {
+        [] => "no sealed hours".to_string(),
+        [h] => format!("sealed hour {}", h.hour),
+        [first, .., last] => {
+            format!("{} sealed, {} to {}", hours(c.hours.len()), first.hour, last.hour)
+        }
+    };
+    match &c.tip {
+        Some(t) => format!("{sealed} and a tip at {} events", t.seq),
+        None => sealed,
+    }
+}
+
+/// The roots of node `node`'s audit chain the keeper holds, from the first member that answers.
+async fn keeper_chain(members: &[&str], node: &str) -> Result<pb::AuditChain, String> {
+    use hive_proto::internal::keeper_client::KeeperClient;
+    let mut last = String::new();
+    for m in members {
+        let url = if m.contains("://") { (*m).to_owned() } else { format!("http://{m}") };
+        let channel = match tonic::transport::Endpoint::from_shared(url) {
+            Ok(e) => e.connect_timeout(Duration::from_secs(2)),
+            Err(e) => return Err(format!("keeper {m}: {e}")),
+        };
+        let req = pb::GetAuditChainRequest { node: node.to_owned() };
+        match KeeperClient::new(channel.connect_lazy()).get_audit_chain(req).await {
+            Ok(r) => return Ok(r.into_inner()),
+            Err(s) if s.code() == tonic::Code::NotFound => return Err(s.message().to_owned()),
+            Err(s) => last = format!("keeper {m}: {}", s.message()),
+        }
+    }
+    Err(last)
+}
+
+/// What the chain has to match: the end of each sealed hour the keeper holds, and its tip.
+fn anchors(c: &pb::AuditChain) -> Result<Vec<(u64, [u8; 32])>, String> {
+    let hash = |b: &[u8]| {
+        <[u8; 32]>::try_from(b)
+            .map_err(|_| "the keeper sent a hash that is not 32 bytes".to_string())
+    };
+    let mut out = Vec::with_capacity(c.hours.len() + 1);
+    for h in &c.hours {
+        out.push((h.first_seq.saturating_add(h.count), hash(&h.root)?));
+        // The first hour held starts where the hour before it ended, which may not be held.
+        out.push((h.first_seq, hash(&h.prev)?));
+    }
+    if let Some(t) = &c.tip {
+        out.push((t.seq, hash(&t.root)?));
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -833,5 +911,20 @@ mod tests {
         assert_eq!(remote("./a:b"), None);
         assert_eq!(remote("/tmp/x"), None);
         assert_eq!(remote(":x"), None);
+    }
+
+    #[test]
+    fn what_the_keeper_holds_reads_as_said() {
+        let hour = |h: &str| pb::AuditHour { hour: h.into(), ..Default::default() };
+        let mut c = pb::AuditChain::default();
+        assert_eq!(held_roots(&c), "no sealed hours");
+        c.tip = Some(pb::AuditTip { seq: 200, ..Default::default() });
+        assert_eq!(held_roots(&c), "no sealed hours and a tip at 200 events");
+        c.hours.push(hour("2026-10-07T09"));
+        assert_eq!(held_roots(&c), "sealed hour 2026-10-07T09 and a tip at 200 events");
+        c.hours.push(hour("2026-10-07T10"));
+        c.tip = None;
+        assert_eq!(held_roots(&c), "2 hours sealed, 2026-10-07T09 to 2026-10-07T10");
+        assert_eq!(hours(1), "1 hour");
     }
 }

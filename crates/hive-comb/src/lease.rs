@@ -11,9 +11,17 @@
 //! machine's clock. The cells keep running while the comb is down, and nothing else stops them
 //! once the lease is gone and the keeper gives the node to another comb, so a comb that cannot
 //! register again before then stops them itself.
+//!
+//! Each renewal also carries the roots of the comb's audit chain: the hours it sealed since the
+//! last one the keeper holds, and how far the chain has got. The keeper refuses roots that do
+//! not follow on from the ones it holds, which the comb reports, and the renewal goes through
+//! either way.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
+
+use hive_telemetry::audit::{self, AuditLog};
 
 use hive_proto::internal as pb;
 use hive_proto::internal::keeper_client::KeeperClient;
@@ -35,6 +43,13 @@ const RETRY: Duration = Duration::from_millis(500);
 
 /// The longest wait between tries to register.
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The most sealed hours one renewal carries, as many as the keeper takes at once.
+const AUDIT_HOURS: usize = 64;
+
+/// The audit log whose roots go with each renewal, and the directory it is in. It is set once
+/// the comb has opened the log, and holds it weakly, so the comb closing the log is not held up.
+pub type AuditLink = Arc<OnceLock<(Weak<AuditLog>, PathBuf)>>;
 
 /// The node this comb is, as the keeper gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,10 +102,19 @@ impl Keeper {
     }
 
     /// Renews once, the same way.
-    async fn renew(&mut self, l: Lease) -> Result<Lease, tonic::Status> {
-        let req = pb::RenewRequest { node: u32::from(l.node), epoch: u32::from(l.epoch) };
+    async fn renew(
+        &mut self,
+        l: Lease,
+        (audit_hours, audit_tip): Roots,
+    ) -> Result<pb::Lease, tonic::Status> {
+        let req = pb::RenewRequest {
+            node: u32::from(l.node),
+            epoch: u32::from(l.epoch),
+            audit_hours,
+            audit_tip,
+        };
         let r = self.members[self.at].1.renew(req).await;
-        self.next_on_failure(r).map(|l| lease(&l))
+        self.next_on_failure(r)
     }
 
     fn next_on_failure<T>(
@@ -203,12 +227,14 @@ pub async fn keep(
     mut l: Lease,
     since: Instant,
     file: PathBuf,
+    audit: AuditLink,
     stop: CancellationToken,
 ) -> Result<(), String> {
     let mut wait = l.ttl / 3;
     let mut ends = since + l.ttl;
     let mut said = false;
     let mut unwritten = false;
+    let mut roots = Publisher::default();
     loop {
         tokio::select! {
             () = stop.cancelled() => return Ok(()),
@@ -221,8 +247,11 @@ pub async fn keep(
                 l.node, l.epoch
             ));
         }
-        match keeper.renew(l).await {
-            Ok(renewed) => {
+        let sending = roots.next(&audit).await;
+        match keeper.renew(l, sending).await {
+            Ok(got) => {
+                roots.got(got.audit_hour.clone(), &got.audit_refused);
+                let renewed = lease(&got);
                 ends = sent + renewed.ttl;
                 match write(&file, renewed, Some(until(wall, renewed))) {
                     Ok(()) => unwritten = false,
@@ -256,6 +285,90 @@ pub async fn keep(
             }
         }
     }
+}
+
+/// What a renewal carries of the audit chain: sealed hours and the tip.
+type Roots = (Vec<pb::AuditHour>, Option<pb::AuditTip>);
+
+/// Works out which audit roots go with the next renewal.
+#[derive(Debug, Default)]
+struct Publisher {
+    /// The last sealed hour the keeper holds, once a renewal has said.
+    held: Option<String>,
+    /// The hours found after `held` when the log had sealed this many, which go again until the
+    /// keeper takes them.
+    found: Option<(String, u64, Vec<pb::AuditHour>)>,
+    /// The last refusal reported, so it is said once and not on every renewal.
+    refused: String,
+    /// The tip that went with the last renewal, and the one the keeper took, so a tip that has
+    /// not moved is not sent again and a quiet node's renewals stay small.
+    sent: Option<(u64, Vec<u8>)>,
+    taken: Option<(u64, Vec<u8>)>,
+}
+
+impl Publisher {
+    async fn next(&mut self, link: &AuditLink) -> Roots {
+        let Some((log, dir)) =
+            link.get().and_then(|(log, dir)| Some((log.upgrade()?, dir.clone())))
+        else {
+            return Roots::default();
+        };
+        let (tip, sealed) = (log.tip(), log.stats().sealed);
+        drop(log);
+        let mut tip = (tip.seq > 0).then(|| pb::AuditTip {
+            hour: tip.hour,
+            seq: tip.seq,
+            root: tip.root.to_vec(),
+            at_ms: 0,
+        });
+        self.sent = tip.as_ref().map(|t| (t.seq, t.root.clone()));
+        if self.sent.is_some() && self.sent == self.taken {
+            tip = None;
+        }
+        // The first renewal finds out from the keeper where to start.
+        let Some(held) = self.held.clone() else { return (Vec::new(), tip) };
+        if let Some((h, n, hours)) = &self.found
+            && *h == held
+            && *n == sealed
+        {
+            return (hours.clone(), tip);
+        }
+        let after = held.clone();
+        let read = tokio::task::spawn_blocking(move || audit::seals(&dir, &after, AUDIT_HOURS));
+        let hours: Vec<_> = match read.await {
+            Ok(Ok(seals)) => seals.into_iter().filter_map(|s| hour(&s)).collect(),
+            Ok(Err(e)) => {
+                eprintln!("hive-comb: reading the audit seals: {e}");
+                Vec::new()
+            }
+            Err(_) => Vec::new(),
+        };
+        self.found = Some((held, sealed, hours.clone()));
+        (hours, tip)
+    }
+
+    fn got(&mut self, held: String, refused: &str) {
+        if refused != self.refused {
+            if !refused.is_empty() {
+                eprintln!("hive-comb: the keeper refused the audit roots: {refused}");
+            }
+            self.refused = refused.to_owned();
+        }
+        if refused.is_empty() {
+            self.taken = self.sent.take();
+        }
+        self.held = Some(held);
+    }
+}
+
+fn hour(s: &audit::Seal) -> Option<pb::AuditHour> {
+    Some(pb::AuditHour {
+        hour: s.hour.clone(),
+        first_seq: s.first_seq,
+        count: s.count,
+        prev: audit::unhex(&s.prev)?.to_vec(),
+        root: audit::unhex(&s.root)?.to_vec(),
+    })
 }
 
 /// Whether a failed call is worth trying again: the keeper or its leader was out of reach, or
@@ -328,4 +441,44 @@ fn until(wall: u64, l: Lease) -> u64 {
 fn now_ms() -> u64 {
     let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hive_telemetry::AuditEvent;
+
+    #[tokio::test]
+    async fn a_tip_the_keeper_has_taken_is_not_sent_again() {
+        let dir = std::env::temp_dir().join(format!("hive-comb-tip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = Arc::new(AuditLog::open(&dir, "node-a").unwrap());
+        let link = AuditLink::default();
+        link.set((Arc::downgrade(&log), dir.clone())).unwrap();
+        let mut p = Publisher::default();
+        let seq = |r: &Roots| r.1.as_ref().map(|t| t.seq);
+
+        // Nothing recorded yet, so there is no tip.
+        assert_eq!(seq(&p.next(&link).await), None);
+        log.record(AuditEvent { op: "exec.run".into(), ..AuditEvent::default() });
+        log.flush().unwrap();
+        assert_eq!(seq(&p.next(&link).await), Some(1));
+        // A renewal that failed took nothing, so the tip goes again, and once it is taken it
+        // stops going until it moves.
+        assert_eq!(seq(&p.next(&link).await), Some(1));
+        p.got(String::new(), "");
+        assert_eq!(seq(&p.next(&link).await), None);
+        p.got(String::new(), "");
+        assert_eq!(seq(&p.next(&link).await), None);
+        log.record(AuditEvent { op: "exec.run".into(), ..AuditEvent::default() });
+        log.flush().unwrap();
+        assert_eq!(seq(&p.next(&link).await), Some(2));
+        // A refused tip is sent again.
+        p.got(String::new(), "refused");
+        assert_eq!(seq(&p.next(&link).await), Some(2));
+
+        drop(log);
+        assert_eq!(p.next(&link).await, Roots::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

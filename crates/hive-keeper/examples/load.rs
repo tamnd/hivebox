@@ -1,7 +1,7 @@
 //! Drives a keeper group the way a cluster of combs would and prints what it measured.
 //!
 //! ```text
-//! cargo run --release -p hive-keeper --example load -- ADDR NODES SECONDS
+//! cargo run --release -p hive-keeper --example load -- ADDR NODES SECONDS [audit]
 //! cargo run --release -p hive-keeper --example load -- leader ADDR
 //! cargo run --release -p hive-keeper --example load -- nodes ADDR
 //! cargo run --release -p hive-keeper --example load -- key ADDR PROJECT
@@ -11,8 +11,12 @@
 //!
 //! It registers `NODES` combs through the member at `ADDR`, then renews each lease once a second
 //! for `SECONDS`, the way combs keep their leases, and also makes a project and a key every
-//! 100 ms. At the end it prints the call counts, the failures and the latency of each kind.
+//! 100 ms. At the end it prints the call counts, the failures and the latency of each kind. With
+//! `audit`, each renewal carries an audit tip 40 events on from the last, and every tenth one a
+//! sealed hour too, the way a comb publishes its audit roots.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hive_proto::internal as pb;
@@ -80,9 +84,13 @@ async fn main() {
         println!("{}", c.revoke_key(req).await.unwrap().into_inner().revoked_ms);
         return;
     }
-    let [addr, nodes, secs] = &args[..] else {
-        eprintln!("usage: load ADDR NODES SECONDS");
-        std::process::exit(2);
+    let (addr, nodes, secs, audit) = match &args[..] {
+        [addr, nodes, secs] => (addr, nodes, secs, false),
+        [addr, nodes, secs, a] if a == "audit" => (addr, nodes, secs, true),
+        _ => {
+            eprintln!("usage: load ADDR NODES SECONDS [audit]");
+            std::process::exit(2);
+        }
     };
     let nodes: u32 = nodes.parse().expect("NODES is a number");
     let secs: u64 = secs.parse().expect("SECONDS is a number");
@@ -116,19 +124,30 @@ async fn main() {
     print_latency("register", &mut register);
 
     let deadline = Instant::now() + Duration::from_secs(secs);
+    let refused = Arc::new(AtomicU64::new(0));
     let renews = leases.into_iter().map(|l| {
         let mut c = client.clone();
+        let refused = refused.clone();
         async move {
             let mut took = Vec::new();
             let mut failed = 0u32;
             // Spread the renewals over the second so they do not all land at once.
             tokio::time::sleep(Duration::from_millis(u64::from(l.node) * 1000 / 1024 % 1000)).await;
             let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut chain = Chain::default();
             while Instant::now() < deadline {
                 tick.tick().await;
+                let (audit_hours, audit_tip) =
+                    if audit { chain.next() } else { (Vec::new(), None) };
+                let req = pb::RenewRequest { node: l.node, epoch: l.epoch, audit_hours, audit_tip };
                 let t = Instant::now();
-                match c.renew(pb::RenewRequest { node: l.node, epoch: l.epoch }).await {
-                    Ok(_) => took.push(t.elapsed()),
+                match c.renew(req).await {
+                    Ok(got) => {
+                        took.push(t.elapsed());
+                        if !got.get_ref().audit_refused.is_empty() {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     Err(_) => failed += 1,
                 }
             }
@@ -176,6 +195,9 @@ async fn main() {
         all.len() as f64 / elapsed
     );
     print_latency("renew", &mut all);
+    if audit {
+        println!("audit roots refused on {} renewals", refused.load(Ordering::Relaxed));
+    }
     println!("project and key: {} pairs", admin.len());
     print_latency("project and key", &mut admin);
 }
@@ -187,4 +209,35 @@ fn print_latency(what: &str, took: &mut [Duration]) {
     took.sort_unstable();
     let at = |p: usize| took[(took.len() * p / 100).min(took.len() - 1)].as_secs_f64() * 1000.0;
     println!("{what}: p50 {:.2} ms, p99 {:.2} ms, max {:.2} ms", at(50), at(99), at(100));
+}
+
+/// A made up audit chain that grows by 40 events a renewal and seals an hour every tenth one.
+#[derive(Default)]
+struct Chain {
+    renewals: u64,
+    /// The first sequence number of the open hour, and the root of the hour before it.
+    open: (u64, [u8; 32]),
+}
+
+impl Chain {
+    fn next(&mut self) -> (Vec<pb::AuditHour>, Option<pb::AuditTip>) {
+        self.renewals += 1;
+        let (seq, n) = (self.renewals * 40, self.renewals / 10);
+        let root = |seq: u64| *blake3::hash(&seq.to_le_bytes()).as_bytes();
+        let hour = |n: u64| format!("2026-10-{:02}T{:02}", 1 + n / 24, n % 24);
+        let mut hours = Vec::new();
+        if self.renewals.is_multiple_of(10) {
+            let (first_seq, prev) = self.open;
+            hours.push(pb::AuditHour {
+                hour: hour(n - 1),
+                first_seq,
+                count: seq - first_seq,
+                prev: prev.to_vec(),
+                root: root(seq).to_vec(),
+            });
+            self.open = (seq, root(seq));
+        }
+        let tip = pb::AuditTip { hour: hour(n), seq, root: root(seq).to_vec(), at_ms: 0 };
+        (hours, Some(tip))
+    }
 }
