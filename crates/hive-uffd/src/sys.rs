@@ -340,33 +340,48 @@ pub(crate) fn memfd(name: &str) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Sends `data` and the descriptor `fd` in one message, the way Firecracker hands over its
-/// userfaultfd.
-pub(crate) fn send_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> io::Result<()> {
+/// The most descriptors one message carries.
+const MAX_FDS: usize = 4;
+
+/// Sends `data` and the descriptors `fds` in one message, the way Firecracker hands over its
+/// userfaultfd. The receiver gets its own copies.
+pub(crate) fn send_fds(stream: &UnixStream, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    assert!(!fds.is_empty() && fds.len() <= MAX_FDS, "one to four descriptors");
     let mut space = [0u8; 64];
     let mut iov = libc::iovec { iov_base: data.as_ptr().cast_mut().cast(), iov_len: data.len() };
+    let bytes = u32::try_from(size_of_val(fds)).unwrap_or(u32::MAX);
     // SAFETY: an all zero msghdr is valid, and every pointer set below outlives the call.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &raw mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = space.as_mut_ptr().cast();
     // SAFETY: CMSG_SPACE only does arithmetic.
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as _;
-    // SAFETY: the control buffer is big enough for one descriptor, so the first header is in it.
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(bytes) } as _;
+    // SAFETY: the control buffer is big enough for four descriptors, so the first header and all
+    // of `fds` fit in it.
     unsafe {
         let c = libc::CMSG_FIRSTHDR(&raw const msg);
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<RawFd>(), fd);
+        (*c).cmsg_len = libc::CMSG_LEN(bytes) as _;
+        let at = libc::CMSG_DATA(c).cast::<RawFd>();
+        for (i, fd) in fds.iter().enumerate() {
+            std::ptr::write_unaligned(at.add(i), *fd);
+        }
     }
     // SAFETY: `msg` points at live buffers, and the socket is open.
-    let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const msg, 0) };
+    let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const msg, libc::MSG_NOSIGNAL) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
-/// Reads one message into `buf` and the descriptor sent with it. Returns the length read.
-pub(crate) fn recv_fd(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
+/// Sends `data` and one descriptor in one message.
+pub(crate) fn send_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> io::Result<()> {
+    send_fds(stream, data, &[fd])
+}
+
+/// Reads one message into `buf` and the descriptors sent with it. Returns the length read, which
+/// is 0 once the other side hung up.
+pub(crate) fn recv_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
     let mut space = [0u8; 64];
     let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
     // SAFETY: an all zero msghdr is valid, and every pointer set below outlives the call.
@@ -380,20 +395,49 @@ pub(crate) fn recv_fd(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize,
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut fd = None;
+    let mut fds = Vec::new();
     // SAFETY: the kernel filled the control buffer and set its length, so walking it with the
-    // CMSG macros stays inside it.
+    // CMSG macros stays inside it, and each descriptor in it is new and owned by nothing else.
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&raw const msg);
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let raw = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<RawFd>());
-                fd = Some(OwnedFd::from_raw_fd(raw));
+                let data = libc::CMSG_DATA(c);
+                let len = (*c).cmsg_len as usize - (data as usize - c as usize);
+                for i in 0..len / size_of::<RawFd>() {
+                    let raw = std::ptr::read_unaligned(data.cast::<RawFd>().add(i));
+                    fds.push(OwnedFd::from_raw_fd(raw));
+                }
             }
             c = libc::CMSG_NXTHDR(&raw const msg, c);
         }
     }
-    Ok((n as usize, fd))
+    Ok((n as usize, fds))
+}
+
+/// Reads one message into `buf` and the first descriptor sent with it.
+pub(crate) fn recv_fd(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
+    let (n, fds) = recv_fds(stream, buf)?;
+    Ok((n, fds.into_iter().next()))
+}
+
+/// A connected pair of Unix sockets that keep the bounds of each message, closed on exec.
+pub(crate) fn seqpacket_pair() -> io::Result<(UnixStream, UnixStream)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` has room for the two descriptors the call writes.
+    let r = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just made and are owned by nothing else.
+    Ok(unsafe { (UnixStream::from_raw_fd(fds[0]), UnixStream::from_raw_fd(fds[1])) })
 }
 
 /// Waits until `a` or `b` can be read or hung up, or `timeout_ms` passes. Returns which of the two

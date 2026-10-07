@@ -1,5 +1,6 @@
 //! One restored VM's memory, served from the snapshot's memory file as the VM touches it.
 
+use crate::hand::{self, Hello, Report};
 use crate::sys::{self, Event, Map, Uffd};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -220,6 +221,8 @@ pub struct Session {
     /// Whether a prefetch maps pages in, which it does until the kernel says the VM's memory is
     /// not registered for minor faults.
     map_in: bool,
+    /// Where to say what the guest gives back, and the VM's number there.
+    report: Option<(Arc<UnixStream>, u64)>,
 }
 
 impl Session {
@@ -230,29 +233,47 @@ impl Session {
     /// The VMM sends no descriptor, regions that do not parse, or a region that runs past the end
     /// of the memory file.
     pub fn accept(stream: UnixStream, memory: Arc<Memory>) -> io::Result<Self> {
-        let mut buf = vec![0u8; 64 << 10];
-        let (n, fd) = sys::recv_fd(&stream, &mut buf)?;
-        let fd = fd.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "the VMM sent no userfaultfd")
-        })?;
-        let regions = Region::parse(&buf[..n])?;
+        Self::start(Hello::read(stream)?, memory)
+    }
+
+    /// Takes a VM handed over whole, and wakes every thread waiting on its memory. That costs
+    /// nothing for a VM no one served yet. For a VM whose server died, it sends each thread whose
+    /// fault the old server read and never answered back to fault again, so this one sees it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Session::accept`], or the wake fails.
+    pub fn start(hello: Hello, memory: Arc<Memory>) -> io::Result<Self> {
+        let Hello { text, uffd, stream, removed } = hello;
+        let regions = Region::parse(&text)?;
         if let Some(r) = regions.iter().find(|r| r.offset.saturating_add(r.size) > memory.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("region {r:?} runs past the {} byte memory file", memory.len()),
             ));
         }
+        let uffd = Uffd::from(uffd);
+        for r in &regions {
+            uffd.wake(r.base, r.size)?;
+        }
         Ok(Self {
-            uffd: Uffd::from(fd),
+            uffd,
             stream,
             regions,
-            removed: Vec::new(),
+            removed,
             pending: VecDeque::new(),
             trace: Vec::new(),
             stats: Stats::default(),
             map_in: memory.in_memory(),
             memory,
+            report: None,
         })
+    }
+
+    /// Sends a [`Report::Removed`] for VM `id` to `to` each time the guest gives memory back, so
+    /// whoever hands the VM to the next server can tell it.
+    pub fn report_to(&mut self, to: Arc<UnixStream>, id: u64) {
+        self.report = Some((to, id));
     }
 
     /// The regions the VMM sent.
@@ -393,17 +414,14 @@ impl Session {
 
     fn remove(&mut self, start: u64, end: u64) {
         self.stats.removes += 1;
+        if let Some((to, id)) = &self.report
+            && let Err(e) = (Report::Removed { id: *id, start, end }).send(to)
+        {
+            eprintln!("hive-uffd: vm {id}: reporting memory given back: {e}");
+        }
         self.removed.push((start, end));
         // Neighbouring and overlapping ranges become one, so a fault checks as few as it can.
-        self.removed.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.removed.len());
-        for &(s, e) in &self.removed {
-            match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
-            }
-        }
-        self.removed = merged;
+        self.removed = hand::merge(std::mem::take(&mut self.removed));
     }
 
     /// Fills file offsets `start..end` of region `r`, page by page past any that are there.
@@ -820,6 +838,108 @@ mod tests {
         let s = handle.join().unwrap().stats();
         assert_eq!(s.prefetched, 64 * PAGE as u64);
         assert_eq!((s.faults, s.mapped), (1, 0));
+    }
+
+    #[test]
+    fn a_vm_handed_over_is_served_at_the_other_end() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let mem = memory(&dir.0, 16);
+        let sock = dir.0.join("uffd.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let guest = Guest::connect(&sock, 16 * PAGE).unwrap();
+        let hello = Hello::read(listener.accept().unwrap().0).unwrap();
+        let (a, b) = hand::pair().unwrap();
+        hello.send(&a, 7).unwrap();
+        let (id, got) = Hello::receive(&b).unwrap().unwrap();
+        assert_eq!((id, &got.text), (7, &hello.text));
+        // The sender's copies go, and the ones handed over keep the VM covered.
+        drop(hello);
+        let mut s = Session::start(got, mem).unwrap();
+        let served = std::thread::spawn(move || s.serve().map(|()| s.stats()));
+        assert_eq!(guest.touch(3 * PAGE), expect(3));
+        drop(guest);
+        assert_eq!(served.join().unwrap().unwrap().faults, 1);
+        drop(a);
+        assert!(Hello::receive(&b).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_fault_the_last_server_read_and_never_answered_comes_again() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let mem = memory(&dir.0, 64);
+        let sock = dir.0.join("uffd.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let guest = Arc::new(Guest::connect(&sock, 64 * PAGE).unwrap());
+        let hello = Hello::read(listener.accept().unwrap().0).unwrap();
+        let toucher = {
+            let guest = guest.clone();
+            std::thread::spawn(move || guest.touch(9 * PAGE))
+        };
+        // The first server reads the fault and dies before it answers.
+        let first = Uffd::from(hello.uffd.try_clone().unwrap());
+        let event = loop {
+            match first.read().unwrap() {
+                Some(e) => break e,
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+        assert!(matches!(event, Event::Fault { minor: false, .. }), "{event:?}");
+        drop(first);
+        let mut s = Session::start(hello, mem).unwrap();
+        let served = std::thread::spawn(move || s.serve().map(|()| s.stats()));
+        assert_eq!(toucher.join().unwrap(), expect(9));
+        drop(guest);
+        assert_eq!(served.join().unwrap().unwrap().faults, 1);
+    }
+
+    #[test]
+    fn memory_given_back_before_a_hand_over_still_reads_as_zeros() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let mem = memory(&dir.0, 64);
+        let sock = dir.0.join("uffd.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut guest = Guest::connect(&sock, 64 * PAGE).unwrap();
+        let mut hello = Hello::read(listener.accept().unwrap().0).unwrap();
+        let discard = std::thread::spawn(move || {
+            guest.discard(10 * PAGE, 3 * PAGE).unwrap();
+            guest
+        });
+        // The first server reads that the guest gave the pages back, says so, and dies.
+        let first = Uffd::from(hello.uffd.try_clone().unwrap());
+        let event = loop {
+            match first.read().unwrap() {
+                Some(e) => break e,
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+        let Event::Remove { start, end } = event else { panic!("{event:?}") };
+        let (a, b) = hand::pair().unwrap();
+        Report::Removed { id: 7, start, end }.send(&a).unwrap();
+        drop(first);
+        let guest = discard.join().unwrap();
+        let Some(Report::Removed { id: 7, start, end }) = Report::receive(&b).unwrap() else {
+            panic!("no report")
+        };
+        hello.gave_back(start, end);
+        hello.send(&a, 7).unwrap();
+        let (_, got) = Hello::receive(&b).unwrap().unwrap();
+        drop(hello);
+        let mut s = Session::start(got, mem).unwrap();
+        let served = std::thread::spawn(move || s.serve().map(|()| s.stats()));
+        assert!(guest.bytes(10 * PAGE, 3 * PAGE).iter().all(|&b| b == 0));
+        assert_eq!(guest.touch(13 * PAGE), expect(13));
+        drop(guest);
+        let st = served.join().unwrap().unwrap();
+        assert_eq!((st.faults, st.zero_faults), (1, 3));
     }
 
     #[test]
