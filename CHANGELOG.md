@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The drone's seccomp filter looks at `ioctl` requests. Terminal, socket, file flag and reflink requests pass, `TIOCSTI` and the ext4 extent swaps fail with EPERM, and the rest, `XFS_IOC_SWAPEXT` among them, fail with ENOTTY. The three filters are now one program, so an allowed `ioctl` costs 149 to 185 ns more than with no filter on server3, not 795 to 1,006 ns. `/proc/kpagecount` is masked in containers, as `kpagecgroup` and `kpageflags` were.
+
 ## 0.0.33
 
 Cell quarantine, and security events sent to a SIEM.

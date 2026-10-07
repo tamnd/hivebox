@@ -28,9 +28,9 @@ const CAPS: [&str; 14] = [
     "CAP_AUDIT_WRITE",
 ];
 
-/// Kernel files a cell has no business reading. The last three are from DSec, where reading them
-/// from a container took a host down.
-const MASKED: [&str; 14] = [
+/// Kernel files a cell has no business reading. The `kpage` files and debugfs are from DSec, where
+/// a `grep -r /` in a container read them and took the host down.
+const MASKED: [&str; 15] = [
     "/proc/acpi",
     "/proc/asound",
     "/proc/interrupts",
@@ -44,6 +44,7 @@ const MASKED: [&str; 14] = [
     "/sys/devices/virtual/powercap",
     "/proc/kpagecgroup",
     "/proc/kpageflags",
+    "/proc/kpagecount",
     "/sys/kernel/debug",
 ];
 
