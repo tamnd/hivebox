@@ -17,6 +17,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json", "std"] }
 
