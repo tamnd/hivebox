@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::BlobId;
 
-/// One layer: the two blobs `mkfs.erofs` made from one tar.
+/// One layer: the two blobs built from one tar.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerRef {
     /// The layer's name, the BLAKE3 hash of its metadata blob's name followed by its data

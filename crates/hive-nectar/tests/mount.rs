@@ -1,7 +1,7 @@
 //! Mounting an imported image as it would be for container cells. It needs root, a kernel with
-//! EROFS and loop devices, `HIVE_MKFS_EROFS` and `HIVE_OCI_LAYOUT` as the import tests do, and
-//! passes without doing anything otherwise. The lazy test also needs the `nbd` module, and takes
-//! the image from the bucket at `HB_S3_URL` when that is set.
+//! EROFS and loop devices, and `HIVE_OCI_LAYOUT` as the import tests do, and passes without doing
+//! anything otherwise. Layers are built with `HIVE_MKFS_EROFS` when that is set. The lazy test also
+//! needs the `nbd` module, and takes the image from the bucket at `HB_S3_URL` when that is set.
 
 #![cfg(target_os = "linux")]
 
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hive_nectar::cas::Cuts;
-use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
+use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
 use hive_nectar::mount::{IdMap, Layers};
 use hive_nectar::oci::{Importer, Platform};
 use hive_nectar::{BlobStore, Cache, PosixStore, S3Config, S3Store};
@@ -38,10 +38,8 @@ fn mounts_under(dir: &Path) -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_image_mounts_once_idmapped_and_goes_away_cleanly() {
-    let (Some(program), Some(layout)) =
-        (std::env::var_os("HIVE_MKFS_EROFS"), std::env::var_os("HIVE_OCI_LAYOUT"))
-    else {
-        eprintln!("skipped: set HIVE_MKFS_EROFS and HIVE_OCI_LAYOUT to run it");
+    let Some(layout) = std::env::var_os("HIVE_OCI_LAYOUT") else {
+        eprintln!("skipped: set HIVE_OCI_LAYOUT to run it");
         return;
     };
     if !rustix::process::geteuid().is_root() {
@@ -52,8 +50,7 @@ async fn an_image_mounts_once_idmapped_and_goes_away_cleanly() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let store: Arc<dyn BlobStore> = Arc::new(PosixStore::open(dir.join("store")).unwrap());
-    let importer =
-        Importer::new(Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap(), dir.join("work")).unwrap();
+    let importer = Importer::new(builder(), dir.join("work")).unwrap();
     let image =
         importer.import_layout(&*store, layout.as_ref(), &Platform::default()).await.unwrap();
     let m = &image.manifest;
@@ -175,10 +172,8 @@ fn digest_tree(dir: &Path) -> (BTreeMap<PathBuf, String>, u64) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
-    let (Some(program), Some(layout)) =
-        (std::env::var_os("HIVE_MKFS_EROFS"), std::env::var_os("HIVE_OCI_LAYOUT"))
-    else {
-        eprintln!("skipped: set HIVE_MKFS_EROFS and HIVE_OCI_LAYOUT to run it");
+    let Some(layout) = std::env::var_os("HIVE_OCI_LAYOUT") else {
+        eprintln!("skipped: set HIVE_OCI_LAYOUT to run it");
         return;
     };
     if !rustix::process::geteuid().is_root() || !Path::new("/sys/block/nbd0").exists() {
@@ -192,8 +187,7 @@ async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
         Ok(url) => Arc::new(S3Store::new(S3Config::from_url_and_env(&url).unwrap()).unwrap()),
         Err(_) => Arc::new(PosixStore::open(dir.join("store")).unwrap()),
     };
-    let mut importer =
-        Importer::new(Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap(), dir.join("work")).unwrap();
+    let mut importer = Importer::new(builder(), dir.join("work")).unwrap();
     // With HIVE_DEDUP=chunks the data is kept as chunks, and both mounts read through recipes.
     let chunked = std::env::var("HIVE_DEDUP").is_ok_and(|d| d == "chunks");
     if chunked {
@@ -288,4 +282,11 @@ async fn an_image_mounts_lazily_and_reads_the_same_as_a_whole_fetch() {
     assert_eq!(nbd_in_use(), in_use, "every NBD device was freed");
     assert_eq!(cache.usage().pinned, 0);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn builder() -> Builder {
+    match std::env::var_os("HIVE_MKFS_EROFS") {
+        Some(program) => Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap().into(),
+        None => Writer::new(DEFAULT_CHUNK_SIZE).unwrap().into(),
+    }
 }

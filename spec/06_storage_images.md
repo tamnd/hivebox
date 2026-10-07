@@ -32,7 +32,7 @@ LayerRef   := { digest: Blake3, kind: Base|Workspace|Toolkit|Snapshot,
 
 ### 3.1 EROFS layer blobs
 
-- Layers are built with `mkfs.erofs` (erofs-utils 1.7 or newer, since 1.7 is the first with `--tar` and `--blobdev` together, and Ubuntu 24.04 ships it), invoked by `hive-imaged`. A pure-Rust writer (`erofs-rs`/`am-fs-erofs`) is tracked as a future option. We keep a Rust reader (`erofs-rs`) for indexing, verification and tracing.
+- Layers are built by the writer in `hive-nectar`, which reads the tar as it streams in and writes the same format as `mkfs.erofs --tar=f --blobdev` (erofs-utils 1.7 or newer): chunk based files in the data blob, and inodes, dirents, xattrs and chunk indexes in the metadata blob. `mkfs.erofs` can still be used instead with `[images] mkfs` or `--mkfs`. We keep a Rust reader (`erofs-rs`) for indexing, verification and tracing.
 - Multi-device blob split: a metadata blob (inodes, dirents, xattrs, chunk indexes) plus one or more data blobs. Metadata blobs are small (typically under 1-2% of the layer) and are pushed to every node that may run the image.
 - Data uses a chunk-based layout with chunk size 64 KiB to 1 MiB. The default is 256 KiB, which matches DSec's OverlayBD fetch unit.
 - Compression: workspaces and toolkits use `lz4hc` (fast decompress) or `zstd` level 3. Bases intended for pmem+DAX stay uncompressed, because DAX requires uncompressed inodes.

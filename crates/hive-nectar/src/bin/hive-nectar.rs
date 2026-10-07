@@ -22,11 +22,11 @@
 //! `relayout` stores a copy of each traced layer's data with the traced chunks first and prints
 //! the name of the relaid image, whose lazy mounts fetch from the copies.
 //!
-//! Imports take `--mkfs PATH` for a `mkfs.erofs` that is not on the path, `--chunk BYTES` for
-//! the layer chunk size, and `--dedup chunks` to keep data blobs as content addressed chunks, so
-//! layers that share files share them in the store. `--cas-avg BYTES` sets the average size of
-//! those chunks, 64 KiB by default. They remember built layers in `--work DIR`,
-//! which is `STORE/import` by default.
+//! Imports build layers in process, or with the `mkfs.erofs` at `--mkfs PATH`. They take
+//! `--chunk BYTES` for the layer chunk size, and `--dedup chunks` to keep data blobs as content
+//! addressed chunks, so layers that share files share them in the store. `--cas-avg BYTES` sets
+//! the average size of those chunks, 64 KiB by default. They remember built layers in
+//! `--work DIR`, which is `STORE/import` by default.
 //!
 //! `run --commit on` commits what the command wrote as `commit` does.
 //!
@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hive_nectar::cas::{self, Chunked, Cuts};
-use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
+use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
 use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 
@@ -310,9 +310,11 @@ fn importer(flags: &HashMap<String, String>, work: PathBuf) -> Result<Importer, 
     };
     let chunk = u32::try_from(number("chunk", DEFAULT_CHUNK_SIZE.into())?)
         .map_err(|_| "--chunk is too big")?;
-    let program = flags.get("mkfs").map_or_else(|| "mkfs.erofs".into(), PathBuf::from);
-    let mkfs = Mkfs::new(program, chunk).map_err(|e| e.to_string())?;
-    let importer = Importer::new(mkfs, work).map_err(|e| e.to_string())?;
+    let builder: Builder = match flags.get("mkfs") {
+        Some(program) => Mkfs::new(program, chunk).map_err(|e| e.to_string())?.into(),
+        None => Writer::new(chunk).map_err(|e| e.to_string())?.into(),
+    };
+    let importer = Importer::new(builder, work).map_err(|e| e.to_string())?;
     match flags.get("dedup").map(String::as_str) {
         None => Ok(importer),
         Some("chunks") => {

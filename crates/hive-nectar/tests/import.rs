@@ -1,13 +1,13 @@
-//! Imports with a real `mkfs.erofs`. They need `HIVE_MKFS_EROFS` pointing at one, and pass
-//! without doing anything when it is not set. The OCI test also needs `HIVE_OCI_LAYOUT`, an image
-//! layout such as `docker save` writes, unpacked.
+//! Imports with the writer in this crate, or with the `mkfs.erofs` at `HIVE_MKFS_EROFS` when that
+//! is set. The OCI test also needs `HIVE_OCI_LAYOUT`, an image layout such as `docker save` writes,
+//! unpacked, and passes without doing anything when it is not set.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use hive_nectar::cas::{Chunked, Cuts};
-use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs, superblock};
+use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer, superblock};
 use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobStore, Cache, PosixStore};
 
@@ -33,12 +33,11 @@ impl Drop for Scratch {
     }
 }
 
-fn mkfs() -> Option<Mkfs> {
-    let Some(program) = std::env::var_os("HIVE_MKFS_EROFS") else {
-        eprintln!("skipped: set HIVE_MKFS_EROFS to run it");
-        return None;
-    };
-    Some(Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap())
+fn builder() -> Builder {
+    match std::env::var_os("HIVE_MKFS_EROFS") {
+        Some(program) => Mkfs::new(program, DEFAULT_CHUNK_SIZE).unwrap().into(),
+        None => Writer::new(DEFAULT_CHUNK_SIZE).unwrap().into(),
+    }
 }
 
 /// A small root filesystem tar: a file big enough for a few chunks, a small one, a link, and an
@@ -69,7 +68,7 @@ fn tar(path: &Path, mtime: u64) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tar_becomes_the_same_layer_every_time() {
-    let Some(mkfs) = mkfs() else { return };
+    let mkfs = builder();
     let s = Scratch::new();
     let src = s.0.join("rootfs.tar");
     tar(&src, 1_700_000_000);
@@ -100,7 +99,7 @@ async fn a_tar_becomes_the_same_layer_every_time() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oci_image_is_imported_once_and_fetched_whole() {
-    let Some(mkfs) = mkfs() else { return };
+    let mkfs = builder();
     let Some(layout) = std::env::var_os("HIVE_OCI_LAYOUT") else {
         eprintln!("skipped: set HIVE_OCI_LAYOUT to run it");
         return;
@@ -186,7 +185,7 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn layers_that_share_a_file_share_its_chunks() {
-    let Some(mkfs) = mkfs() else { return };
+    let mkfs = builder();
     let s = Scratch::new();
     let store = PosixStore::open(s.0.join("store")).unwrap();
     let importer = Importer::new(mkfs, s.0.join("work")).unwrap().chunked(Cuts::default());

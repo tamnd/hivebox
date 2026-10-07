@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::BlobId;
 use crate::cas::Cuts;
-use crate::erofs::Mkfs;
+use crate::erofs::Builder;
 use crate::image::{ImageConfig, LayerRef, Manifest, Provenance};
 use crate::leaves::Leaves;
 use crate::store::{BlobStore, blocking, hash_file, write_synced};
@@ -123,11 +123,11 @@ impl Drop for Staged {
     }
 }
 
-/// Builds layers with one `mkfs.erofs` into one store, using `work` for scratch space and for
+/// Builds layers with one [`Builder`] into one store, using `work` for scratch space and for
 /// remembering what it built.
 #[derive(Debug)]
 pub struct Importer {
-    mkfs: Mkfs,
+    builder: Builder,
     work: PathBuf,
     seq: AtomicU64,
     chunked: Option<Cuts>,
@@ -139,11 +139,11 @@ impl Importer {
     /// # Errors
     ///
     /// `work` cannot be made.
-    pub fn new(mkfs: Mkfs, work: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn new(builder: impl Into<Builder>, work: impl Into<PathBuf>) -> io::Result<Self> {
         let work = work.into();
         std::fs::create_dir_all(work.join("layers"))?;
         std::fs::create_dir_all(work.join("build"))?;
-        Ok(Self { mkfs, work, seq: AtomicU64::new(0), chunked: None })
+        Ok(Self { builder: builder.into(), work, seq: AtomicU64::new(0), chunked: None })
     }
 
     /// The same importer, storing each data blob as [`crate::cas`] chunks cut by `cuts` rather
@@ -331,7 +331,7 @@ impl Importer {
             self.work.join("layers").join(format!(
                 "{}-{}{}.json",
                 d.replace(':', "-"),
-                self.mkfs.chunk_size(),
+                self.builder.chunk_size(),
                 self.chunked.map(|c| format!("-cas{}", c.avg())).unwrap_or_default()
             ))
         });
@@ -350,16 +350,16 @@ impl Importer {
             std::process::id(),
             self.seq.fetch_add(1, Ordering::Relaxed)
         ));
-        let mkfs = self.mkfs.clone();
+        let builder = self.builder.clone();
         let result = async {
-            let (dir2, chunk) = (dir.clone(), mkfs.chunk_size());
+            let (dir2, chunk) = (dir.clone(), builder.chunk_size());
             let (built, meta, data, (leaves, leaves_path), meta_size, data_size) =
                 blocking(move || {
                     std::fs::create_dir_all(&dir2)?;
-                    // One read of the layer both checks it and feeds mkfs.erofs, and a layer that
+                    // One read of the layer both checks it and feeds the build, and a layer that
                     // turns out not to match is thrown away with the build directory.
                     let mut hashed = Hashed { inner: File::open(&src.tar)?, sha: Sha256::new() };
-                    let built = mkfs.build(&mut hashed, &dir2)?;
+                    let built = builder.build(&mut hashed, &dir2)?;
                     if let Some(digest) = &src.digest {
                         let got = format!("sha256:{:x}", hashed.sha.finalize());
                         if got != *digest {

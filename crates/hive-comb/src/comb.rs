@@ -16,7 +16,7 @@ use hive_cell::{DriverRegistry, RootfsPlan, Slot};
 use hive_drone::Client;
 use hive_guard::Profile;
 use hive_nectar::cas::Cuts;
-use hive_nectar::erofs::{DEFAULT_CHUNK_SIZE, Mkfs};
+use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
 use hive_nectar::mount::{IdMap, Layers};
 use hive_nectar::oci::{Commit, Importer, Staged, load_manifest};
 use hive_nectar::upper::{Scrub, SecretsFound, Shift};
@@ -112,7 +112,7 @@ fn at(what: &str, path: &Path) -> impl FnOnce(io::Error) -> io::Error {
 }
 
 /// Images from a `hive-nectar` store, the layers of them this node has mounted, and what builds
-/// the layers of snapshots, when `mkfs.erofs` is there.
+/// the layers of snapshots.
 struct Nectar {
     store: Arc<dyn BlobStore>,
     layers: Layers,
@@ -150,8 +150,12 @@ impl Nectar {
         }
         // Snapshot layers are kept as chunks, so snapshots of one cell share what they have in
         // common in the store.
-        let importer = Mkfs::new(&i.mkfs, DEFAULT_CHUNK_SIZE)
-            .and_then(|m| Importer::new(m, cfg.data_dir.join("build")))
+        let builder = match &i.mkfs {
+            Some(program) => Mkfs::new(program, DEFAULT_CHUNK_SIZE).map(Builder::from),
+            None => Writer::new(DEFAULT_CHUNK_SIZE).map(Builder::from),
+        };
+        let importer = builder
+            .and_then(|b| Importer::new(b, cfg.data_dir.join("build")))
             .map(|i| i.chunked(Cuts::default()))
             .map_err(|e| eprintln!("hive-comb: snapshots are off: {e}"))
             .ok();
@@ -916,7 +920,7 @@ impl Inner {
             Some(Nectar { importer: Some(i), store, .. }) => Ok((i, store)),
             _ => Err(Error::new(
                 Reason::PolicyDenied,
-                "this node cannot take snapshots, as it has no image store or no mkfs.erofs",
+                "this node cannot take snapshots, as it has no image store or its mkfs.erofs failed",
             )),
         }
     }
