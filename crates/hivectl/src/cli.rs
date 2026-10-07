@@ -47,8 +47,11 @@ Files:
   files ID PATH [--depth N]
   rm ID PATH [-r]
 
+Audit:
+  audit verify DIR    checks a node's audit chain in DIR and prints its root, or where it breaks
+
 The socket is $HIVE_SOCKET, or /run/hivebox/comb.sock. The project is $HIVE_PROJECT, or local.
-Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out. `verify` exits 0 when every run passed, 1 when one failed, and 2 when hivebox could not tell.
+Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out. `verify` exits 0 when every run passed, 1 when one failed, and 2 when hivebox could not tell. `audit verify` exits 1 when the chain is broken.
 ";
 
 /// A command line split into flags and the rest.
@@ -144,6 +147,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
             println!("hivectl {}", env!("CARGO_PKG_VERSION"));
             return Ok(0);
         }
+        "audit" => return audit(&args),
         _ => {}
     }
     let endpoint = match (endpoint, socket) {
@@ -745,6 +749,35 @@ fn table<const N: usize>(header: &[&str; N], rows: &[[String; N]]) {
     }
     for r in rows {
         line(&mut out, &r.each_ref().map(String::as_str));
+    }
+}
+
+/// `audit verify DIR`, which needs no comb.
+fn audit(args: &Args) -> Result<i32, String> {
+    args.check(&[])?;
+    let [what, dir] = &args.rest[..] else {
+        return Err("usage: hivectl audit verify DIR".into());
+    };
+    if what != "verify" {
+        return Err(format!("audit {what} is not a command"));
+    }
+    match hive_telemetry::audit::verify(std::path::Path::new(dir)) {
+        Err(e) => Err(format!("{dir}: {e}")),
+        Ok(Err(broken)) => {
+            println!("broken: {broken}");
+            Ok(1)
+        }
+        Ok(Ok(v)) => {
+            let last = if v.sealed { "sealed" } else { "open" };
+            println!(
+                "node {}: {} events in {} hours, the last {last}, root {}",
+                v.node,
+                v.events,
+                v.hours,
+                v.root_hex()
+            );
+            Ok(0)
+        }
     }
 }
 

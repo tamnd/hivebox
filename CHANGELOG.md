@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- An audit log in `hive_telemetry::audit`: a node's events as a hash chain cut into hourly files, each sealed with its count and root when the hour turns, written in batches with one sync each. `hivectl audit verify DIR` says where a chain breaks. On server3 at load 80, 8 threads recorded 32,000 to 42,000 events a second, and verifying ran at 71,000 to 171,000 a second.
+
 ## 0.0.31
 
 A `hive-uffd` that survives its worker dying, and a prefetch trace that learns from every restore.

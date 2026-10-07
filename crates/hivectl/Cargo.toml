@@ -17,6 +17,7 @@ publish.workspace = true
 futures.workspace = true
 hive-proto.workspace = true
 hive-sdk.workspace = true
+hive-telemetry.workspace = true
 hive-types.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "rt", "sync", "time"] }
 

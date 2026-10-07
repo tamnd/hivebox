@@ -1472,6 +1472,9 @@ version = "0.0.31"
 name = "hive-telemetry"
 version = "0.0.31"
 dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]
@@ -1508,6 +1511,7 @@ dependencies = [
  "futures",
  "hive-proto",
  "hive-sdk",
+ "hive-telemetry",
  "hive-types",
  "tokio",
 ]
