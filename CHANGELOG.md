@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.31
+
+A `hive-uffd` that survives its worker dying, and a prefetch trace that learns from every restore.
+
 - `hive-uffd` merges the prefetch trace from every restore, not just the first. A page joins the trace once two restores faulted on it. On server3, with a working set that shifted from run to run, the merged trace left out 32 to 480 touched pages a run against about 5,000 for the first trace, and the working set was in after a median of 291.9 ms against 513.5 ms.
 - `hive-uffd` runs under a watchdog. The process that listens keeps a copy of each VM's regions and userfaultfd and hands the VM to a worker process, and when the worker dies it starts another and hands it every VM still running. A fault the dead worker read and never answered is raised again, and memory the guest gave back still reads as zeros. On server3 the first page a VM touched after its worker was killed came in 2.9 to 6.3 ms in 7 of 10 runs, and in 21.0 to 62.1 ms in the other three.
 
