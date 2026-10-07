@@ -11,7 +11,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class VerifyRequest(_message.Message):
-    __slots__ = ("subject_cell_id", "verifier", "argv", "timeout", "workdir", "protected_paths", "files", "repeats")
+    __slots__ = ("subject_cell_id", "verifier", "argv", "timeout", "workdir", "protected_paths", "files", "repeats", "report", "must_pass")
     class FilesEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -27,6 +27,8 @@ class VerifyRequest(_message.Message):
     PROTECTED_PATHS_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
     REPEATS_FIELD_NUMBER: _ClassVar[int]
+    REPORT_FIELD_NUMBER: _ClassVar[int]
+    MUST_PASS_FIELD_NUMBER: _ClassVar[int]
     subject_cell_id: str
     verifier: _types_pb2.CellSpec
     argv: _containers.RepeatedScalarFieldContainer[str]
@@ -35,10 +37,12 @@ class VerifyRequest(_message.Message):
     protected_paths: _containers.RepeatedScalarFieldContainer[str]
     files: _containers.ScalarMap[str, bytes]
     repeats: int
-    def __init__(self, subject_cell_id: _Optional[str] = ..., verifier: _Optional[_Union[_types_pb2.CellSpec, _Mapping]] = ..., argv: _Optional[_Iterable[str]] = ..., timeout: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., workdir: _Optional[str] = ..., protected_paths: _Optional[_Iterable[str]] = ..., files: _Optional[_Mapping[str, bytes]] = ..., repeats: _Optional[int] = ...) -> None: ...
+    report: str
+    must_pass: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, subject_cell_id: _Optional[str] = ..., verifier: _Optional[_Union[_types_pb2.CellSpec, _Mapping]] = ..., argv: _Optional[_Iterable[str]] = ..., timeout: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., workdir: _Optional[str] = ..., protected_paths: _Optional[_Iterable[str]] = ..., files: _Optional[_Mapping[str, bytes]] = ..., repeats: _Optional[int] = ..., report: _Optional[str] = ..., must_pass: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class VerifyResult(_message.Message):
-    __slots__ = ("passed", "exit_code", "output", "scores", "error", "tampered", "flaky", "runs_passed")
+    __slots__ = ("passed", "exit_code", "output", "scores", "error", "tampered", "flaky", "runs_passed", "not_passed")
     class ScoresEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -54,6 +58,7 @@ class VerifyResult(_message.Message):
     TAMPERED_FIELD_NUMBER: _ClassVar[int]
     FLAKY_FIELD_NUMBER: _ClassVar[int]
     RUNS_PASSED_FIELD_NUMBER: _ClassVar[int]
+    NOT_PASSED_FIELD_NUMBER: _ClassVar[int]
     passed: bool
     exit_code: int
     output: bytes
@@ -62,4 +67,5 @@ class VerifyResult(_message.Message):
     tampered: _containers.RepeatedScalarFieldContainer[str]
     flaky: bool
     runs_passed: int
-    def __init__(self, passed: _Optional[bool] = ..., exit_code: _Optional[int] = ..., output: _Optional[bytes] = ..., scores: _Optional[_Mapping[str, float]] = ..., error: _Optional[_Union[_types_pb2.Error, _Mapping]] = ..., tampered: _Optional[_Iterable[str]] = ..., flaky: _Optional[bool] = ..., runs_passed: _Optional[int] = ...) -> None: ...
+    not_passed: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, passed: _Optional[bool] = ..., exit_code: _Optional[int] = ..., output: _Optional[bytes] = ..., scores: _Optional[_Mapping[str, float]] = ..., error: _Optional[_Union[_types_pb2.Error, _Mapping]] = ..., tampered: _Optional[_Iterable[str]] = ..., flaky: _Optional[bool] = ..., runs_passed: _Optional[int] = ..., not_passed: _Optional[_Iterable[str]] = ...) -> None: ...

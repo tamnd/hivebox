@@ -137,10 +137,12 @@ class RunResult:
 
 @dataclass
 class VerifyResult:
-    """What a verifier made of a subject's changes. `passed` is every run exiting with 0, and
-    `error` is why the check could not be done, if it could not, in which case `passed` says
-    nothing about the subject. `scores` has the test counts pytest printed, the diff's size and
-    how long each step took in milliseconds."""
+    """What a verifier made of a subject's changes. `passed` is every run exiting with 0, and with
+    a report asked for, every run leaving one with no test failed and each in `must_pass` passed.
+    `not_passed` is those of `must_pass` the last report did not show passing. `error` is why the
+    check could not be done, if it could not, in which case `passed` says nothing about the
+    subject. `scores` has the test counts from the report, or pytest's summary line without one,
+    the diff's size and how long each step took in milliseconds."""
 
     passed: bool
     exit_code: int
@@ -150,6 +152,7 @@ class VerifyResult:
     flaky: bool
     runs_passed: int
     error: _errors.HiveError | None
+    not_passed: list[str] = field(default_factory=list)
 
     @classmethod
     def _from(cls, r) -> VerifyResult:
@@ -157,7 +160,8 @@ class VerifyResult:
         if r.HasField("error"):
             err = _errors.make(r.error.reason, r.error.message, is_infra_error=r.error.is_infra_error,
                                errno_name=r.error.errno or None)
-        return cls(r.passed, r.exit_code, r.output, dict(r.scores), list(r.tampered), r.flaky, r.runs_passed, err)
+        return cls(r.passed, r.exit_code, r.output, dict(r.scores), list(r.tampered), r.flaky, r.runs_passed, err,
+                   list(r.not_passed))
 
     @property
     def is_infra_error(self) -> bool:
@@ -329,14 +333,18 @@ class AsyncHive:
 
     async def verify(self, argv: Sequence[str], *, verifier: Spec, workdir: str, subject: Cell | str | None = None,
                      protected_paths: Iterable[str] = (), files: Mapping[str, bytes | str] | None = None,
-                     repeats: int = 1, timeout: float | str | None = None) -> VerifyResult:
+                     repeats: int = 1, timeout: float | str | None = None, report: str | None = None,
+                     must_pass: Iterable[str] = ()) -> VerifyResult:
         """Checks the changes `subject` made to the git checkout at `workdir` in a fresh cell
         made from `verifier`, with no network, and runs `argv` there `repeats` times. Changes to
         `protected_paths`, globs like tests/** under `workdir`, are left out and reported in
         `tampered`. `files`, such as hidden tests, are written in after the changes, a relative
         path being under `workdir`. With no subject the image is checked as it is. `timeout` is
-        for each run. A check that could not be done returns with `error` set rather than
-        raising, unless the request itself was wrong."""
+        for each run. With `report`, the path of a JUnit report `argv` writes, as with pytest's
+        --junitxml, a run passes only when the report is there with no test failed and every test
+        in `must_pass`, pytest node ids, passed. Without one, a sys.exit(0) in the code under test
+        passes on its exit code alone. A check that could not be done returns with
+        `error` set rather than raising, unless the request itself was wrong."""
         if isinstance(argv, str):
             raise _errors.InvalidArgument("argv is a list, like [\"bash\", \"-c\", script]")
         subject_id = subject.id if isinstance(subject, Cell) else (subject or "")
@@ -349,6 +357,8 @@ class AsyncHive:
             files={k: v.encode() if isinstance(v, str) else v for k, v in (files or {}).items()},
             repeats=repeats,
             timeout=_seconds(timeout),
+            report=report or "",
+            must_pass=list(must_pass),
         )
         return VerifyResult._from(await self._call(self._verify.Run, req))
 

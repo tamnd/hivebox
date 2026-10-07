@@ -107,6 +107,14 @@ pub struct Verify {
     /// How many times to run the tests.
     #[serde(default = "one")]
     pub repeats: u32,
+    /// The JUnit report the tests write, like `/tmp/report.xml` with `pytest --junitxml`. When
+    /// set, a run passes on what the report says and not on its exit code alone.
+    #[serde(default)]
+    pub report: Option<String>,
+    /// Tests the report has to show passing, as pytest node ids, like SWE-bench's `FAIL_TO_PASS`
+    /// and `PASS_TO_PASS`.
+    #[serde(default)]
+    pub must_pass: Vec<String>,
     /// Seconds each run may take, or the node's default when 0.
     #[serde(default)]
     pub timeout_s: u64,

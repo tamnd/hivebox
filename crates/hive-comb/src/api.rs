@@ -37,6 +37,7 @@ use tonic::server::NamedService;
 use tonic::{Request, Response, Status, Streaming};
 
 mod audit;
+mod junit;
 mod llm;
 mod snapshots;
 mod verify;

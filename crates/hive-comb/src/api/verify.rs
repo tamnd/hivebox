@@ -6,7 +6,12 @@
 //! index is left alone and new files count. Changes to protected paths are left out and reported.
 //! The verifier cell gets no network, then the diff, then the caller's files such as hidden tests,
 //! and runs the command as many times as asked. It is stopped when the call ends, however it ends.
+//!
+//! An exit code is easy for the subject to fake, with a `sys.exit(0)` in the code the tests load.
+//! A verify that names a JUnit report passes a run only on what the report says, and a run cut
+//! short leaves none.
 
+use super::junit::{self, Verdict};
 use super::{Api, Args, Call, invalid, millis, parse_id, status};
 use crate::comb::CreateRequest;
 use bytes::Bytes;
@@ -26,6 +31,8 @@ const PATCH: &str = "/tmp/hive-verify.patch";
 const MAX_DIFF: usize = 32 << 20;
 /// Output kept from the last run.
 const OUTPUT_TAIL: usize = 64 << 10;
+/// The biggest report read.
+const MAX_REPORT: usize = 16 << 20;
 /// The most runs one call may ask for.
 const MAX_REPEATS: u32 = 16;
 /// Takes the diff with an index of its own, so the subject's staged changes count the same as
@@ -56,7 +63,9 @@ impl Verify for Api {
             .str(&format!("{:?}", r.timeout))
             .str(&r.workdir)
             .strs(&r.protected_paths)
-            .num(r.repeats.into());
+            .num(r.repeats.into())
+            .str(&r.report)
+            .strs(&r.must_pass);
         let job = async {
             let subject = match r.subject_cell_id.as_str() {
                 "" => None,
@@ -71,6 +80,12 @@ impl Verify for Api {
             }
             if r.argv.is_empty() {
                 return Err(invalid("the verifier needs a command"));
+            }
+            if !r.must_pass.is_empty() && r.report.is_empty() {
+                return Err(invalid("must_pass needs a report to find the tests in"));
+            }
+            if !r.report.is_empty() && !r.report.starts_with('/') && r.workdir.is_empty() {
+                return Err(invalid("a relative report path needs a workdir"));
             }
             if r.repeats > MAX_REPEATS {
                 return Err(invalid(format!("at most {MAX_REPEATS} repeats")));
@@ -114,6 +129,8 @@ struct Done {
     flaky: bool,
     runs_passed: u32,
     last: Option<drone::RunResult>,
+    /// What the last run's report said, when one was asked for.
+    report: Option<Verdict>,
     tampered: Vec<String>,
 }
 
@@ -179,13 +196,8 @@ impl Job<'_> {
             }
         }
         for (path, data) in &self.req.files {
-            let path = if path.starts_with('/') {
-                path.clone()
-            } else {
-                format!("{}/{path}", self.req.workdir.trim_end_matches('/'))
-            };
             let put = drone::FsWrite {
-                path,
+                path: self.path(path),
                 data: data.clone(),
                 make_parents: true,
                 ..Default::default()
@@ -196,8 +208,14 @@ impl Job<'_> {
         let t = Instant::now();
         let mut runs_passed = 0;
         let mut last = None;
+        let mut report = None;
+        let report_path = (!self.req.report.is_empty()).then(|| self.path(&self.req.report));
         let repeats = self.req.repeats.max(1);
         for _ in 0..repeats {
+            if let Some(path) = &report_path {
+                let gone = drone::FsPath { path: path.clone(), ..Default::default() };
+                let _ = drone.fs_remove(&gone).await;
+            }
             let command = drone::Command {
                 argv: self.req.argv.clone(),
                 cwd: self.req.workdir.clone(),
@@ -207,9 +225,21 @@ impl Job<'_> {
             let out = drone
                 .run(&drone::RunRequest { command: Some(command), stdin: Default::default() })
                 .await?;
-            if out.exit_code == 0 && out.signal == 0 && !out.timed_out {
-                runs_passed += 1;
+            let mut passed = out.exit_code == 0 && out.signal == 0 && !out.timed_out;
+            if let Some(path) = &report_path {
+                let read = drone::FsRead { path: path.clone(), offset: 0, length: 0 };
+                let xml = match drone.fs_read(&read, MAX_REPORT).await {
+                    Ok(xml) => Some(xml),
+                    // A report that is not there, or too big, is the run's doing.
+                    Err(e) if !e.reason.is_infra() => None,
+                    Err(e) => return Err(e),
+                };
+                let cases = xml.and_then(|x| junit::cases(&x));
+                let verdict = junit::judge(cases.as_deref(), &self.req.must_pass);
+                passed &= verdict.ok;
+                report = Some(verdict);
             }
+            runs_passed += u32::from(passed);
             last = Some(out);
         }
         self.time("run", t);
@@ -218,8 +248,18 @@ impl Job<'_> {
             flaky: runs_passed != 0 && runs_passed != repeats,
             runs_passed,
             last,
+            report,
             tampered: Vec::new(),
         })
+    }
+
+    /// `path` in the verifier, a relative one being under the workdir.
+    fn path(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("{}/{path}", self.req.workdir.trim_end_matches('/'))
+        }
     }
 
     /// Runs a shell script in the workdir, with git trusting a checkout someone else owns.
@@ -260,9 +300,20 @@ impl Job<'_> {
                 output.drain(..output.len() - OUTPUT_TAIL);
             }
             exit_code = if last.timed_out || last.signal != 0 { -1 } else { last.exit_code };
-            for (k, v) in test_counts(&last.stdout) {
+            // The counts printed are only a fallback, as the subject's code can print anything.
+            if done.report.is_none() {
+                for (k, v) in test_counts(&last.stdout) {
+                    self.scores.insert(k.into(), v);
+                }
+            }
+        }
+        let mut not_passed = Vec::new();
+        if let Some(report) = done.report {
+            self.scores.insert("report".into(), f64::from(u8::from(!report.counts.is_empty())));
+            for (k, v) in report.counts {
                 self.scores.insert(k.into(), v);
             }
+            not_passed = report.not_passed;
         }
         v1::VerifyResult {
             passed: done.passed,
@@ -273,6 +324,7 @@ impl Job<'_> {
             tampered: done.tampered,
             flaky: done.flaky,
             runs_passed: done.runs_passed,
+            not_passed,
         }
     }
 }
