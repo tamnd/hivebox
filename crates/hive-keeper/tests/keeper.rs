@@ -178,9 +178,14 @@ async fn three_members_agree_and_outlive_their_leader() {
     assert_eq!(info.prefix, key.key[..8]);
     let lease = c.register(register("box-a", 0)).await.unwrap().into_inner();
     assert_eq!((lease.node, lease.epoch, lease.ttl_ms), (1, 1, 10_000));
-    let renewed = c.renew(pb::RenewRequest { node: 1, epoch: 1 }).await.unwrap().into_inner();
+    let renewed = c
+        .renew(pb::RenewRequest { node: 1, epoch: 1, ..Default::default() })
+        .await
+        .unwrap()
+        .into_inner();
     assert!(renewed.expires_ms >= lease.expires_ms);
-    let stale = c.renew(pb::RenewRequest { node: 1, epoch: 7 }).await.unwrap_err();
+    let stale =
+        c.renew(pb::RenewRequest { node: 1, epoch: 7, ..Default::default() }).await.unwrap_err();
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
 
     let index = g.applied(leader).await;
@@ -244,7 +249,8 @@ async fn a_lease_that_ran_out_means_a_new_epoch() {
     tokio::time::sleep(Duration::from_millis(1300)).await;
     let nodes = c.list_nodes(pb::ListNodesRequest {}).await.unwrap().into_inner().nodes;
     assert!(nodes[0].lost);
-    let e = c.renew(pb::RenewRequest { node: 1, epoch: 1 }).await.unwrap_err();
+    let e =
+        c.renew(pb::RenewRequest { node: 1, epoch: 1, ..Default::default() }).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::FailedPrecondition, "{e:?}");
     let again = c.register(register("box-a", 1)).await.unwrap().into_inner();
     assert_eq!((again.node, again.epoch), (1, 2));
@@ -257,4 +263,64 @@ async fn a_lease_that_ran_out_means_a_new_epoch() {
     let nodes = c.list_nodes(pb::ListNodesRequest {}).await.unwrap().into_inner().nodes;
     assert_eq!((nodes[0].node, nodes[0].epoch), (1, 2));
     g.stop(1).await;
+}
+
+/// Hour `i` of an audit chain of ten events an hour.
+fn audit_hour(i: u8) -> pb::AuditHour {
+    pb::AuditHour {
+        hour: format!("2026-10-07T{i:02}"),
+        first_seq: u64::from(i) * 10,
+        count: 10,
+        prev: if i == 0 { vec![0; 32] } else { vec![i; 32] },
+        root: vec![i + 1; 32],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_roots_go_in_with_a_renewal_and_a_forged_one_is_refused() {
+    let mut g = Group::new("audit", 3, 10_000).await;
+    let leader = g.leader().await;
+    let follower = *g.members.keys().find(|id| **id != leader).unwrap();
+    let mut c = g.client(follower).await;
+    c.register(register("box-a", 0)).await.unwrap();
+    let tip = |seq, root| Some(pb::AuditTip { hour: "2026-10-07T02".into(), seq, root, at_ms: 0 });
+    let renew =
+        |audit_hours, audit_tip| pb::RenewRequest { node: 1, epoch: 1, audit_hours, audit_tip };
+
+    let l = c.renew(renew(vec![], tip(21, vec![9; 32]))).await.unwrap().into_inner();
+    assert_eq!((l.audit_hour.as_str(), l.audit_refused.as_str()), ("", ""));
+    let l = c.renew(renew(vec![audit_hour(0), audit_hour(1)], tip(25, vec![9; 32]))).await;
+    let l = l.unwrap().into_inner();
+    assert_eq!((l.audit_hour.as_str(), l.audit_refused.as_str()), ("2026-10-07T01", ""));
+
+    // A forged hour is refused and the lease is renewed all the same.
+    let mut forged = audit_hour(1);
+    forged.root = vec![7; 32];
+    let l = c.renew(renew(vec![forged], None)).await.unwrap().into_inner();
+    assert_eq!(l.audit_hour, "2026-10-07T01");
+    assert!(l.audit_refused.contains("another root"), "{}", l.audit_refused);
+    let bad = c.renew(renew(vec![], tip(25, vec![1; 3]))).await.unwrap().into_inner();
+    assert!(bad.audit_refused.contains("32 bytes"), "{}", bad.audit_refused);
+    let stale = c.renew(pb::RenewRequest { epoch: 7, ..renew(vec![audit_hour(2)], None) }).await;
+    assert_eq!(stale.unwrap_err().code(), tonic::Code::FailedPrecondition);
+
+    // Every member holds the same roots, and one that restarts reads them back from its disk.
+    let index = g.applied(leader).await;
+    g.caught_up(index).await;
+    g.stop(follower).await;
+    g.start(follower);
+    g.caught_up(index).await;
+    for id in [1, 2, 3] {
+        let mut c = g.client(id).await;
+        let req = pb::GetAuditChainRequest { node: "box-a".into() };
+        let chain = c.get_audit_chain(req).await.unwrap().into_inner();
+        assert_eq!(chain.hours, vec![audit_hour(0), audit_hour(1)], "member {id}");
+        let t = chain.tip.unwrap();
+        assert_eq!((t.hour.as_str(), t.seq, t.root), ("2026-10-07T02", 25, vec![9; 32]));
+        let none = c.get_audit_chain(pb::GetAuditChainRequest { node: "box-b".into() }).await;
+        assert_eq!(none.unwrap_err().code(), tonic::Code::NotFound);
+    }
+    for id in [1, 2, 3] {
+        g.stop(id).await;
+    }
 }

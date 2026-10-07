@@ -17,7 +17,8 @@ service Keeper {
   // A comb asks for its node index and epoch when it starts, and again once its lease is lost.
   rpc Register(RegisterRequest) returns (Lease);
   // A comb renews its lease well before it runs out. A lease that ran out cannot be renewed,
-  // and the comb has to register again and gets a new epoch.
+  // and the comb has to register again and gets a new epoch. The comb sends the roots of its
+  // audit chain along, and a renewal goes through even when the keeper refuses them.
   rpc Renew(RenewRequest) returns (Lease);
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   // A gate takes a share of a project's quota to spend on its own for a while, and asks again
@@ -29,6 +30,8 @@ service Keeper {
   rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
   // Where this member stands in the Raft group.
   rpc Status(StatusRequest) returns (StatusResponse);
+  // The roots of a node's audit chain the keeper holds, from this member's copy.
+  rpc GetAuditChain(GetAuditChainRequest) returns (AuditChain);
 }
 
 message Quota {
@@ -123,6 +126,47 @@ message RegisterRequest {
 message RenewRequest {
   uint32 node = 1;
   uint32 epoch = 2;
+  // The hours of the node's audit chain sealed since the last one the keeper holds, oldest
+  // first, at most 64.
+  repeated AuditHour audit_hours = 3;
+  // How far the node's audit chain has got, or unset for a node that keeps none.
+  AuditTip audit_tip = 4;
+}
+
+// A sealed hour of a node's audit chain.
+message AuditHour {
+  // The hour, as its file is named, such as 2026-10-07T06.
+  string hour = 1;
+  uint64 first_seq = 2;
+  uint64 count = 3;
+  // The hash its first line points back at, 32 bytes.
+  bytes prev = 4;
+  // The hash of its last line, 32 bytes.
+  bytes root = 5;
+}
+
+// How far a node's audit chain has got.
+message AuditTip {
+  // The hour its last event fell in.
+  string hour = 1;
+  // How many events the chain holds.
+  uint64 seq = 2;
+  // The hash of the last event's line, 32 bytes.
+  bytes root = 3;
+  // When the keeper took it, in milliseconds since the Unix epoch.
+  uint64 at_ms = 4;
+}
+
+message GetAuditChainRequest {
+  // The node's name.
+  string node = 1;
+}
+
+message AuditChain {
+  string node = 1;
+  // The sealed hours held, oldest first. The keeper holds the last 720.
+  repeated AuditHour hours = 2;
+  AuditTip tip = 3;
 }
 
 message Lease {
@@ -132,6 +176,10 @@ message Lease {
   uint64 expires_ms = 3;
   // How long a lease lasts, so the comb can renew without trusting the clocks to agree.
   uint64 ttl_ms = 4;
+  // On a renewal, the last sealed hour of the node's audit chain the keeper holds, or empty.
+  string audit_hour = 5;
+  // On a renewal, why the keeper refused the audit roots sent with it, or empty.
+  string audit_refused = 6;
 }
 
 message TakeQuotaRequest {

@@ -77,7 +77,14 @@ async fn a_comb_keeps_its_epoch_until_it_registers_afresh() {
     assert_eq!(again, first);
     let renewing = CancellationToken::new();
     let file = data.join(lease::FILE);
-    let held = tokio::spawn(lease::keep(k, again, sent, file, renewing.clone()));
+    let held = tokio::spawn(lease::keep(
+        k,
+        again,
+        sent,
+        file,
+        lease::AuditLink::default(),
+        renewing.clone(),
+    ));
 
     // The same name with no file, like a machine that lost its disk, waits while the comb that
     // holds the node renews its lease, and gets a new epoch once that comb stops and its lease
@@ -129,7 +136,9 @@ async fn a_comb_that_cannot_reach_the_keeper_stops_when_its_lease_runs_out() {
     let dir = Dir::new("renew");
     let file = dir.0.join(lease::FILE);
     let since = tokio::time::Instant::now();
-    let e = lease::keep(k, l, since, file, CancellationToken::new()).await.unwrap_err();
+    let e = lease::keep(k, l, since, file, lease::AuditLink::default(), CancellationToken::new())
+        .await
+        .unwrap_err();
     assert!(e.contains("before it ran out"), "{e}");
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(1200) && took < Duration::from_secs(3), "{took:?}");
@@ -144,5 +153,79 @@ async fn a_bad_name_is_refused_and_not_tried_again() {
     let mut k = Keeper::new(&bad.members).unwrap();
     let e = lease::register(&mut k, &bad, &dir.0).await.unwrap_err();
     assert!(e.contains("refused node no spaces"), "{e}");
+    stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comb_publishes_its_audit_roots_as_it_renews() {
+    use hive_proto::internal as pb;
+    use hive_telemetry::audit::{self, AuditEvent, AuditLog};
+    use std::sync::Arc;
+
+    let dir = Dir::new("audit");
+    let stop = CancellationToken::new();
+    // A long lease, so a slow disk under the keeper does not lose it before the roots go in.
+    let addr = keeper(&dir, 6000, &stop).await;
+    let link = link(&addr, "node-a");
+    let data = dir.0.join("comb");
+    std::fs::create_dir_all(&data).unwrap();
+
+    // Three hours of events, 2026-10-07T06 to T08, so two are sealed.
+    let logs = dir.0.join("audit");
+    let log = Arc::new(AuditLog::open(&logs, "node-a").unwrap());
+    let t0 = 1_791_352_800 * 1_000_000_000u64;
+    for i in 0..150u64 {
+        let ts = t0 + (i / 50) * 3_600_000_000_000 + i;
+        log.record(AuditEvent { ts, op: "exec.run".into(), ..AuditEvent::default() });
+    }
+    log.flush().unwrap();
+
+    let mut k = Keeper::new(&link.members).unwrap();
+    let (l, sent) = leased(lease::register(&mut k, &link, &data).await.unwrap());
+    let roots = lease::AuditLink::default();
+    roots.set((Arc::downgrade(&log), logs.clone())).unwrap();
+    let renewing = CancellationToken::new();
+    let file = data.join(lease::FILE);
+    let held = tokio::spawn(lease::keep(k, l, sent, file, roots, renewing.clone()));
+
+    // The first renewal learns where the keeper is, and the next ones send the sealed hours.
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut c = pb::keeper_client::KeeperClient::new(channel.connect_lazy());
+    let began = Instant::now();
+    let chain = loop {
+        let req = pb::GetAuditChainRequest { node: "node-a".into() };
+        let got = c.get_audit_chain(req).await;
+        if let Ok(c) = &got
+            && c.get_ref().hours.len() == 2
+        {
+            break got.unwrap().into_inner();
+        }
+        if held.is_finished() {
+            panic!("the lease was given up: {:?}", held.await.unwrap());
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "the roots never got to the keeper: {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let hours: Vec<_> =
+        chain.hours.iter().map(|h| (h.hour.as_str(), h.first_seq, h.count)).collect();
+    assert_eq!(hours, [("2026-10-07T06", 0, 50), ("2026-10-07T07", 50, 50)]);
+    let tip = chain.tip.unwrap();
+    assert_eq!((tip.hour.as_str(), tip.seq), ("2026-10-07T08", 150));
+
+    // The chain on disk matches what the keeper holds.
+    let mut anchors: Vec<(u64, [u8; 32])> = chain
+        .hours
+        .iter()
+        .map(|h| (h.first_seq + h.count, h.root.clone().try_into().unwrap()))
+        .collect();
+    anchors.push((tip.seq, tip.root.try_into().unwrap()));
+    assert_eq!(audit::verify_with(&logs, &anchors).unwrap().unwrap().events, 150);
+
+    drop(log);
+    renewing.cancel();
+    held.await.unwrap().unwrap();
     stop.cancel();
 }

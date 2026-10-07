@@ -12,7 +12,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 use crate::net::Peers;
-use crate::state::{Command, Key, Node, Project, Quota, Refusal, Reply};
+use crate::state::{AUDIT_BATCH, AuditHour, Command, Key, Node, Project, Quota, Refusal, Reply};
 use crate::store::{Store, TypeConfig};
 
 /// How long a write waits for the group to have a leader before it gives up.
@@ -263,13 +263,68 @@ impl keeper_server::Keeper for Keeper {
             u16::try_from(req.node).map_err(|_| Status::invalid_argument("node is past 65535"))?;
         let epoch = u16::try_from(req.epoch)
             .map_err(|_| Status::invalid_argument("epoch is past 65535"))?;
-        match self
-            .write(Command::Renew { node, epoch, now_ms: now_ms(), ttl_ms: self.lease_ms })
-            .await?
-        {
-            Reply::Node(n) => Ok(Response::new(self.lease(&n))),
-            r => Err(unexpected(&r)),
-        }
+        let now_ms = now_ms();
+        let renew = Command::Renew { node, epoch, now_ms, ttl_ms: self.lease_ms };
+        // Audit roots that do not decode are refused on their own, and the renewal goes on.
+        let (cmd, mut refused) = match audit(req.audit_hours, req.audit_tip) {
+            Ok(None) => (renew, String::new()),
+            Ok(Some((hours, tip))) => {
+                let audit = Command::Audit { node, epoch, now_ms, hours, tip };
+                (Command::Batch(vec![renew, audit]), String::new())
+            }
+            Err(e) => (renew, e),
+        };
+        let (n, audited) = match self.write(cmd).await? {
+            Reply::Node(n) => (n, None),
+            Reply::Batch(mut rs) if rs.len() == 2 => {
+                let audited = rs.pop();
+                match rs.pop().map(refusal) {
+                    Some(Ok(Reply::Node(n))) => (n, audited),
+                    Some(Err(s)) => return Err(s),
+                    r => return Err(Status::internal(format!("the log gave {r:?}"))),
+                }
+            }
+            r => return Err(unexpected(&r)),
+        };
+        let mut lease = self.lease(&n);
+        lease.audit_hour = match audited {
+            Some(Reply::Audit(last)) => last,
+            Some(Reply::Refused(r)) => {
+                refused = refusal(Reply::Refused(r))
+                    .err()
+                    .map(|s| s.message().to_owned())
+                    .unwrap_or_default();
+                self.last_audit_hour(&n.name)
+            }
+            _ => self.last_audit_hour(&n.name),
+        };
+        lease.audit_refused = refused;
+        Ok(Response::new(lease))
+    }
+
+    async fn get_audit_chain(
+        &self,
+        req: Request<pb::GetAuditChainRequest>,
+    ) -> Result<Response<pb::AuditChain>, Status> {
+        let node = req.into_inner().node;
+        let chain = self.store.read(|s| {
+            s.audit.get(&node).map(|c| {
+                let hours = c.hours.iter().map(|(hour, h)| audit_hour(hour, h)).collect();
+                let tip = c.tip.as_ref().map(|t| pb::AuditTip {
+                    hour: t.hour.clone(),
+                    seq: t.seq,
+                    root: t.root.to_vec(),
+                    at_ms: t.at_ms,
+                });
+                (hours, tip)
+            })
+        });
+        let Some((hours, tip)) = chain else {
+            return Err(Status::not_found(format!(
+                "the keeper holds no audit chain of node {node}"
+            )));
+        };
+        Ok(Response::new(pb::AuditChain { node, hours, tip }))
     }
 
     async fn list_nodes(
@@ -393,7 +448,15 @@ impl Keeper {
             epoch: u32::from(n.epoch),
             expires_ms: n.expires_ms,
             ttl_ms: self.lease_ms,
+            ..pb::Lease::default()
         }
+    }
+
+    /// The last sealed hour of node `name`'s audit chain in this member's copy, or empty.
+    fn last_audit_hour(&self, name: &str) -> String {
+        self.store.read(|s| {
+            s.audit.get(name).and_then(|c| c.hours.keys().next_back().cloned()).unwrap_or_default()
+        })
     }
 }
 
@@ -412,7 +475,40 @@ fn refusal(r: Reply) -> Result<Reply, Status> {
         Reply::Refused(Refusal::Exhausted(m)) => Err(Status::resource_exhausted(m)),
         // The comb tries again, as it does when the keeper is out of reach.
         Reply::Refused(Refusal::Held(m)) => Err(Status::unavailable(m)),
+        Reply::Refused(Refusal::Conflict(m)) => Err(Status::aborted(m)),
         r => Ok(r),
+    }
+}
+
+/// The audit hours and tip of a renewal, or `None` when it brings neither.
+type Audit = (Vec<(String, AuditHour)>, Option<(String, u64, [u8; 32])>);
+
+fn audit(hours: Vec<pb::AuditHour>, tip: Option<pb::AuditTip>) -> Result<Option<Audit>, String> {
+    if hours.is_empty() && tip.is_none() {
+        return Ok(None);
+    }
+    if hours.len() > AUDIT_BATCH {
+        return Err(format!("more than {AUDIT_BATCH} audit hours at once"));
+    }
+    let hash = |b: Vec<u8>| <[u8; 32]>::try_from(b).map_err(|_| "an audit hash is not 32 bytes");
+    let hours = hours
+        .into_iter()
+        .map(|h| {
+            let (prev, root) = (hash(h.prev)?, hash(h.root)?);
+            Ok((h.hour, AuditHour { first_seq: h.first_seq, count: h.count, prev, root }))
+        })
+        .collect::<Result<_, &str>>()?;
+    let tip = tip.map(|t| Ok::<_, &str>((t.hour, t.seq, hash(t.root)?))).transpose()?;
+    Ok(Some((hours, tip)))
+}
+
+fn audit_hour(hour: &str, h: &AuditHour) -> pb::AuditHour {
+    pb::AuditHour {
+        hour: hour.to_string(),
+        first_seq: h.first_seq,
+        count: h.count,
+        prev: h.prev.to_vec(),
+        root: h.root.to_vec(),
     }
 }
 

@@ -25,7 +25,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Changed, Command, Key, Node, Project, Reply, State};
+use crate::state::{AuditChain, Changed, Command, Key, Node, Project, Reply, State};
 
 openraft::declare_raft_types!(
     /// The types the keeper's Raft group works with.
@@ -46,6 +46,10 @@ const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 const PROJECTS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("projects");
 const KEYS: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("keys");
 const NODES: TableDefinition<'_, u16, &[u8]> = TableDefinition::new("nodes");
+/// The sealed hours of the nodes' audit chains, by node name and hour.
+const AUDIT_HOURS: TableDefinition<'_, (&str, &str), &[u8]> = TableDefinition::new("audit_hours");
+/// The tips of the nodes' audit chains, by node name.
+const AUDIT_TIPS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("audit_tips");
 
 const VOTE: &str = "vote";
 const PURGED: &str = "purged";
@@ -64,6 +68,8 @@ struct Image {
     nodes: Vec<Node>,
     #[serde(default)]
     root: Option<[u8; 32]>,
+    #[serde(default)]
+    audit: Vec<(String, AuditChain)>,
 }
 
 /// A snapshot as it is kept, the meta and the bytes.
@@ -127,6 +133,8 @@ impl Store {
         tx.open_table(LOGS).map_err(write)?;
         tx.open_table(KEYS).map_err(write)?;
         tx.open_table(NODES).map_err(write)?;
+        tx.open_table(AUDIT_HOURS).map_err(write)?;
+        tx.open_table(AUDIT_TIPS).map_err(write)?;
         tx.commit().map_err(write)?;
         let store = Self { inner: Arc::new(Inner { db, state: RwLock::default() }) };
         let loaded = store.load()?;
@@ -169,6 +177,16 @@ impl Store {
             let (k, v) = row.map_err(read)?;
             a.state.nodes.insert(k.value(), decode(v.value())?);
         }
+        for row in tx.open_table(AUDIT_HOURS).map_err(read)?.iter().map_err(read)? {
+            let (k, v) = row.map_err(read)?;
+            let (node, hour) = k.value();
+            let chain = a.state.audit.entry(node.to_owned()).or_default();
+            chain.hours.insert(hour.to_owned(), decode(v.value())?);
+        }
+        for row in tx.open_table(AUDIT_TIPS).map_err(read)?.iter().map_err(read)? {
+            let (k, v) = row.map_err(read)?;
+            a.state.audit.entry(k.value().to_owned()).or_default().tip = Some(decode(v.value())?);
+        }
         Ok(a)
     }
 
@@ -195,6 +213,7 @@ impl Store {
             keys: a.state.keys.iter().map(|(h, k)| (*h, k.clone())).collect(),
             nodes: a.state.nodes.values().cloned().collect(),
             root: a.state.root,
+            audit: a.state.audit.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
         };
         encode(&image)
     }
@@ -357,6 +376,20 @@ impl RaftStorage<TypeConfig> for Store {
             for n in &image.nodes {
                 nodes.insert(n.node, encode(n)?.as_slice()).map_err(write_sm)?;
             }
+            let mut hours = tx.open_table(AUDIT_HOURS).map_err(write_sm)?;
+            hours.retain(|_, _| false).map_err(write_sm)?;
+            let mut tips = tx.open_table(AUDIT_TIPS).map_err(write_sm)?;
+            tips.retain(|_, _| false).map_err(write_sm)?;
+            for (node, chain) in &image.audit {
+                for (hour, h) in &chain.hours {
+                    hours
+                        .insert((node.as_str(), hour.as_str()), encode(h)?.as_slice())
+                        .map_err(write_sm)?;
+                }
+                if let Some(t) = &chain.tip {
+                    tips.insert(node.as_str(), encode(t)?.as_slice()).map_err(write_sm)?;
+                }
+            }
             let mut m = tx.open_table(META).map_err(write_sm)?;
             m.insert(APPLIED, encode(&meta.last_log_id)?.as_slice()).map_err(write_sm)?;
             m.insert(MEMBERSHIP, encode(&meta.last_membership)?.as_slice()).map_err(write_sm)?;
@@ -375,6 +408,7 @@ impl RaftStorage<TypeConfig> for Store {
             keys: image.keys.into_iter().collect(),
             nodes: image.nodes.into_iter().map(|n| (n.node, n)).collect(),
             root: image.root,
+            audit: image.audit.into_iter().collect(),
         };
         Ok(())
     }
@@ -415,6 +449,8 @@ impl Inner {
             let mut projects = tx.open_table(PROJECTS).map_err(write_sm)?;
             let mut keys = tx.open_table(KEYS).map_err(write_sm)?;
             let mut nodes = tx.open_table(NODES).map_err(write_sm)?;
+            let mut hours = tx.open_table(AUDIT_HOURS).map_err(write_sm)?;
+            let mut tips = tx.open_table(AUDIT_TIPS).map_err(write_sm)?;
             for c in changed {
                 match c {
                     Changed::Project(name) => {
@@ -434,6 +470,24 @@ impl Inner {
                         nodes
                             .insert(n, encode(&a.state.nodes[&n])?.as_slice())
                             .map_err(write_sm)?;
+                    }
+                    Changed::Audit { node, added, gone, tip } => {
+                        let chain = &a.state.audit[&node];
+                        // A batch can add an hour and a later command in it drop it again.
+                        for hour in &added {
+                            if let Some(h) = chain.hours.get(hour) {
+                                let row = encode(h)?;
+                                hours
+                                    .insert((node.as_str(), hour.as_str()), row.as_slice())
+                                    .map_err(write_sm)?;
+                            }
+                        }
+                        for hour in &gone {
+                            hours.remove((node.as_str(), hour.as_str())).map_err(write_sm)?;
+                        }
+                        if let (true, Some(t)) = (tip, &chain.tip) {
+                            tips.insert(node.as_str(), encode(t)?.as_slice()).map_err(write_sm)?;
+                        }
                     }
                 }
             }

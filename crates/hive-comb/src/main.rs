@@ -123,10 +123,11 @@ async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
     };
     // Renewing starts now, since opening the comb over many cells can take longer than a lease.
     let stop = CancellationToken::new();
+    let audit = lease::AuditLink::default();
     let mut held = match keeper {
         Some((k, l, sent)) => {
             let file = cfg.data_dir.join(lease::FILE);
-            tokio::spawn(lease::keep(k, l, sent, file, stop.clone()))
+            tokio::spawn(lease::keep(k, l, sent, file, audit.clone(), stop.clone()))
         }
         None => tokio::spawn(std::future::pending()),
     };
@@ -138,7 +139,11 @@ async fn run(mut cfg: hive_comb::Config) -> std::io::Result<()> {
     if drivers.iter().next().is_none() {
         eprintln!("hive-comb: no backend can run here, so every create will be refused");
     }
+    let audit_dir = cfg.audit_dir.clone();
     let comb = hive_comb::Comb::open(cfg, drivers).await?;
+    if let (Some(log), Some(dir)) = (comb.audit(), audit_dir) {
+        let _ = audit.set((std::sync::Arc::downgrade(&log), dir));
+    }
     let listener = hive_comb::api::bind(&socket)?;
     let tcp = match listen {
         Some(addr) => Some(tokio::net::TcpListener::bind(addr).await.map_err(|e| {
