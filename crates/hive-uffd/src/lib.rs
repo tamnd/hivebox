@@ -1,10 +1,12 @@
 //! A restored microVM starts before its memory has arrived. This server answers its page faults from the snapshot's memory file, and fills in the pages the last restore touched before the VM asks for them.
 //!
-//! The design is in `spec/07_backends_snapshots.md`, section 3.4. A VMM restoring with the userfaultfd backend connects to a Unix socket and sends its guest memory regions as JSON, with the userfaultfd that covers them attached. [`Session::accept`] takes both, [`Session::prefetch`] fills in the pages of a [`Trace`] saved from an earlier restore, as REAP does, and [`Session::serve`] answers each fault with a copy of the page from the [`Memory`] file, which every VM restored from the same snapshot shares through the page cache. Memory the guest gives back, as the balloon does, comes back as zero pages. [`Guest`] plays the VMM's side, so all of this runs and is measured without a VM.
+//! The design is in `spec/07_backends_snapshots.md`, section 3.4. A VMM restoring with the userfaultfd backend connects to a Unix socket and sends its guest memory regions as JSON, with the userfaultfd that covers them attached. [`Session::accept`] takes both, [`Session::prefetch`] fills in the pages of a [`Trace`] saved from earlier restores, as REAP does, and [`Session::serve`] answers each fault with a copy of the page from the [`Memory`] file, which every VM restored from the same snapshot shares through the page cache. Memory the guest gives back, as the balloon does, comes back as zero pages. [`Guest`] plays the VMM's side, so all of this runs and is measured without a VM.
 //!
 //! When the snapshot's memory is kept in memory, on tmpfs or hugetlbfs or loaded with [`Memory::load`], a VMM can map it privately and register for minor faults. Each fault and each prefetch then maps the page cache page in with no copy, so every VM restored from the snapshot shares its clean pages, and a page is copied only when its VM first writes to it.
 //!
 //! The `hive-uffd` binary serves VMs from a worker process. The process that accepts them keeps a copy of each [`Hello`], with its userfaultfd, and when the worker dies it starts another and hands it every VM still running. [`Session::start`] wakes any thread whose fault the old worker read and never answered, so it faults again and the new worker sees it. The worker sends a [`Report`] for each range the guest gives back, and the next worker gets them with the VM, so those pages still read as zeros.
+//!
+//! The binary keeps the trace up to date with a [`Merged`]: the first restore's trace, plus each page that later restores faulted on twice, so a guest whose working set shifts from run to run still has most of it filled in.
 //!
 //! Streaming a remote snapshot in chunks comes later.
 
@@ -20,4 +22,4 @@ mod sys;
 #[cfg(target_os = "linux")]
 pub use hand::{Hello, Report, pair};
 #[cfg(target_os = "linux")]
-pub use server::{Guest, Memory, Region, Session, Stats, Trace};
+pub use server::{Guest, Memory, Merged, Region, Session, Stats, Trace};

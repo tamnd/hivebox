@@ -3,7 +3,7 @@
 use crate::hand::{self, Hello, Report};
 use crate::sys::{self, Event, Map, Uffd};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -183,6 +183,56 @@ impl Trace {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, self.0.iter().flat_map(|o| o.to_le_bytes()).collect::<Vec<u8>>())?;
         std::fs::rename(&tmp, path)
+    }
+}
+
+/// A trace built up over many restores of the same snapshot. The first restore's trace is taken
+/// whole. A restore after it faults only on the pages its prefetch missed, and a page joins the
+/// trace once it has been missed in `at_least` restores, so a page that one restore happened to
+/// touch is not prefetched for every VM after it.
+#[derive(Debug, Clone, Default)]
+pub struct Merged {
+    trace: Option<Trace>,
+    has: HashSet<u64>,
+    missed: HashMap<u64, u32>,
+    at_least: u32,
+}
+
+impl Merged {
+    /// Starts from `trace`, if there is one already, and adds a page once `at_least` restores
+    /// missed it.
+    pub fn new(trace: Option<Trace>, at_least: u32) -> Self {
+        let has = trace.iter().flat_map(|t| t.0.iter().copied()).collect();
+        Self { trace, has, missed: HashMap::new(), at_least: at_least.max(1) }
+    }
+
+    /// The trace so far, or `None` before the first restore.
+    pub fn trace(&self) -> Option<&Trace> {
+        self.trace.as_ref()
+    }
+
+    /// Takes in the trace of one restore that ended, and says how many pages joined the merged
+    /// trace.
+    pub fn add(&mut self, restore: &Trace) -> usize {
+        let Some(trace) = &mut self.trace else {
+            self.has = restore.0.iter().copied().collect();
+            self.trace = Some(restore.clone());
+            return restore.0.len();
+        };
+        let before = trace.0.len();
+        for &at in &restore.0 {
+            if self.has.contains(&at) {
+                continue;
+            }
+            let n = self.missed.entry(at).or_default();
+            *n += 1;
+            if *n >= self.at_least {
+                self.missed.remove(&at);
+                self.has.insert(at);
+                trace.0.push(at);
+            }
+        }
+        trace.0.len() - before
     }
 }
 
@@ -940,6 +990,20 @@ mod tests {
         drop(guest);
         let st = served.join().unwrap().unwrap();
         assert_eq!((st.faults, st.zero_faults), (1, 3));
+    }
+
+    #[test]
+    fn a_merged_trace_takes_a_page_once_two_restores_missed_it() {
+        let mut m = Merged::new(None, 2);
+        assert!(m.trace().is_none());
+        assert_eq!(m.add(&Trace(vec![3, 1, 2])), 3);
+        assert_eq!(m.add(&Trace(vec![9, 7])), 0);
+        assert_eq!(m.add(&Trace(vec![7, 8, 2])), 1);
+        assert_eq!(m.add(&Trace(vec![1, 7])), 0);
+        assert_eq!(m.trace().unwrap().0, vec![3, 1, 2, 7]);
+        let mut again = Merged::new(m.trace().cloned(), 2);
+        assert_eq!(again.add(&Trace(vec![7, 8])), 0);
+        assert_eq!(again.add(&Trace(vec![8])), 1);
     }
 
     #[test]

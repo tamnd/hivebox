@@ -7,7 +7,8 @@
 //! It listens on `PATH` and serves every VMM that connects from the memory file `FILE`, one thread
 //! per VM. With `--trace`, each restore first fills in the pages in the trace file. While there is
 //! no trace file yet, the first restore to end writes the pages it faulted in there, so the ones
-//! after it start from them.
+//! after it start from them. After that, a page later restores fault on joins the trace once two
+//! of them have, and the file is written again.
 //!
 //! When `FILE` is on tmpfs or hugetlbfs, a VMM that maps it privately and registers for minor
 //! faults gets its pages mapped in from the page cache, not copied, so all its VMs share them.
@@ -64,7 +65,7 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use hive_uffd::{Hello, Memory, Report, Session, Trace};
+    use hive_uffd::{Hello, Memory, Merged, Report, Session, Trace};
     use std::collections::BTreeMap;
     use std::os::fd::{AsFd, OwnedFd};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -73,6 +74,8 @@ mod linux {
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
 
+    /// How many restores have to miss a page before the trace takes it in.
+    const MISSED_IN: u32 = 2;
     /// How long a worker has to live for its death to be taken as bad luck, not a crash loop.
     const SETTLED: Duration = Duration::from_secs(10);
     const SHORTEST_PAUSE: Duration = Duration::from_millis(100);
@@ -226,7 +229,8 @@ mod linux {
                 return ExitCode::FAILURE;
             }
         };
-        let saved = Arc::new(Mutex::new(trace.as_deref().and_then(|p| Trace::load(p).ok())));
+        let loaded = trace.as_deref().and_then(|p| Trace::load(p).ok());
+        let saved = Arc::new(Mutex::new(Merged::new(loaded, MISSED_IN)));
         let mut serving = Vec::new();
         loop {
             let (vm, hello) = match Hello::receive(&control) {
@@ -259,7 +263,7 @@ mod linux {
         vm: u64,
         hello: Hello,
         memory: Arc<Memory>,
-        saved: &Mutex<Option<Trace>>,
+        saved: &Mutex<Merged>,
         path: Option<&Path>,
         control: &Arc<UnixStream>,
     ) {
@@ -269,7 +273,7 @@ mod linux {
         };
         s.report_to(control.clone(), vm);
         let started = Instant::now();
-        let prefetch = saved.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let prefetch = saved.lock().unwrap_or_else(PoisonError::into_inner).trace().cloned();
         if let Some(t) = &prefetch
             && let Err(e) = s.prefetch(t)
         {
@@ -288,12 +292,11 @@ mod linux {
             st.slowest.as_micros()
         );
         let mut saved = saved.lock().unwrap_or_else(PoisonError::into_inner);
-        if let (None, Some(path)) = (saved.as_ref(), path) {
-            let t = s.trace();
-            match t.save(path) {
-                Ok(()) => *saved = Some(t),
-                Err(e) => eprintln!("hive-uffd: {}: {e}", path.display()),
-            }
+        if saved.add(&s.trace()) > 0
+            && let (Some(t), Some(path)) = (saved.trace(), path)
+            && let Err(e) = t.save(path)
+        {
+            eprintln!("hive-uffd: {}: {e}", path.display());
         }
     }
 }
