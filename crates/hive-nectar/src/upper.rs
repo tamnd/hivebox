@@ -16,7 +16,9 @@
 //! that hold a secret. Every other file up to [`SCAN_MAX`] is searched for secrets such as private
 //! keys and cloud or API tokens, except under `site-packages`, `dist-packages` and `node_modules`,
 //! which come from public registries. A secret found outside the paths the caller allows stops the
-//! commit, and the error says where, but never what.
+//! commit, and the error says where, but never what. So does one in a file a Debian package put
+//! there, unless the file is still what the package shipped, by the md5sums dpkg keeps for it in
+//! the upper: libgnutls, for one, holds the private keys of its self tests.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -27,6 +29,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use md5::{Digest, Md5};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
 use crate::image::{Finding, Scrubbed};
@@ -205,6 +208,7 @@ pub fn write_tar<W: Write>(
         shift,
         scrub,
         links: HashMap::new(),
+        sums: None,
         xbuf: vec![0; 1 << 16],
         written: Written { scrubbed: scrub.map(|_| Scrubbed::default()), ..Written::default() },
     };
@@ -220,6 +224,9 @@ struct Walk<'a, W: Write> {
     scrub: Option<&'a Scrub>,
     /// The first path of each file with more than one link, by device and inode.
     links: HashMap<(u64, u64), PathBuf>,
+    /// The md5 of each file the packages installed in the upper shipped, by path, read the first
+    /// time a secret is found.
+    sums: Option<HashMap<Vec<u8>, [u8; 16]>>,
     xbuf: Vec<u8>,
     written: Written,
 }
@@ -359,6 +366,8 @@ impl<W: Write> Walk<'_, W> {
                     }
                     if scrub.allows(&path) {
                         report.allowed.extend(found);
+                    } else if shipped(&mut self.sums, self.upper, &path, &bytes) {
+                        report.shipped.extend(found);
                     } else {
                         self.written.found.extend(found);
                     }
@@ -552,6 +561,66 @@ fn not_searched(path: &str) -> bool {
     path.split('/').any(|c| NOT_SEARCHED.contains(&c))
 }
 
+/// Whether `bytes` at `path` is what a Debian package installed in the upper shipped there, by the
+/// md5sums dpkg keeps in the upper. With merged `/usr`, a package may list `lib/x` for what is at
+/// `usr/lib/x`.
+fn shipped(
+    sums: &mut Option<HashMap<Vec<u8>, [u8; 16]>>,
+    upper: &Path,
+    path: &str,
+    bytes: &[u8],
+) -> bool {
+    let sums = sums.get_or_insert_with(|| md5sums(upper));
+    let listed = [Some(path), path.strip_prefix("usr/")]
+        .into_iter()
+        .flatten()
+        .find_map(|p| sums.get(p.as_bytes()));
+    listed.is_some_and(|sum| Md5::digest(bytes)[..] == sum[..])
+}
+
+/// The md5 of each file the packages in `upper/var/lib/dpkg/info` shipped, by path. The cell
+/// wrote these lists, so a link is not followed and a list bigger than [`SCAN_MAX`] is not read.
+fn md5sums(upper: &Path) -> HashMap<Vec<u8>, [u8; 16]> {
+    let mut sums = HashMap::new();
+    let mut info = upper.to_path_buf();
+    for part in ["var", "lib", "dpkg", "info"] {
+        info.push(part);
+        if !fs::symlink_metadata(&info).is_ok_and(|m| m.is_dir()) {
+            return sums;
+        }
+    }
+    let Ok(lists) = fs::read_dir(&info) else { return sums };
+    for list in lists.flatten() {
+        if !list.file_name().as_bytes().ends_with(b".md5sums")
+            || !fs::symlink_metadata(list.path()).is_ok_and(|m| m.is_file() && m.len() <= SCAN_MAX)
+        {
+            continue;
+        }
+        let Ok(text) = fs::read(list.path()) else { continue };
+        for line in text.split(|&b| b == b'\n') {
+            // `<32 hex digits>  <path>`, the path without its leading slash.
+            if line.len() < 35 || &line[32..34] != b"  " {
+                continue;
+            }
+            let mut sum = [0u8; 16];
+            let hex = |b: u8| (b as char).to_digit(16);
+            let ok = sum.iter_mut().zip(line[..32].chunks(2)).all(|(s, h)| {
+                match (hex(h[0]), hex(h[1])) {
+                    (Some(hi), Some(lo)) => {
+                        *s = (hi * 16 + lo) as u8;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            if ok {
+                sums.insert(line[34..].to_vec(), sum);
+            }
+        }
+    }
+    sums
+}
+
 /// A git config with the users and tokens taken out of remote urls, and extra headers dropped.
 fn git_config(bytes: &[u8]) -> Vec<u8> {
     let urls = GIT_URL.replace_all(bytes, &b"${1}"[..]);
@@ -717,6 +786,35 @@ mod tests {
         let (_, w) = write_tar(&dir, None, None, Vec::new()).unwrap();
         assert!(w.found.is_empty() && w.scrubbed.is_none());
         assert_eq!(w.entries, 10);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_a_package_shipped_is_let_through_until_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("hive-upper-pkg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let key = format!("\0\0-----BEGIN PRIVATE KEY-----\nMIIB{}\n\0", "A".repeat(60));
+        let lib = "usr/lib/x86_64-linux-gnu/libtls.so.30";
+        fs::create_dir_all(dir.join("var/lib/dpkg/info")).unwrap();
+        fs::create_dir_all(dir.join("usr/lib/x86_64-linux-gnu")).unwrap();
+        fs::write(dir.join(lib), &key).unwrap();
+        fs::write(dir.join("usr/lib/x86_64-linux-gnu/libother.so"), &key).unwrap();
+        let sum: String = Md5::digest(key.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let list = format!("{sum}  {lib}\n{sum}  lib/x86_64-linux-gnu/libother.so\nnot a line\n");
+        fs::write(dir.join("var/lib/dpkg/info/libtls30:amd64.md5sums"), list).unwrap();
+
+        let (_, w) = write_tar(&dir, None, Some(&Scrub::default()), Vec::new()).unwrap();
+        assert!(w.found.is_empty(), "{:?}", w.found);
+        let shipped: Vec<&str> =
+            w.scrubbed.as_ref().unwrap().shipped.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(shipped, ["usr/lib/x86_64-linux-gnu/libother.so", lib]);
+
+        // Changed after it was installed, it is the cell's file, and so is one no package lists.
+        fs::write(dir.join(lib), format!("{key}x")).unwrap();
+        fs::write(dir.join("usr/lib/x86_64-linux-gnu/libmine.so"), &key).unwrap();
+        let (_, w) = write_tar(&dir, None, Some(&Scrub::default()), Vec::new()).unwrap();
+        let found: Vec<&str> = w.found.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(found, ["usr/lib/x86_64-linux-gnu/libmine.so", lib]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

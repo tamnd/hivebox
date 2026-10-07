@@ -71,6 +71,7 @@ hyper-util = { version = "0.1", default-features = false }
 landlock = "0.4"
 libc = "0.2"
 libcontainer = { version = "0.7", default-features = false }
+md-5 = "0.10"
 nix = { version = "0.29", default-features = false }
 # The keeper's Raft. 0.9 is the release line on crates.io, and its v1 storage trait keeps the
 # log and the state machine in one store.
