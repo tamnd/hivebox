@@ -68,8 +68,10 @@ def test_a_verify_result_keeps_the_verdict_and_the_error():
     r = _client.VerifyResult._from(verify_pb2.VerifyResult(
         passed=True, exit_code=0, output=b"1 passed", scores={"tests_passed": 1.0}, tampered=["tests/a.py"],
         runs_passed=3))
-    assert (r.passed, r.output, r.scores, r.tampered, r.runs_passed, r.error, r.is_infra_error) == (
-        True, b"1 passed", {"tests_passed": 1.0}, ["tests/a.py"], 3, None, False)
+    assert (r.passed, r.output, r.scores, r.tampered, r.runs_passed, r.error, r.is_infra_error, r.not_passed) == (
+        True, b"1 passed", {"tests_passed": 1.0}, ["tests/a.py"], 3, None, False, [])
+    r = _client.VerifyResult._from(verify_pb2.VerifyResult(not_passed=["t.py::a"]))
+    assert (r.passed, r.not_passed) == (False, ["t.py::a"])
     r = _client.VerifyResult._from(verify_pb2.VerifyResult(
         error=types_pb2.Error(reason="CAPACITY_UNAVAILABLE", message="full", is_infra_error=True)))
     assert isinstance(r.error, hivebox.CapacityUnavailable) and r.is_infra_error and not r.passed

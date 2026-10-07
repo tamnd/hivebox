@@ -5,6 +5,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 ## Unreleased
 
 - The drone's seccomp filter looks at `ioctl` requests. Terminal, socket, file flag and reflink requests pass, `TIOCSTI` and the ext4 extent swaps fail with EPERM, and the rest, `XFS_IOC_SWAPEXT` among them, fail with ENOTTY. The three filters are now one program, so an allowed `ioctl` costs 149 to 185 ns more than with no filter on server3, not 795 to 1,006 ns. `/proc/kpagecount` is masked in containers, as `kpagecgroup` and `kpageflags` were.
+- A verify can name a JUnit report with `report`, and tests that have to pass with `must_pass`, in the API, `hivectl verify --report PATH --must-pass TEST`, the SDK and pollen tasks. A run then passes only when it exited with 0 and left the report with no test failed or errored and each test in `must_pass` passed, so a `sys.exit(0)` slipped into the code under test no longer passes. The report is removed before each run, its counts replace the ones read from the output, and the tests that did not pass come back in `not_passed`.
 
 ## 0.0.33
 

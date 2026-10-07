@@ -221,6 +221,8 @@ fn verify_request(task: &Task, subject: &str) -> v1::VerifyRequest {
         protected_paths: v.protected_paths.clone(),
         files: v.files.iter().map(|(k, c)| (k.clone(), c.clone().into_bytes().into())).collect(),
         repeats: v.repeats,
+        report: v.report.clone().unwrap_or_default(),
+        must_pass: v.must_pass.clone(),
     }
 }
 
@@ -240,6 +242,7 @@ mod tests {
                 "policy":{"script":[["true"]]},
                 "verify":{"argv":["pytest","-q"],"protected_paths":["tests/**"],
                           "files":{"hidden.py":"assert 1\n"},"repeats":3,"timeout_s":30,
+                          "report":"/tmp/r.xml","must_pass":["tests/test_a.py::test_b"],
                           "cell":{"mem_mib":2048,"vcpu_milli":2000}}}"#,
         )
         .unwrap()
@@ -261,6 +264,10 @@ mod tests {
         assert_eq!(r.subject_cell_id, "c1");
         assert_eq!(r.workdir, "/testbed");
         assert_eq!(r.repeats, 3);
+        assert_eq!(
+            (r.report.as_str(), r.must_pass.as_slice()),
+            ("/tmp/r.xml", &["tests/test_a.py::test_b".to_owned()][..])
+        );
         assert_eq!(r.timeout.unwrap().seconds, 30);
         assert_eq!(&r.files["hidden.py"][..], b"assert 1\n");
         let res = r.verifier.unwrap().resources.unwrap();

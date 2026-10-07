@@ -564,6 +564,60 @@ async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
     let got = verify.run(req("p", r)).await.unwrap().into_inner();
     assert!(got.passed);
     assert_eq!(&got.output[..], b"plain\n");
+
+    // With a report, a run passes on what the report says. One left from before is removed
+    // first, so exiting with 0 and writing none fails, whatever the output says.
+    let report = s.0.join("report.xml");
+    let xml = |cases: &str| {
+        format!("printf '%s' \"<testsuite>{cases}</testsuite>\" > {}", report.display())
+    };
+    let good = xml("<testcase classname='t' name='a'/><testcase classname='t' name='b'/>");
+    std::fs::write(&report, "<testsuite><testcase classname='t' name='a'/></testsuite>").unwrap();
+    let plain = v1::VerifyRequest {
+        subject_cell_id: String::new(),
+        workdir: String::new(),
+        report: report.to_str().unwrap().into(),
+        must_pass: vec!["t.py::a".into()],
+        ..base.clone()
+    };
+    let r = v1::VerifyRequest { argv: sh("echo '=== 3 passed in 0.01s ==='"), ..plain.clone() };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(!got.passed && got.error.is_none());
+    assert_eq!((got.runs_passed, got.exit_code), (0, 0));
+    assert_eq!(got.not_passed, ["t.py::a"]);
+    assert_eq!(got.scores["report"], 0.0);
+    assert!(!got.scores.contains_key("tests_passed"), "the printed counts are not taken");
+    let r = v1::VerifyRequest {
+        argv: sh(&format!("{good}; echo '=== 9 passed in 0.01s ==='")),
+        repeats: 2,
+        ..plain.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.passed && got.not_passed.is_empty());
+    assert_eq!(got.runs_passed, 2);
+    assert_eq!((got.scores["report"], got.scores["tests_passed"]), (1.0, 2.0));
+    // A test that had to pass and is not there fails the run, and so does one that failed.
+    let r = v1::VerifyRequest {
+        argv: sh(&good),
+        must_pass: vec!["t.py::a".into(), "t.py::c".into()],
+        ..plain.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(!got.passed);
+    assert_eq!(got.not_passed, ["t.py::c"]);
+    let r = v1::VerifyRequest {
+        argv: sh(&xml(
+            "<testcase classname='t' name='a'/><testcase classname='t' name='b'><failure/></testcase>",
+        )),
+        ..plain.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(!got.passed && got.not_passed.is_empty());
+    assert_eq!(got.scores["tests_failed"], 1.0);
+    let r = v1::VerifyRequest { argv: sh("true"), report: String::new(), ..plain.clone() };
+    assert_eq!(reason(&verify.run(req("p", r)).await.unwrap_err()), Reason::InvalidArgument);
+    let r = v1::VerifyRequest { argv: sh("true"), report: "r.xml".into(), ..plain.clone() };
+    assert_eq!(reason(&verify.run(req("p", r)).await.unwrap_err()), Reason::InvalidArgument);
     // Every verifier cell is gone, and the subject is still there.
     assert_eq!(fake.live(), 1);
     api.stop.cancel();

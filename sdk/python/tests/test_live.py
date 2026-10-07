@@ -159,3 +159,33 @@ async def test_verify_checks_a_cells_changes_in_a_cell_of_its_own():
         # With no subject the image is checked as it is, and has no probe.txt.
         r = await hive.verify(check, verifier=verifier, workdir=GIT_WORKDIR, files={"hidden.txt": "7\n"})
         assert (r.passed, r.exit_code, r.runs_passed, r.error) == (False, 1, 0, None)
+
+
+# Stands in for pytest --junitxml, which the image may not have: it imports the subject's code and
+# writes a report of one test.
+CHECK = """import sys
+import probe
+ok = probe.answer() == 42
+with open(sys.argv[1], "w") as f:
+    f.write('<testsuite><testcase classname="check" name="answer">%s</testcase></testsuite>' % ("" if ok else "<failure/>"))
+"""
+
+
+@pytest.mark.skipif(not GIT_IMAGE, reason="set HIVE_TEST_GIT_IMAGE to an image with a git checkout at HIVE_TEST_GIT_WORKDIR")
+async def test_verify_with_a_report_is_not_fooled_by_an_early_exit():
+    verifier = hivebox.Spec(image=GIT_IMAGE, backend="container", mem_mib=512)
+    check = ["python3", "check.py", "/tmp/report.xml"]
+    kw = dict(verifier=verifier, workdir=GIT_WORKDIR, files={"check.py": CHECK})
+    async with hivebox.AsyncHive(ENDPOINT, project="sdk-test") as hive:
+        cell = await hive.cells.create(hivebox.Spec(image=GIT_IMAGE, backend="container", mem_mib=512))
+        try:
+            await cell.files.write(f"{GIT_WORKDIR}/probe.py", "import sys\nsys.exit(0)\n")
+            r = await hive.verify(check, subject=cell, **kw)
+            assert (r.passed, r.exit_code) == (True, 0), "an exit code alone is fooled"
+            r = await hive.verify(check, subject=cell, report="/tmp/report.xml", must_pass=["check.py::answer"], **kw)
+            assert (r.passed, r.exit_code, r.not_passed, r.scores["report"]) == (False, 0, ["check.py::answer"], 0.0)
+            await cell.files.write(f"{GIT_WORKDIR}/probe.py", "def answer():\n    return 42\n")
+            r = await hive.verify(check, subject=cell, report="/tmp/report.xml", must_pass=["check.py::answer"], **kw)
+            assert (r.passed, r.not_passed, r.scores["tests_passed"], r.error) == (True, [], 1.0, None), r.output
+        finally:
+            await cell.stop()

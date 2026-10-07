@@ -41,9 +41,11 @@ Commands:
 
 Verifying:
   verify IMAGE [--subject ID] --workdir DIR [--protect GLOB]... [--file PATH=LOCAL]...
-         [--repeats N] [--timeout DURATION] [--mem MIB] [--cpu MILLICORES] -- ARGV...
+         [--repeats N] [--timeout DURATION] [--mem MIB] [--cpu MILLICORES]
+         [--report PATH [--must-pass TEST]...] -- ARGV...
          takes the subject's changes to the git checkout in DIR, minus protected paths, and
-         runs ARGV on them in a fresh cell of IMAGE with no network
+         runs ARGV on them in a fresh cell of IMAGE with no network; with --report, a run
+         passes on the JUnit report it writes at PATH, with each TEST in it passed
 
 Files:
   cat ID PATH
@@ -331,6 +333,8 @@ async fn verify(client: &Client, args: &Args) -> Result<i32, String> {
         "--timeout",
         "--mem",
         "--cpu",
+        "--report",
+        "--must-pass",
     ])?;
     let Some((image, argv)) = args.rest.split_first().filter(|(_, a)| !a.is_empty()) else {
         return Err("verify needs an image and a command".into());
@@ -364,12 +368,17 @@ async fn verify(client: &Client, args: &Args) -> Result<i32, String> {
         protected_paths: args.all(&["--protect"]).into_iter().map(String::from).collect(),
         files,
         repeats: number("--repeats")?.unwrap_or(1),
+        report: args.one(&["--report"]).unwrap_or_default().to_string(),
+        must_pass: args.all(&["--must-pass"]).into_iter().map(String::from).collect(),
     };
     let r = client.verify(req).await.map_err(err)?;
     std::io::stdout().write_all(&r.output).map_err(|e| e.to_string())?;
     let repeats = number("--repeats")?.unwrap_or(1).max(1);
     for p in &r.tampered {
         eprintln!("hivectl: left out a change to protected {p}");
+    }
+    for t in &r.not_passed {
+        eprintln!("hivectl: {t} did not pass");
     }
     let mut scores: Vec<_> = r.scores.iter().collect();
     scores.sort_by(|a, b| a.0.cmp(b.0));

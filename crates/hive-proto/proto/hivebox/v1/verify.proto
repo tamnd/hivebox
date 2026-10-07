@@ -32,10 +32,19 @@ message VerifyRequest {
   map<string, bytes> files = 7;
   // How many times to run the command. 1 when zero.
   uint32 repeats = 8;
+  // A JUnit XML report the command writes, as with pytest's --junitxml. When set, a run passes
+  // only when it exits with 0 and leaves a report with tests in it, none failed or errored, and
+  // every test in `must_pass` passed. A run the subject's code cut short with an exit of 0 leaves
+  // none. The file is removed before each run, so one left over or brought in by the changes does
+  // not count. A relative path is under `workdir`.
+  string report = 9;
+  // Tests the report has to show passing, as pytest node ids like tests/test_a.py::test_b, or as
+  // the report names them, the class name and the name joined by a dot.
+  repeated string must_pass = 10;
 }
 
 message VerifyResult {
-  // Every run of the command exited with 0.
+  // Every run of the command passed.
   bool passed = 1;
   // The exit code of the last run, or -1 when a signal or the timeout ended it.
   int32 exit_code = 2;
@@ -51,6 +60,9 @@ message VerifyResult {
   repeated string tampered = 6;
   // The runs did not all agree.
   bool flaky = 7;
-  // Runs that exited with 0.
+  // Runs that passed: exited with 0, and with a good report when one was asked for.
   uint32 runs_passed = 8;
+  // The tests in `must_pass` the last run's report did not show passing, or all of them when it
+  // left no report.
+  repeated string not_passed = 9;
 }
