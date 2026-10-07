@@ -340,6 +340,27 @@ impl DnsAllow {
         let until = boottime().saturating_add(u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX));
         self.0.insert(DnsKey { cell, ip: net(ip) }, until, 0).map_err(|e| failed("dns_allow", e))
     }
+
+    /// Takes back everything the DNS proxy let the cell with this `idx` reach, and returns how
+    /// many addresses that was. It reads the whole map, so it is for a quarantine and not for
+    /// every stop.
+    ///
+    /// # Errors
+    ///
+    /// The kernel refused a delete.
+    pub fn forget(&mut self, cell: u32) -> io::Result<usize> {
+        let keys: Vec<DnsKey> =
+            self.0.keys().filter_map(Result::ok).filter(|k| k.cell == cell).collect();
+        for k in &keys {
+            match self.0.remove(k) {
+                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
+                Err(aya::maps::MapError::SyscallError(e))
+                    if e.io_error.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(failed("dns_allow", e)),
+            }
+        }
+        Ok(keys.len())
+    }
 }
 
 fn boottime() -> u64 {

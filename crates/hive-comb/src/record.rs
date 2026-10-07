@@ -39,6 +39,9 @@ pub(crate) struct Record {
     /// unpacked image.
     #[prost(bytes = "vec", tag = "11")]
     pub(crate) image: Vec<u8>,
+    /// Frozen and cut off from the network until it is stopped.
+    #[prost(bool, tag = "12")]
+    pub(crate) quarantined: bool,
 }
 
 /// A [`CellHandle`] as stored.

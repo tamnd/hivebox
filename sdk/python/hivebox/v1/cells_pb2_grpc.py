@@ -70,6 +70,11 @@ class CellsStub:
                 request_serializer=hivebox_dot_v1_dot_cells__pb2.StopRequest.SerializeToString,
                 response_deserializer=hivebox_dot_v1_dot_types__pb2.BulkResult.FromString,
                 _registered_method=True)
+        self.Quarantine = channel.unary_unary(
+                '/hivebox.v1.Cells/Quarantine',
+                request_serializer=hivebox_dot_v1_dot_cells__pb2.QuarantineRequest.SerializeToString,
+                response_deserializer=hivebox_dot_v1_dot_cells__pb2.QuarantineResponse.FromString,
+                _registered_method=True)
         self.ExtendTtl = channel.unary_unary(
                 '/hivebox.v1.Cells/ExtendTtl',
                 request_serializer=hivebox_dot_v1_dot_cells__pb2.ExtendTtlRequest.SerializeToString,
@@ -134,6 +139,15 @@ class CellsServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Quarantine(self, request, context):
+        """Freezes each cell for good, cuts it off the network and keeps an unscrubbed disk snapshot of
+        it for forensics. A quarantined cell stays paused until it is stopped: it cannot be resumed
+        and no timer stops it.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ExtendTtl(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -189,6 +203,11 @@ def add_CellsServicer_to_server(servicer, server):
                     servicer.Stop,
                     request_deserializer=hivebox_dot_v1_dot_cells__pb2.StopRequest.FromString,
                     response_serializer=hivebox_dot_v1_dot_types__pb2.BulkResult.SerializeToString,
+            ),
+            'Quarantine': grpc.unary_unary_rpc_method_handler(
+                    servicer.Quarantine,
+                    request_deserializer=hivebox_dot_v1_dot_cells__pb2.QuarantineRequest.FromString,
+                    response_serializer=hivebox_dot_v1_dot_cells__pb2.QuarantineResponse.SerializeToString,
             ),
             'ExtendTtl': grpc.unary_unary_rpc_method_handler(
                     servicer.ExtendTtl,
@@ -395,6 +414,33 @@ class Cells:
             '/hivebox.v1.Cells/Stop',
             hivebox_dot_v1_dot_cells__pb2.StopRequest.SerializeToString,
             hivebox_dot_v1_dot_types__pb2.BulkResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Quarantine(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/hivebox.v1.Cells/Quarantine',
+            hivebox_dot_v1_dot_cells__pb2.QuarantineRequest.SerializeToString,
+            hivebox_dot_v1_dot_cells__pb2.QuarantineResponse.FromString,
             options,
             channel_credentials,
             insecure,

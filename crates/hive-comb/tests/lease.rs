@@ -109,13 +109,14 @@ async fn a_comb_keeps_its_epoch_until_it_registers_afresh() {
 async fn a_comb_that_cannot_register_before_its_last_lease_runs_out_says_so() {
     let dir = Dir::new("lapse");
     let file = dir.0.join(lease::FILE);
+    // Timed from before the lease's end is set, so a slow setup can't make the wait look short.
+    let started = Instant::now();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
     let until = u64::try_from(now.as_millis()).unwrap() + 1200;
     std::fs::write(&file, format!("4 2 {until}\n")).unwrap();
     // Nothing listens on port 1.
     let link = link("127.0.0.1:1", "node-a");
     let mut k = Keeper::new(&link.members).unwrap();
-    let started = Instant::now();
     assert_eq!(lease::register(&mut k, &link, &dir.0).await.unwrap(), Start::Lapsed(4, 2));
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(1200) && took < Duration::from_secs(4), "{took:?}");

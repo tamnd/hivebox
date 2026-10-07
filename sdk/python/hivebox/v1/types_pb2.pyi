@@ -191,7 +191,7 @@ class CellSpec(_message.Message):
     def __init__(self, template: _Optional[str] = ..., image: _Optional[_Union[ImageRef, _Mapping]] = ..., snapshot: _Optional[_Union[SnapshotRef, _Mapping]] = ..., backend: _Optional[_Union[Backend, str]] = ..., resources: _Optional[_Union[Resources, _Mapping]] = ..., qos: _Optional[_Union[Qos, str]] = ..., network_profile: _Optional[str] = ..., idle_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., idle_action: _Optional[_Union[IdleAction, str]] = ..., hard_ttl: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., labels: _Optional[_Mapping[str, str]] = ..., env: _Optional[_Mapping[str, str]] = ..., limits: _Optional[_Union[Limits, _Mapping]] = ..., trusted_image: _Optional[bool] = ..., checkpoint: _Optional[_Union[CheckpointPolicy, _Mapping]] = ..., burst_until_ready: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ...) -> None: ...
 
 class Cell(_message.Message):
-    __slots__ = ("id", "project", "state", "cause", "backend", "spec", "node", "created_at", "state_since", "expires_at", "labels")
+    __slots__ = ("id", "project", "state", "cause", "backend", "spec", "node", "created_at", "state_since", "expires_at", "labels", "quarantined")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -210,6 +210,7 @@ class Cell(_message.Message):
     STATE_SINCE_FIELD_NUMBER: _ClassVar[int]
     EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
     LABELS_FIELD_NUMBER: _ClassVar[int]
+    QUARANTINED_FIELD_NUMBER: _ClassVar[int]
     id: str
     project: str
     state: CellState
@@ -221,7 +222,8 @@ class Cell(_message.Message):
     state_since: _timestamp_pb2.Timestamp
     expires_at: _timestamp_pb2.Timestamp
     labels: _containers.ScalarMap[str, str]
-    def __init__(self, id: _Optional[str] = ..., project: _Optional[str] = ..., state: _Optional[_Union[CellState, str]] = ..., cause: _Optional[_Union[Cause, str]] = ..., backend: _Optional[_Union[Backend, str]] = ..., spec: _Optional[_Union[CellSpec, _Mapping]] = ..., node: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., state_since: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., labels: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    quarantined: bool
+    def __init__(self, id: _Optional[str] = ..., project: _Optional[str] = ..., state: _Optional[_Union[CellState, str]] = ..., cause: _Optional[_Union[Cause, str]] = ..., backend: _Optional[_Union[Backend, str]] = ..., spec: _Optional[_Union[CellSpec, _Mapping]] = ..., node: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., state_since: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., labels: _Optional[_Mapping[str, str]] = ..., quarantined: _Optional[bool] = ...) -> None: ...
 
 class Error(_message.Message):
     __slots__ = ("reason", "message", "is_infra_error", "retryable", "errno")

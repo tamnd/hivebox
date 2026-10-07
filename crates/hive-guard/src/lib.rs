@@ -65,6 +65,9 @@ impl Profile {
     pub const MIRRORS: Self = Self(2);
     /// What `mirrors` has, and the LLM gateway.
     pub const LLM: Self = Self(3);
+    /// Nothing at all, not even the DNS proxy. A quarantined cell gets it, and no rules are ever
+    /// written for it.
+    pub const QUARANTINE: Self = Self(0);
     /// The built-in profiles.
     pub const BUILTIN: [Self; 3] = [Self::NONE, Self::MIRRORS, Self::LLM];
 

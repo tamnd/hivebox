@@ -28,7 +28,7 @@ impl Cells for Loopback {
         (a == 127).then_some(((u32::from(c) << 8) | u32::from(d), Profile(16)))
     }
 
-    fn allow(&self, _: u32, ips: &[Ipv4Addr], _: Duration) -> io::Result<()> {
+    fn allow(&self, _: Ipv4Addr, _: u32, ips: &[Ipv4Addr], _: Duration) -> io::Result<()> {
         self.allowed.fetch_add(ips.len() as u64, Ordering::Relaxed);
         Ok(())
     }

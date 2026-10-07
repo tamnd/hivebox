@@ -27,6 +27,7 @@ pub const OPS: &[&str] = &[
     "pause",
     "resume",
     "stop",
+    "quarantine",
     "extend_ttl",
     "update_policy",
     "expose_port",

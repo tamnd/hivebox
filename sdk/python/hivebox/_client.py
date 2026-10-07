@@ -249,6 +249,26 @@ class BulkResult:
         return cls(r.matched, r.succeeded, failures)
 
 
+@dataclass
+class Quarantined:
+    """What a quarantine did to one cell. `network` is "cut", "loopback" when the cell had only
+    loopback, or "unmanaged" when the node gives cells no network namespace of their own, so
+    nothing could be cut. `snapshot` is the id of its disk snapshot, or None with why in
+    `snapshot_error`."""
+
+    network: str
+    snapshot: str | None
+    snapshot_error: _errors.HiveError | None
+
+    @classmethod
+    def _from(cls, c) -> Quarantined:
+        error = None
+        if c.HasField("snapshot_error"):
+            e = c.snapshot_error
+            error = _errors.make(e.reason, e.message, is_infra_error=e.is_infra_error, errno_name=e.errno or None)
+        return cls(c.network, c.snapshot_id or None, error)
+
+
 def _selector(selector: str | Mapping[str, str] | Cell) -> types_pb2.CellSelector:
     if isinstance(selector, Cell):
         return types_pb2.CellSelector(id=selector.id)
@@ -468,6 +488,15 @@ class Cells:
         req = cells_pb2.StopRequest(selector=_selector(selector))
         return BulkResult._from(await self._hive._call(self._hive._cells.Stop, req, retry=True))
 
+    async def quarantine(self, selector: str | Mapping[str, str] | Cell,
+                         reason: str = "") -> tuple[BulkResult, dict[str, Quarantined]]:
+        """Freezes each cell for good, cuts it off the network and keeps an unscrubbed disk
+        snapshot of it. A quarantined cell stays paused until it is stopped. Returns what was
+        done to each cell by id. `reason` goes in the audit log."""
+        req = cells_pb2.QuarantineRequest(selector=_selector(selector), reason=reason)
+        r = await self._hive._call(self._hive._cells.Quarantine, req)
+        return BulkResult._from(r.result), {c.cell_id: Quarantined._from(c) for c in r.cells}
+
     async def watch(self, selector: str | Mapping[str, str] | Cell | None = None) -> AsyncIterator[tuple[str, str, str]]:
         """Yields (cell id, from state, to state) as cells change, starting with each one's
         current state with an empty from. A watch of one cell ends once the cell has ended, and
@@ -561,6 +590,16 @@ class Cell:
 
     async def stop(self) -> None:
         _one(await self._hive.cells.stop(self.id))
+
+    async def quarantine(self, reason: str = "") -> Quarantined:
+        """Quarantines the cell, as Cells.quarantine does."""
+        r, done = await self._hive.cells.quarantine(self.id, reason)
+        _one(r)
+        return done[self.id]
+
+    @property
+    def quarantined(self) -> bool:
+        return self.info.quarantined
 
     async def snapshot(self, *, scrub: bool = False, allow: Iterable[str] = ()) -> str:
         """Takes a disk snapshot of the cell, as AsyncHive.snapshot does."""

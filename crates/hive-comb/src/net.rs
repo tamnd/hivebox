@@ -158,6 +158,18 @@ impl Net {
         Ok(())
     }
 
+    /// Cuts cell `id` off: from its next packet nothing it sends gets anywhere, the DNS proxy and
+    /// the node's other services included, and what the proxy resolved for it before is taken
+    /// back. Only a stop undoes it. Returns how many resolved addresses were taken back.
+    pub(crate) fn isolate(&self, veth: &Veth, id: CellId) -> io::Result<usize> {
+        let idx = idx(id);
+        let cell = CellNet { idx, ip: veth.ip, mac: Some(veth.mac), profile: Profile::QUARANTINE };
+        self.state().guard.set_cell(veth.ifindex, &cell)?;
+        let mut allow = self.book.allow.lock().unwrap_or_else(PoisonError::into_inner);
+        self.book.set(veth.ip, None);
+        allow.forget(idx)
+    }
+
     /// The cell with address `ip` and its profile, for the node's services on the VIPs, which
     /// see a cell only by the address it connects from.
     pub(crate) fn cell_at(&self, ip: Ipv4Addr) -> Option<(CellId, Profile)> {
@@ -183,7 +195,10 @@ impl Net {
         let mut s = self.state();
         let cell = s.guard.cell(ifindex).ok()??;
         s.ips.claim(cell.ip);
-        self.book.set(cell.ip, Some(Seat { idx: cell.idx, profile: cell.profile, id }));
+        // A quarantined cell stays out of the book, so the node's services do not know it.
+        if cell.profile != Profile::QUARANTINE {
+            self.book.set(cell.ip, Some(Seat { idx: cell.idx, profile: cell.profile, id }));
+        }
         Some(Veth { host, ifindex, ip: cell.ip, mac: cell.mac.unwrap_or(wire::macs(n).1) })
     }
 
@@ -249,8 +264,13 @@ impl Cells for Book {
         self.seat(ip).map(|s| (s.idx, s.profile))
     }
 
-    fn allow(&self, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
+    fn allow(&self, from: Ipv4Addr, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
         let mut allow = self.allow.lock().unwrap_or_else(PoisonError::into_inner);
+        // Checked under the lock, so an answer still being looked up when its cell is cut off
+        // cannot let it reach anything after `isolate` has taken the rest away.
+        if self.seat(from).is_none_or(|s| s.idx != idx) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "the cell is no longer there"));
+        }
         ips.iter().try_for_each(|&ip| allow.allow(idx, ip, ttl))
     }
 }

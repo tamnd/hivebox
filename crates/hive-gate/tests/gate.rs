@@ -231,6 +231,26 @@ impl Cells for FakeComb {
         )))
     }
 
+    async fn quarantine(
+        &self,
+        req: Request<v1::QuarantineRequest>,
+    ) -> Result<Response<v1::QuarantineResponse>, Status> {
+        let project = project(&req);
+        let sel = req.into_inner().selector;
+        let cells = self
+            .picked(&project, sel.clone())
+            .into_iter()
+            .map(|id| v1::QuarantinedCell {
+                cell_id: id.to_string(),
+                network: "cut".into(),
+                snapshot_id: format!("snap-{id}"),
+                snapshot_error: None,
+            })
+            .collect();
+        let result = self.set_state(&project, sel, v1::CellState::Paused);
+        Ok(Response::new(v1::QuarantineResponse { result: Some(result), cells }))
+    }
+
     async fn extend_ttl(
         &self,
         req: Request<v1::ExtendTtlRequest>,
@@ -768,13 +788,22 @@ async fn a_batch_is_spread_and_every_call_finds_its_cell() {
     want.sort_by_key(|id| id.parse::<CellId>().unwrap());
     assert_eq!(seen, want);
 
-    // By label, a stop reaches both nodes.
+    // By label, a quarantine reaches both nodes and names every cell it took.
     create(&c, 5, "b").await;
     let sel = v1::CellSelector {
         by: Some(v1::cell_selector::By::Labels(v1::LabelSelector {
             r#match: [("run".to_string(), "a".to_string())].into(),
         })),
     };
+    let req = v1::QuarantineRequest { selector: Some(sel.clone()), reason: "test".into() };
+    let q = c.cells().quarantine(authed(req)).await.unwrap().into_inner();
+    let r = q.result.unwrap();
+    assert_eq!((r.matched, r.succeeded, r.failures.len()), (40, 40, 0));
+    let mut took: Vec<String> = q.cells.into_iter().map(|c| c.cell_id).collect();
+    took.sort_by_key(|id| id.parse::<CellId>().unwrap());
+    assert_eq!(took, want);
+
+    // By label, a stop reaches both nodes.
     let r = c
         .cells()
         .stop(authed(v1::StopRequest { selector: Some(sel), snapshot: false }))
