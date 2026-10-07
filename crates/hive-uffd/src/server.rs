@@ -3,6 +3,7 @@
 use crate::sys::{self, Event, Map, Uffd};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -85,9 +86,16 @@ impl Region {
 
 /// A snapshot's memory file, mapped once and shared by every VM restored from it, so the pages
 /// they all start from are in the page cache once.
+///
+/// When the file is in memory, on tmpfs or hugetlbfs or made by [`Memory::load`], a VMM can map
+/// it privately and register its guest memory for minor faults. The server then maps each page
+/// in from the page cache with no copy, every VM shares the clean pages, and a page is copied
+/// only when its VM first writes to it.
 #[derive(Debug)]
 pub struct Memory {
     map: Map,
+    file: File,
+    in_memory: bool,
 }
 
 impl Memory {
@@ -97,7 +105,35 @@ impl Memory {
     ///
     /// The file cannot be opened or mapped, or is empty.
     pub fn open(path: &Path) -> io::Result<Self> {
-        Ok(Self { map: Map::file(path)? })
+        Self::from_file(File::open(path)?)
+    }
+
+    /// Copies the memory file at `path` into a file in memory and maps that, so VMs can be served
+    /// in minor fault mode from one copy of the snapshot's pages.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, is empty, or the copy does not fit in memory.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let mut file = sys::memfd("hive-uffd")?;
+        io::copy(&mut File::open(path)?, &mut file)?;
+        Self::from_file(file)
+    }
+
+    fn from_file(file: File) -> io::Result<Self> {
+        Ok(Self { map: Map::file(&file)?, in_memory: sys::in_memory(&file)?, file })
+    }
+
+    /// The file the pages are in, for a VMM in the same process or one it is passed to.
+    #[must_use]
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Whether the file is in memory, so VMs that map it can take minor faults.
+    #[must_use]
+    pub fn in_memory(&self) -> bool {
+        self.in_memory
     }
 
     /// The file's length in bytes.
@@ -154,6 +190,8 @@ impl Trace {
 pub struct Stats {
     /// Faults answered with a page from the memory file.
     pub faults: u64,
+    /// Of those, the faults answered by mapping the page in from the page cache, with no copy.
+    pub mapped: u64,
     /// Faults answered with a zero page, for memory the guest had given back.
     pub zero_faults: u64,
     /// Faults on a page that was already there by the time the server got to it.
@@ -179,6 +217,9 @@ pub struct Session {
     pending: VecDeque<Event>,
     trace: Vec<u64>,
     stats: Stats,
+    /// Whether a prefetch maps pages in, which it does until the kernel says the VM's memory is
+    /// not registered for minor faults.
+    map_in: bool,
 }
 
 impl Session {
@@ -205,11 +246,12 @@ impl Session {
             uffd: Uffd::from(fd),
             stream,
             regions,
-            memory,
             removed: Vec::new(),
             pending: VecDeque::new(),
             trace: Vec::new(),
             stats: Stats::default(),
+            map_in: memory.in_memory(),
+            memory,
         })
     }
 
@@ -233,7 +275,7 @@ impl Session {
     }
 
     /// Fills in the pages in `trace` before the VM asks for them. Neighbouring pages go in one
-    /// copy of up to 2 MiB, and faults that come in meanwhile are answered between copies. A VM
+    /// copy, or one mapping in minor fault mode, of up to 2 MiB, and faults that come in meanwhile are answered between copies. A VM
     /// that goes away before the prefetch is done ends it, since there is nothing left to fill.
     ///
     /// # Errors
@@ -297,7 +339,7 @@ impl Session {
     fn answer_waiting(&mut self) -> io::Result<()> {
         while let Some(event) = self.next_event()? {
             match event {
-                Event::Fault { addr } => self.fault(addr)?,
+                Event::Fault { addr, minor } => self.fault(addr, minor)?,
                 Event::Remove { start, end } => self.remove(start, end),
                 Event::Other(_) => {}
             }
@@ -312,7 +354,7 @@ impl Session {
         }
     }
 
-    fn fault(&mut self, addr: u64) -> io::Result<()> {
+    fn fault(&mut self, addr: u64, minor: bool) -> io::Result<()> {
         let began = Instant::now();
         let Some(r) = self.regions.iter().copied().find(|r| r.holds(addr)) else {
             // Not guest memory, so nothing the snapshot has. A zero page keeps the thread going.
@@ -327,14 +369,19 @@ impl Session {
         } else {
             let at = r.offset + (page - r.base);
             let memory = self.memory.clone();
-            let src = memory.bytes(at, r.page);
-            if self.retry(|u| u.copy(page, src))? == 0 {
+            let done = if minor {
+                self.retry(|u| u.map_in(page, r.page))?
+            } else {
+                self.retry(|u| u.copy(page, memory.bytes(at, r.page)))?
+            };
+            if done == 0 {
                 // The page was filled since the fault, by a prefetch or a fault from another
                 // thread, so the thread only needs waking.
                 self.uffd.wake(page, r.page)?;
                 self.stats.raced += 1;
             } else {
                 self.stats.faults += 1;
+                self.stats.mapped += u64::from(minor);
                 self.trace.push(at);
             }
         }
@@ -372,8 +419,21 @@ impl Session {
             // A copy stops short of memory the guest gave back, so none of it gets old pages.
             let room = self.removed.iter().filter(|&&(s, _)| s > dst).map(|&(s, _)| s - dst).min();
             let len = room.map_or(end - at, |room| room.min(end - at));
-            let src = memory.bytes(at, len);
-            let done = self.retry(|u| u.copy(dst, src))?;
+            let done = if self.map_in {
+                match self.retry(|u| u.map_in(dst, len)) {
+                    // The VM's memory is not registered for minor faults, so its pages are copied.
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                        self.map_in = false;
+                        continue;
+                    }
+                    // A hole in the file has no page to map, and the kernel fills it with zeros
+                    // when the VM gets there.
+                    Err(e) if e.raw_os_error() == Some(libc::EFAULT) => 0,
+                    r => r?,
+                }
+            } else {
+                self.retry(|u| u.copy(dst, memory.bytes(at, len)))?
+            };
             self.stats.prefetched += done;
             // A short copy stopped at a page that is there already, which is skipped.
             at += if done < len { done + r.page } else { done };
@@ -421,10 +481,26 @@ impl Guest {
     ///
     /// The kernel does not allow this process a userfaultfd, or the server is not listening.
     pub fn connect(socket: &Path, len: usize) -> io::Result<Self> {
-        let map = Map::anon(len)?;
+        Self::hand_over(socket, Map::anon(len)?, false)
+    }
+
+    /// Maps all of `memory` privately, registers it for minor faults, and hands it to the server
+    /// listening on `socket`, the way a VMM restores from a snapshot kept in memory.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Guest::connect`], or the kernel has no minor faults for shared memory, which came
+    /// in Linux 5.14.
+    pub fn connect_mapped(socket: &Path, memory: &Memory) -> io::Result<Self> {
+        Self::hand_over(socket, Map::private(memory.file())?, true)
+    }
+
+    fn hand_over(socket: &Path, map: Map, minor: bool) -> io::Result<Self> {
+        let len = map.len();
         let uffd = Uffd::new()?;
-        uffd.api(sys::UFFD_FEATURE_EVENT_REMOVE)?;
-        uffd.register(map.addr(), len as u64)?;
+        let features = if minor { sys::UFFD_FEATURE_MINOR_SHMEM } else { 0 };
+        uffd.api(sys::UFFD_FEATURE_EVENT_REMOVE | features)?;
+        uffd.register(map.addr(), len as u64, minor)?;
         let stream = UnixStream::connect(socket)?;
         let region = Region { base: map.addr(), size: len as u64, offset: 0, page: 4096 };
         let text = serde_json::to_vec(&[region.to_wire()]).map_err(io::Error::other)?;
@@ -442,6 +518,11 @@ impl Guest {
     #[must_use]
     pub fn touch(&self, at: usize) -> u8 {
         self.map.touch(at)
+    }
+
+    /// Writes `b` at `at`, as the guest does.
+    pub fn write(&mut self, at: usize, b: u8) {
+        self.map.poke(at, b);
     }
 
     /// Gives `at..at + len` back to the kernel, as the balloon does.
@@ -506,6 +587,21 @@ mod tests {
         let data: Vec<u8> = (0..pages).flat_map(|p| [(p % 255 + 1) as u8; PAGE]).collect();
         std::fs::write(&path, data).unwrap();
         Arc::new(Memory::open(&path).unwrap())
+    }
+
+    /// The memory file of [`memory`] copied into memory, or `None` when the kernel has no minor
+    /// faults for shared memory.
+    fn in_memory(dir: &Path, pages: usize) -> Option<Arc<Memory>> {
+        memory(dir, pages);
+        let m = Memory::load(&dir.join("mem")).unwrap();
+        assert!(m.in_memory());
+        match Uffd::new().unwrap().api(sys::UFFD_FEATURE_MINOR_SHMEM) {
+            Ok(()) => Some(Arc::new(m)),
+            Err(e) => {
+                eprintln!("skipped: no minor faults on shared memory: {e}");
+                None
+            }
+        }
     }
 
     fn expect(p: usize) -> u8 {
@@ -626,6 +722,104 @@ mod tests {
         drop(guest);
         let s = handle.join().unwrap().stats();
         assert_eq!((s.faults, s.zero_faults, s.removes), (3, 2, 1));
+    }
+
+    #[test]
+    fn minor_faults_map_the_pages_in_and_writes_stay_private() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let pages = 2048;
+        let Some(mem) = in_memory(&dir.0, pages) else { return };
+        assert!(!Memory::open(&dir.0.join("mem")).unwrap().in_memory());
+        let (sock, ready, handle) = server(&dir.0, mem.clone(), None);
+        let mut guest = Guest::connect_mapped(&sock, &mem).unwrap();
+        ready.recv().unwrap();
+        let touched: Vec<usize> = (0..pages).step_by(5).collect();
+        for &p in &touched {
+            assert!(guest.bytes(p * PAGE, PAGE).iter().all(|&x| x == expect(p)), "page {p}");
+        }
+        // A write to a mapped page copies it for this VM alone, and a write to a page not mapped
+        // yet maps it in first.
+        guest.write(5 * PAGE + 1, 0);
+        guest.write(6 * PAGE, 0);
+        assert_eq!(guest.bytes(5 * PAGE, 2), [expect(5), 0]);
+        assert_eq!(guest.bytes(6 * PAGE, 2), [0, expect(6)]);
+        assert_eq!(mem.bytes(5 * PAGE as u64, 2), [expect(5); 2]);
+        assert_eq!(mem.bytes(6 * PAGE as u64, 2), [expect(6); 2]);
+        drop(guest);
+        let s = handle.join().unwrap();
+        let n = touched.len() as u64 + 1;
+        assert_eq!((s.stats().faults, s.stats().mapped), (n, n));
+        assert_eq!(s.trace().0.len() as u64, n);
+    }
+
+    #[test]
+    fn a_trace_maps_the_pages_in_before_the_vm_asks() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let pages = 4096;
+        let Some(mem) = in_memory(&dir.0, pages) else { return };
+        let touched: Vec<usize> = (0..pages).filter(|p| p % 64 < 9 || p % 101 == 0).collect();
+        let trace = Trace(touched.iter().rev().map(|&p| (p * PAGE) as u64).collect());
+        let (sock, ready, handle) = server(&dir.0, mem.clone(), Some(trace));
+        let guest = Guest::connect_mapped(&sock, &mem).unwrap();
+        ready.recv().unwrap();
+        for &p in &touched {
+            assert_eq!(guest.touch(p * PAGE), expect(p), "page {p}");
+        }
+        assert_eq!(guest.touch(30 * PAGE), expect(30));
+        drop(guest);
+        let s = handle.join().unwrap().stats();
+        assert_eq!(s.prefetched, (touched.len() * PAGE) as u64);
+        assert_eq!((s.faults, s.mapped), (1, 1));
+    }
+
+    #[test]
+    fn mapped_memory_the_guest_gave_back_comes_back_as_zeros() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let pages = 64;
+        let Some(mem) = in_memory(&dir.0, pages) else { return };
+        let (sock, ready, handle) = server(&dir.0, mem.clone(), None);
+        let mut guest = Guest::connect_mapped(&sock, &mem).unwrap();
+        ready.recv().unwrap();
+        assert_eq!(guest.touch(10 * PAGE), expect(10));
+        assert_eq!(guest.touch(11 * PAGE), expect(11));
+        guest.write(12 * PAGE, 7);
+        guest.discard(10 * PAGE, 3 * PAGE).unwrap();
+        assert!(guest.bytes(10 * PAGE, 3 * PAGE).iter().all(|&b| b == 0));
+        assert_eq!(guest.touch(13 * PAGE), expect(13));
+        drop(guest);
+        let s = handle.join().unwrap().stats();
+        assert_eq!((s.faults, s.mapped, s.zero_faults, s.removes), (4, 4, 3, 1));
+    }
+
+    #[test]
+    fn a_vm_with_anonymous_memory_gets_copies_of_memory_in_memory() {
+        if !allowed() {
+            return;
+        }
+        let dir = Scratch::new();
+        let pages = 256;
+        let Some(mem) = in_memory(&dir.0, pages) else { return };
+        let trace = Trace((0..64).map(|p| p * PAGE as u64).collect());
+        let (sock, ready, handle) = server(&dir.0, mem, Some(trace));
+        let guest = Guest::connect(&sock, pages * PAGE).unwrap();
+        ready.recv().unwrap();
+        for p in 0..64 {
+            assert_eq!(guest.touch(p * PAGE), expect(p), "page {p}");
+        }
+        assert_eq!(guest.touch(100 * PAGE), expect(100));
+        drop(guest);
+        let s = handle.join().unwrap().stats();
+        assert_eq!(s.prefetched, 64 * PAGE as u64);
+        assert_eq!((s.faults, s.mapped), (1, 0));
     }
 
     #[test]

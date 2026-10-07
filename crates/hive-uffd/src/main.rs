@@ -8,6 +8,9 @@
 //! per VM. With `--trace`, each restore first fills in the pages in the trace file. While there is
 //! no trace file yet, the first restore to end writes the pages it faulted in there, so the ones
 //! after it start from them.
+//!
+//! When `FILE` is on tmpfs or hugetlbfs, a VMM that maps it privately and registers for minor
+//! faults gets its pages mapped in from the page cache, not copied, so all its VMs share them.
 
 #![forbid(unsafe_code)]
 

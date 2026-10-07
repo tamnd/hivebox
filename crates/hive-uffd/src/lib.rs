@@ -2,7 +2,9 @@
 //!
 //! The design is in `spec/07_backends_snapshots.md`, section 3.4. A VMM restoring with the userfaultfd backend connects to a Unix socket and sends its guest memory regions as JSON, with the userfaultfd that covers them attached. [`Session::accept`] takes both, [`Session::prefetch`] fills in the pages of a [`Trace`] saved from an earlier restore, as REAP does, and [`Session::serve`] answers each fault with a copy of the page from the [`Memory`] file, which every VM restored from the same snapshot shares through the page cache. Memory the guest gives back, as the balloon does, comes back as zero pages. [`Guest`] plays the VMM's side, so all of this runs and is measured without a VM.
 //!
-//! Minor fault mode, where clean pages are mapped from shared memory and not copied, and streaming a remote snapshot in chunks come later.
+//! When the snapshot's memory is kept in memory, on tmpfs or hugetlbfs or loaded with [`Memory::load`], a VMM can map it privately and register for minor faults. Each fault and each prefetch then maps the page cache page in with no copy, so every VM restored from the snapshot shares its clean pages, and a page is copied only when its VM first writes to it.
+//!
+//! Streaming a remote snapshot in chunks comes later.
 
 #![allow(unsafe_code)]
 
