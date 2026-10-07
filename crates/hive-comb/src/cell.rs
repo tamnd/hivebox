@@ -46,6 +46,8 @@ pub struct Status {
     pub message: String,
     /// When the state last changed.
     pub changed: SystemTime,
+    /// Frozen and cut off from the network for good, so it stays paused until it is stopped.
+    pub quarantined: bool,
 }
 
 /// A cell as the API shows it.
@@ -85,11 +87,38 @@ pub(crate) enum Cmd {
     Ready {
         done: oneshot::Sender<Result<(), Error>>,
     },
+    /// Freezes the cell for good and cuts it off the network, answered with what was cut.
+    Quarantine {
+        done: oneshot::Sender<Result<Cutoff, Error>>,
+    },
     /// A disk snapshot, answered with what was read out of the cell, for the caller to build.
     Snapshot {
         scrub: Option<Scrub>,
         done: oneshot::Sender<Result<Staged, Error>>,
     },
+}
+
+/// What a quarantine did to a cell's network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cutoff {
+    /// The cell's interface lets nothing through any more.
+    Cut,
+    /// The cell had only loopback, so there was nothing to cut.
+    Loopback,
+    /// The node does not give cells namespaces of their own, so nothing could be cut.
+    Unmanaged,
+}
+
+impl Cutoff {
+    /// The name used on the wire and in the audit log.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cut => "cut",
+            Self::Loopback => "loopback",
+            Self::Unmanaged => "unmanaged",
+        }
+    }
 }
 
 /// A cell's timers as they are now, which `ExtendTtl` can change after the create.
@@ -307,8 +336,13 @@ impl Actor {
     /// Shows a new state without writing it down. Only for states a restart has nothing to do
     /// about.
     fn show(&mut self, state: CellState, cause: Option<Cause>, message: &str) {
-        let status =
-            Status { state, cause, message: message.to_owned(), changed: SystemTime::now() };
+        let status = Status {
+            state,
+            cause,
+            message: message.to_owned(),
+            changed: SystemTime::now(),
+            quarantined: self.record.quarantined,
+        };
         self.cell.status.send_replace(status);
         self.inner.changed(&self.cell);
     }
@@ -502,7 +536,22 @@ impl Actor {
                 return false;
             }
         }
-        match self.driver.check(&handle).await {
+        let live = self.driver.check(&handle).await;
+        if self.record.quarantined && matches!(live, Ok(Liveness::Alive | Liveness::Paused)) {
+            // Frozen and cut off again, in case the last comb ended before it was done.
+            if matches!(live, Ok(Liveness::Alive))
+                && self.driver.pause(&handle, PauseMode::Freeze).await.is_err()
+            {
+                self.stop(Cause::Recovery, Duration::ZERO).await;
+                return false;
+            }
+            if self.isolate().is_err() {
+                self.stop(Cause::Recovery, Duration::ZERO).await;
+                return false;
+            }
+            return self.commit(CellState::Paused, None, "quarantined").await.is_ok();
+        }
+        match live {
             Ok(Liveness::Gone(exit)) => {
                 let cause = if exit.oom { Cause::Oom } else { Cause::Exited };
                 self.stop(cause, Duration::ZERO).await;
@@ -591,6 +640,14 @@ impl Actor {
                     Some(Cmd::Ready { done }) => {
                         let _ = done.send(self.ready().await);
                     }
+                    Some(Cmd::Quarantine { done }) => {
+                        let r = self.quarantine().await;
+                        let ended = self.cell.state().is_terminal();
+                        let _ = done.send(r);
+                        if ended {
+                            return;
+                        }
+                    }
                     Some(Cmd::Snapshot { scrub, done }) => {
                         let _ = done.send(self.snapshot(scrub).await);
                     }
@@ -664,6 +721,10 @@ impl Actor {
     }
 
     fn next_timer(&self) -> Option<(Instant, Timer)> {
+        // A quarantined cell is kept as it is until someone stops it, whatever its timers say.
+        if self.record.quarantined {
+            return None;
+        }
         let now_sys = SystemTime::now();
         let now = Instant::now();
         let at = |t: SystemTime| now + t.duration_since(now_sys).unwrap_or_default();
@@ -873,6 +934,12 @@ impl Actor {
     }
 
     async fn resume(&mut self) -> Result<(), Error> {
+        if self.record.quarantined {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                "the cell is quarantined, so it stays frozen until it is stopped",
+            ));
+        }
         match self.cell.state() {
             CellState::Running => return Ok(()),
             CellState::Paused => {}
@@ -897,6 +964,50 @@ impl Actor {
             self.commit(CellState::Running, None, "").await?;
         }
         Ok(())
+    }
+
+    /// Freezes the cell and cuts it off the network, for good: it cannot be resumed, its timers
+    /// stop, and only a stop ends it. The quarantine is written down before anything is done, so
+    /// a comb that ends partway through finishes it when it comes back.
+    async fn quarantine(&mut self) -> Result<Cutoff, Error> {
+        let state = self.cell.state();
+        if !matches!(state, CellState::Running | CellState::Paused) {
+            return Err(not_running(state));
+        }
+        if !self.driver.caps().pause {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                "this backend cannot freeze a cell, so stop it instead",
+            ));
+        }
+        let handle = self.handle.clone().expect("a live cell has a handle");
+        let was = self.record.quarantined;
+        self.record.quarantined = true;
+        if state == CellState::Running {
+            self.commit(CellState::Pausing, None, "").await?;
+            if let Err(e) = self.driver.pause(&handle, PauseMode::Freeze).await {
+                // The freeze did not take, so the cell is still running and not quarantined.
+                self.record.quarantined = was;
+                self.commit(CellState::Running, None, &e.to_string()).await?;
+                return Err(e);
+            }
+        }
+        // Frozen first, so nothing in the cell sees the network go and acts on it.
+        let net = self.isolate()?;
+        self.commit(CellState::Paused, None, "quarantined").await?;
+        Ok(net)
+    }
+
+    /// Takes away the cell's network, if the node gave it one.
+    fn isolate(&self) -> Result<Cutoff, Error> {
+        if self.netns.is_none() {
+            return Ok(Cutoff::Unmanaged);
+        }
+        let net = self.inner.netns.as_ref().and_then(|p| p.net());
+        let (Some(veth), Some(net)) = (&self.veth, net) else { return Ok(Cutoff::Loopback) };
+        net.isolate(veth, self.cell.id)
+            .map_err(|e| io_error("cutting the cell off the network", &e))?;
+        Ok(Cutoff::Cut)
     }
 
     /// Builds what the cell wrote into a layer on its image and stores that as a new image. A
@@ -1038,6 +1149,9 @@ impl Actor {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     Some(Cmd::Snapshot { done, .. }) => {
+                        let _ = done.send(Err(not_running(self.cell.state())));
+                    }
+                    Some(Cmd::Quarantine { done }) => {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     None => return,

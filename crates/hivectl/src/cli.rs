@@ -24,6 +24,9 @@ Cells:
   extend ID [--ttl DURATION] [--idle DURATION]     the TTL counts from now
   ready ID                                         ends the setup boost
   pause|resume|stop ID... | -l KEY=VALUE...
+  quarantine ID... | -l KEY=VALUE... [--reason TEXT]
+                      freezes each cell for good, cuts it off the network and prints its
+                      snapshot id. It stays paused until it is stopped
   watch [ID | -l KEY=VALUE...]
 
 Snapshots:
@@ -173,6 +176,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "extend" => extend(&client, &args).await,
         "ready" => ready(&client, &args).await,
         "pause" | "resume" | "stop" => bulk(&client, &command, &args).await,
+        "quarantine" => quarantine(&client, &args).await,
         "watch" => watch(&client, &args).await,
         "run" => run(&client, &args).await,
         "sh" => sh(&client, &args).await,
@@ -287,7 +291,7 @@ async fn ls(client: &Client, args: &Args) -> Result<i32, String> {
             let i = c.info();
             [
                 i.id.clone(),
-                state_name(c.state()),
+                if i.quarantined { "quarantined".into() } else { state_name(c.state()) },
                 i.created_at.map_or_else(String::new, |t| age(t.seconds)),
                 image(i),
                 i.labels.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","),
@@ -392,7 +396,8 @@ async fn get(client: &Client, args: &Args) -> Result<i32, String> {
     let r = spec.resources.unwrap_or_default();
     println!("id:       {}", i.id);
     println!("project:  {}", i.project);
-    println!("state:    {}", state_name(c.state()));
+    let quarantined = if i.quarantined { ", quarantined" } else { "" };
+    println!("state:    {}{quarantined}", state_name(c.state()));
     if i.cause() != v1::Cause::Unspecified {
         println!("cause:    {}", enum_name(i.cause().as_str_name(), "CAUSE_"));
     }
@@ -457,6 +462,56 @@ async fn bulk(client: &Client, what: &str, args: &Args) -> Result<i32, String> {
         }
     }
     Ok(i32::from(failed > 0))
+}
+
+async fn quarantine(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&["-l", "--label", "--reason"])?;
+    let reason = args.one(&["--reason"]).unwrap_or_default();
+    let mut failed = 0;
+    for sel in selectors(args)? {
+        let r = match client.quarantine(&sel, reason).await {
+            Ok(r) => r,
+            Err(e) => {
+                failed += 1;
+                eprintln!("hivectl: {e}");
+                continue;
+            }
+        };
+        let result = r.result.unwrap_or_default();
+        for f in &result.failures {
+            failed += 1;
+            let e = f.error.as_ref();
+            eprintln!(
+                "hivectl: {}: {} {}",
+                f.cell_id,
+                e.map_or("", |e| e.reason.as_str()),
+                e.map_or("", |e| e.message.as_str())
+            );
+        }
+        for c in &r.cells {
+            println!("{}", quarantined(c));
+        }
+        if matches!(sel, Selector::Labels(_)) {
+            println!("{} matched, {} quarantined", result.matched, result.succeeded);
+        }
+    }
+    Ok(i32::from(failed > 0))
+}
+
+/// One line on a quarantined cell: its id, what became of its network and its snapshot.
+fn quarantined(c: &v1::QuarantinedCell) -> String {
+    let network = match c.network.as_str() {
+        "cut" => "network cut",
+        "loopback" => "loopback only",
+        _ => "network not managed by the node, so not cut",
+    };
+    let snapshot = if c.snapshot_id.is_empty() {
+        let why = c.snapshot_error.as_ref().map_or("no reason given", |e| e.message.as_str());
+        format!("no snapshot: {why}")
+    } else {
+        format!("snapshot {}", c.snapshot_id)
+    };
+    format!("{} frozen, {network}, {snapshot}", c.cell_id)
 }
 
 async fn watch(client: &Client, args: &Args) -> Result<i32, String> {
@@ -911,6 +966,28 @@ mod tests {
         assert_eq!(remote("./a:b"), None);
         assert_eq!(remote("/tmp/x"), None);
         assert_eq!(remote(":x"), None);
+    }
+
+    #[test]
+    fn a_quarantined_cell_reads_as_said() {
+        let mut c = v1::QuarantinedCell {
+            cell_id: "c1".into(),
+            network: "cut".into(),
+            snapshot_id: "ab12".into(),
+            snapshot_error: None,
+        };
+        assert_eq!(quarantined(&c), "c1 frozen, network cut, snapshot ab12");
+        c.network = "unmanaged".into();
+        c.snapshot_id.clear();
+        c.snapshot_error = Some(v1::Error {
+            message: "only container cells have snapshots yet".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            quarantined(&c),
+            "c1 frozen, network not managed by the node, so not cut, \
+             no snapshot: only container cells have snapshots yet"
+        );
     }
 
     #[test]

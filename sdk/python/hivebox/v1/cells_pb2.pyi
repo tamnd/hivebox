@@ -87,6 +87,34 @@ class StopRequest(_message.Message):
     snapshot: bool
     def __init__(self, selector: _Optional[_Union[_types_pb2.CellSelector, _Mapping]] = ..., snapshot: _Optional[bool] = ...) -> None: ...
 
+class QuarantineRequest(_message.Message):
+    __slots__ = ("selector", "reason")
+    SELECTOR_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    selector: _types_pb2.CellSelector
+    reason: str
+    def __init__(self, selector: _Optional[_Union[_types_pb2.CellSelector, _Mapping]] = ..., reason: _Optional[str] = ...) -> None: ...
+
+class QuarantineResponse(_message.Message):
+    __slots__ = ("result", "cells")
+    RESULT_FIELD_NUMBER: _ClassVar[int]
+    CELLS_FIELD_NUMBER: _ClassVar[int]
+    result: _types_pb2.BulkResult
+    cells: _containers.RepeatedCompositeFieldContainer[QuarantinedCell]
+    def __init__(self, result: _Optional[_Union[_types_pb2.BulkResult, _Mapping]] = ..., cells: _Optional[_Iterable[_Union[QuarantinedCell, _Mapping]]] = ...) -> None: ...
+
+class QuarantinedCell(_message.Message):
+    __slots__ = ("cell_id", "network", "snapshot_id", "snapshot_error")
+    CELL_ID_FIELD_NUMBER: _ClassVar[int]
+    NETWORK_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ERROR_FIELD_NUMBER: _ClassVar[int]
+    cell_id: str
+    network: str
+    snapshot_id: str
+    snapshot_error: _types_pb2.Error
+    def __init__(self, cell_id: _Optional[str] = ..., network: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., snapshot_error: _Optional[_Union[_types_pb2.Error, _Mapping]] = ...) -> None: ...
+
 class ExtendTtlRequest(_message.Message):
     __slots__ = ("id", "hard_ttl", "idle_ttl")
     ID_FIELD_NUMBER: _ClassVar[int]

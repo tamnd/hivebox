@@ -133,6 +133,8 @@ message Cell {
   // When the cell expires unless its TTL is extended.
   google.protobuf.Timestamp expires_at = 10;
   map<string, string> labels = 11;
+  // Frozen and cut off from the network until it is stopped. See Cells.Quarantine.
+  bool quarantined = 12;
 }
 
 // A failure for one item of a batch. Whole call failures use the gRPC status with the same reason in ErrorInfo.

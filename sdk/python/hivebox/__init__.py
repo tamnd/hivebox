@@ -25,6 +25,7 @@ from ._client import (
     Files,
     Llm,
     Process,
+    Quarantined,
     RunResult,
     Session,
     SessionResult,
@@ -53,7 +54,7 @@ __version__ = "0.0.32"
 
 __all__ = [
     "DEFAULT_SOCKET", "AsyncHive", "BulkResult", "Cell", "CellGroup", "Cells", "Choice", "FileInfo", "Files", "Llm",
-    "Process", "RunResult", "Session", "SessionResult", "Spec", "Turn", "VerifyResult", "CapacityUnavailable",
+    "Process", "Quarantined", "RunResult", "Session", "SessionResult", "Spec", "Turn", "VerifyResult", "CapacityUnavailable",
     "CellLost", "CellNotFound", "CellNotRunning", "DroneUnreachable", "ExecTimeout", "FileError", "HiveError",
     "ImageUnavailable", "Internal", "InvalidArgument", "OutputLimit", "PolicyDenied", "QuotaExceeded",
 ]

@@ -647,6 +647,57 @@ async fn every_call_goes_into_the_audit_log_with_who_made_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_quarantine_says_what_it_did_to_each_cell() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let mut cells = api.cells();
+    let mut spec = v1_spec("python", &[("run", "a")]);
+    spec.hard_ttl = Some(prost_types::Duration { seconds: 3600, nanos: 0 });
+    let made = create(&mut cells, "p", 2, spec).await;
+
+    // Another project's cells are not found, so nothing happens to them.
+    let other = v1::QuarantineRequest { selector: Some(by_id(&made[0].id)), reason: String::new() };
+    assert_eq!(reason(&cells.quarantine(req("q", other)).await.unwrap_err()), Reason::CellNotFound);
+
+    let r = v1::QuarantineRequest {
+        selector: Some(by_labels(&[("run", "a")])),
+        reason: "it sent a key out".into(),
+    };
+    let q = cells.quarantine(req("p", r)).await.unwrap().into_inner();
+    let result = q.result.unwrap();
+    assert_eq!((result.matched, result.succeeded, result.failures.len()), (2, 2, 0));
+    let mut ids: Vec<&str> = q.cells.iter().map(|c| c.cell_id.as_str()).collect();
+    ids.sort_unstable();
+    let mut want: Vec<&str> = made.iter().map(|c| c.id.as_str()).collect();
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    // The fake's image is not from a store, so there is no snapshot, and says why.
+    for c in &q.cells {
+        assert_eq!(c.network, "unmanaged");
+        assert!(c.snapshot_id.is_empty());
+        let e = c.snapshot_error.as_ref().unwrap();
+        assert_eq!(e.reason, "POLICY_DENIED", "{e:?}");
+    }
+    let got = cells.get(req("p", v1::GetCellRequest { id: made[0].id.clone() })).await.unwrap();
+    let got = got.into_inner();
+    assert_eq!((got.state(), got.quarantined), (v1::CellState::Paused, true));
+    assert_eq!(got.expires_at, None, "no timer stops a quarantined cell");
+
+    let log = api.comb.audit().unwrap();
+    tokio::task::block_in_place(|| log.flush()).unwrap();
+    let got: Vec<_> =
+        audited(&s.0.join("audit")).into_iter().filter(|e| e.op == "cell.quarantine").collect();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!((got[0].project.as_str(), got[0].result.as_str()), ("q", "NotFound"));
+    for e in &got[1..] {
+        assert!(e.result.starts_with("ok network=unmanaged cut_ms="), "{e:?}");
+        assert!(e.result.ends_with(" snapshot PermissionDenied"), "{e:?}");
+    }
+    api.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_socket_is_the_owners_only_and_replaced_on_restart() {
     use std::os::unix::fs::PermissionsExt;
     let s = Scratch::new();

@@ -449,6 +449,73 @@ impl Cells for Api {
         Ok(Response::new(r))
     }
 
+    async fn quarantine(
+        &self,
+        req: Request<v1::QuarantineRequest>,
+    ) -> Result<Response<v1::QuarantineResponse>, Status> {
+        let call = Call::new(self, &req, "cell.quarantine")?;
+        let req = req.into_inner();
+        let (_, args) = picked(req.selector.as_ref());
+        let args = args.str(&req.reason);
+        let (cells, by_id) = call.check("", &args, self.select(&call.project, req.selector))?;
+        let live = |s: CellState| matches!(s, CellState::Running | CellState::Paused);
+        let ids: Vec<CellId> =
+            cells.into_iter().filter(|c| by_id || live(c.status.state)).map(|c| c.id).collect();
+        // On tasks of their own, like the other bulk calls, so a caller that goes away does not
+        // leave a cell half done.
+        let tasks: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let comb = self.comb.clone();
+                tokio::spawn(async move { comb.quarantine(id).await })
+            })
+            .collect();
+        let mut result = v1::BulkResult { matched: count(ids.len()), ..v1::BulkResult::default() };
+        let mut done = Vec::new();
+        for (id, task) in ids.into_iter().zip(tasks) {
+            let outcome = task
+                .await
+                .unwrap_or_else(|_| Err(Error::new(Reason::Internal, "the call panicked")));
+            let cell = id.to_string();
+            match outcome {
+                Ok(q) => {
+                    let network = q.network.as_str();
+                    let cut = q.cut.as_millis();
+                    let (snapshot_id, snapshot_error, said) = match q.snapshot {
+                        Ok(snap) => {
+                            let took = q.snapshot_took.as_millis();
+                            (snap.to_string(), None, format!("snapshot={snap} snapshot_ms={took}"))
+                        }
+                        Err(e) => {
+                            let said =
+                                format!("snapshot {}", failed(&convert::error_to_status(&e)));
+                            (String::new(), Some(convert::error_to_v1(&e)), said)
+                        }
+                    };
+                    call.record(&cell, &args, format!("ok network={network} cut_ms={cut} {said}"));
+                    result.succeeded += 1;
+                    done.push(v1::QuarantinedCell {
+                        cell_id: cell,
+                        network: network.into(),
+                        snapshot_id,
+                        snapshot_error,
+                    });
+                }
+                Err(e) => {
+                    call.record(&cell, &args, failed(&convert::error_to_status(&e)));
+                    result.failures.push(v1::BulkFailure {
+                        cell_id: cell,
+                        error: Some(convert::error_to_v1(&e)),
+                    });
+                }
+            }
+        }
+        if result.matched == 0 {
+            call.record("", &args, "ok".into());
+        }
+        Ok(Response::new(v1::QuarantineResponse { result: Some(result), cells: done }))
+    }
+
     async fn stop(
         &self,
         req: Request<v1::StopRequest>,
@@ -1247,6 +1314,11 @@ fn cell_to_v1(c: &CellInfo) -> v1::Cell {
 
 fn set_status(cell: &mut v1::Cell, s: &CellStatus) {
     cell.state = convert::state_to_v1(s.state).into();
+    cell.quarantined = s.quarantined;
+    if s.quarantined {
+        // No timer stops a quarantined cell.
+        cell.expires_at = None;
+    }
     cell.cause = s.cause.map_or(v1::Cause::Unspecified, convert::cause_to_v1).into();
     cell.state_since = Some(prost_types::Timestamp::from(s.changed.max(SystemTime::UNIX_EPOCH)));
 }

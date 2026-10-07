@@ -248,6 +248,23 @@ impl Client {
         Ok(r.map_err(from_status)?.into_inner())
     }
 
+    /// Quarantines what `sel` picks: each cell is frozen for good, cut off the network and kept
+    /// as an unscrubbed disk snapshot, and stays paused until it is stopped. `reason` goes in the
+    /// audit log.
+    ///
+    /// # Errors
+    ///
+    /// The call failed as a whole. Cells that failed on their own are in the result.
+    pub async fn quarantine(
+        &self,
+        sel: &Selector,
+        reason: &str,
+    ) -> Result<v1::QuarantineResponse, Error> {
+        let r = v1::QuarantineRequest { selector: Some(sel.to_v1()), reason: reason.into() };
+        let r = self.cells().quarantine(self.req(r)).await;
+        Ok(r.map_err(from_status)?.into_inner())
+    }
+
     /// Changes a cell's timers: `hard` is how long from now until it is stopped, and `idle`
     /// replaces its idle TTL. Either is left as it was when `None`.
     ///
@@ -549,6 +566,20 @@ impl Cell {
     /// The cell could not be stopped.
     pub async fn stop(&self) -> Result<(), Error> {
         one(self.client.stop(&self.sel()).await?)
+    }
+
+    /// Quarantines the cell, as [`Client::quarantine`] does, and returns what became of its
+    /// network and its snapshot.
+    ///
+    /// # Errors
+    ///
+    /// The cell could not be frozen or cut off.
+    pub async fn quarantine(&self, reason: &str) -> Result<v1::QuarantinedCell, Error> {
+        let mut r = self.client.quarantine(&self.sel(), reason).await?;
+        one(r.result.take().unwrap_or_default())?;
+        r.cells
+            .pop()
+            .ok_or_else(|| Error::new(Reason::Internal, "the node did not say what it did"))
     }
 
     /// Takes a disk snapshot of the cell, as [`Client::snapshot`] does.

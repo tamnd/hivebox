@@ -446,6 +446,53 @@ async fn pause_and_resume_by_hand() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_quarantined_cell_stays_frozen_until_it_is_stopped() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let cfg = Config {
+        reclaim_after: Duration::from_millis(100),
+        pause_ttl: Duration::from_millis(300),
+        ..config(&s.0)
+    };
+    let comb = open(cfg.clone(), &fake).await;
+    let mut short = spec("python");
+    short.hard_ttl = Some(Duration::from_millis(600));
+    let id = comb.create(request(short)).await.unwrap().id;
+    let q = comb.quarantine(id).await.unwrap();
+    assert_eq!((q.info.status.state, q.info.status.quarantined), (CellState::Paused, true));
+    // This node gives cells no namespaces, and the fake's image is not from a store.
+    assert_eq!(q.network, hive_comb::Cutoff::Unmanaged);
+    assert!(q.snapshot.is_err());
+    assert!(fake.with(id, |g| g.paused));
+
+    // Neither a resume nor a request wakes it.
+    let e = comb.resume(id).await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied, "{e}");
+    assert_eq!(comb.drone(id).await.unwrap_err().reason, Reason::PolicyDenied);
+
+    // Its hard TTL, the reclaim and the pause TTL all pass, and it is kept as it is.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(comb.get(id).unwrap().status.state, CellState::Paused);
+    assert!(!fake.with(id, |g| g.reclaimed));
+
+    // A restarted comb keeps it so.
+    comb.shutdown().await;
+    drop(comb);
+    let comb = open(cfg, &fake).await;
+    let info = comb.get(id).unwrap();
+    assert_eq!((info.status.state, info.status.quarantined), (CellState::Paused, true));
+    assert!(fake.with(id, |g| g.paused));
+    assert_eq!(comb.resume(id).await.unwrap_err().reason, Reason::PolicyDenied);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(comb.get(id).unwrap().status.state, CellState::Paused);
+
+    // Only a stop ends it, and an ended cell cannot be quarantined.
+    assert_eq!(comb.stop(id, None).await.unwrap().status.state, CellState::Stopped);
+    assert_eq!(comb.quarantine(id).await.unwrap_err().reason, Reason::CellNotRunning);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_comb_picks_up_every_cell() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());

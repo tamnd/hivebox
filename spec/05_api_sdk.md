@@ -16,6 +16,7 @@ service Cells {
   rpc Pause(CellSelector) returns (BulkResult);                    // single id or label selector
   rpc Resume(CellSelector) returns (BulkResult);
   rpc Stop(StopRequest) returns (BulkResult);
+  rpc Quarantine(QuarantineRequest) returns (QuarantineResponse);  // freeze, cut off, snapshot
   rpc ExtendTtl(ExtendTtlRequest) returns (Cell);
   rpc UpdatePolicy(UpdatePolicyRequest) returns (Cell);            // network profile / limits mid-life
   rpc ExposePort(ExposePortRequest) returns (PortEndpoint);

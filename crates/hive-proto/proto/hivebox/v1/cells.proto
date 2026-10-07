@@ -15,6 +15,10 @@ service Cells {
   rpc Pause(CellSelector) returns (BulkResult);
   rpc Resume(CellSelector) returns (BulkResult);
   rpc Stop(StopRequest) returns (BulkResult);
+  // Freezes each cell for good, cuts it off the network and keeps an unscrubbed disk snapshot of
+  // it for forensics. A quarantined cell stays paused until it is stopped: it cannot be resumed
+  // and no timer stops it.
+  rpc Quarantine(QuarantineRequest) returns (QuarantineResponse);
   rpc ExtendTtl(ExtendTtlRequest) returns (Cell);
   rpc UpdatePolicy(UpdatePolicyRequest) returns (Cell);
   rpc ExposePort(ExposePortRequest) returns (PortEndpoint);
@@ -75,6 +79,29 @@ message StopRequest {
   CellSelector selector = 1;
   // Keep a disk snapshot of each cell before stopping it.
   bool snapshot = 2;
+}
+
+message QuarantineRequest {
+  CellSelector selector = 1;
+  // Why, for the audit log.
+  string reason = 2;
+}
+
+message QuarantineResponse {
+  BulkResult result = 1;
+  // One for each cell quarantined.
+  repeated QuarantinedCell cells = 2;
+}
+
+message QuarantinedCell {
+  string cell_id = 1;
+  // "cut" when its interface lets nothing through any more, "loopback" when it had only loopback,
+  // and "unmanaged" when the node gives cells no network namespace of their own, so nothing could
+  // be cut.
+  string network = 2;
+  // The disk snapshot, empty when there is none, with why in snapshot_error.
+  string snapshot_id = 3;
+  Error snapshot_error = 4;
 }
 
 // Unset fields stay as they were.

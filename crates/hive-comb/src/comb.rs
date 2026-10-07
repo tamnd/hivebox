@@ -1,7 +1,7 @@
 //! The comb: the table of cells, the way into each cell's actor, and recovery after a restart.
 
 use crate::admit::{self, Admission};
-use crate::cell::{Actor, Cell, CellInfo, Cmd, Start, Status};
+use crate::cell::{Actor, Cell, CellInfo, Cmd, Cutoff, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
 use crate::core_sched::CoreSched;
@@ -67,6 +67,21 @@ pub struct WalStats {
     pub syncs: u64,
     /// Times the log was rewritten down to its live records.
     pub compactions: u64,
+}
+
+/// A cell after a quarantine, from [`Comb::quarantine`].
+#[derive(Debug)]
+pub struct Quarantined {
+    /// The cell as it is now, paused.
+    pub info: CellInfo,
+    /// What became of its network.
+    pub network: Cutoff,
+    /// How long the freeze and the cut took together.
+    pub cut: Duration,
+    /// The id of its disk snapshot, or why it has none.
+    pub snapshot: Result<BlobId, Error>,
+    /// How long the snapshot took.
+    pub snapshot_took: Duration,
 }
 
 /// A change to a cell, as sent to watchers.
@@ -363,6 +378,7 @@ impl Comb {
                 cause: record.cell_cause(),
                 message: record.message.clone(),
                 changed: time(record.changed_ms),
+                quarantined: record.quarantined,
             };
             let (cell, rx) = Cell::new(
                 id,
@@ -490,8 +506,13 @@ impl Comb {
         let id = inner.next_id().await?;
         let secret = random();
         let now = SystemTime::now();
-        let status =
-            Status { state: CellState::Pending, cause: None, message: String::new(), changed: now };
+        let status = Status {
+            state: CellState::Pending,
+            cause: None,
+            message: String::new(),
+            changed: now,
+            quarantined: false,
+        };
         let idem_key = idem.clone().unwrap_or_default();
         let (cell, rx) =
             Cell::new(id, req.project.clone(), idem_key.clone(), req.spec.clone(), now, status);
@@ -632,6 +653,26 @@ impl Comb {
         self.inner.metrics.snapshot("build", built.elapsed());
         self.inner.metrics.snapshot("total", started.elapsed());
         Ok(snap)
+    }
+
+    /// Quarantines a live cell: freezes it for good, cuts it off the network and takes a disk
+    /// snapshot of it, unscrubbed, for forensics. The cell then stays paused until it is stopped.
+    /// A snapshot that cannot be taken, such as of a cell that is not a container, does not undo
+    /// the rest and comes back as the error in place of the snapshot.
+    pub async fn quarantine(&self, id: CellId) -> Result<Quarantined, Error> {
+        let cell = self.inner.find(id)?;
+        let started = Instant::now();
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::Quarantine { done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        let network = wait
+            .await
+            .map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        let cut = started.elapsed();
+        let snapshot = self.snapshot(id, None).await;
+        let snapshot_took = started.elapsed() - cut;
+        Ok(Quarantined { info: cell.info(), network, cut, snapshot, snapshot_took })
     }
 
     /// Names a scrubbed snapshot `name` in `project`, so the project's cells can start from it by

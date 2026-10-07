@@ -45,12 +45,13 @@ pub trait Cells: Send + Sync {
     /// The cell with address `ip`, as its `idx` in the guard's maps and its profile.
     fn cell(&self, ip: Ipv4Addr) -> Option<(u32, Profile)>;
 
-    /// Lets cell `idx` reach `ips` for `ttl`.
+    /// Lets cell `idx`, which asked from `from`, reach `ips` for `ttl`.
     ///
     /// # Errors
     ///
-    /// The addresses could not be allowed, and the answer must not go out.
-    fn allow(&self, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()>;
+    /// The addresses could not be allowed, or `from` is no longer that cell's, and the answer
+    /// must not go out.
+    fn allow(&self, from: Ipv4Addr, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()>;
 }
 
 /// The names a profile may look up. `example.com` is that name only, and `*.example.com` is any
@@ -386,7 +387,7 @@ impl Proxy {
             for r in &mut resp.answers {
                 r.ttl = r.ttl.min(u32::try_from(ttl).unwrap_or(u32::MAX));
             }
-            if self.cells.allow(cell, &ips, Duration::from_secs(ttl)).is_err() {
+            if self.cells.allow(from, cell, &ips, Duration::from_secs(ttl)).is_err() {
                 return reply(ResponseCode::ServFail);
             }
         }
@@ -490,7 +491,7 @@ mod tests {
             }
         }
 
-        fn allow(&self, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
+        fn allow(&self, _: Ipv4Addr, idx: u32, ips: &[Ipv4Addr], ttl: Duration) -> io::Result<()> {
             self.allowed.lock().unwrap().push((idx, ips.to_vec(), ttl));
             Ok(())
         }

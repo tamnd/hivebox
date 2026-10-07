@@ -157,7 +157,7 @@ fn a_cell_reaches_only_what_its_profile_and_dns_allow() {
     guard.set_cell(ifindex, &cell).unwrap();
     assert_eq!(guard.cell(ifindex).unwrap(), Some(cell));
     net.send(CELL, DNS_VIP, 53);
-    assert!(got(&dns), "the DNS proxy is in every profile");
+    assert!(got(&dns), "the DNS proxy is in every profile: {:?}", guard.stats().unwrap());
     net.send(CELL, DENIED, 9);
     assert!(!got(&denied));
     let deny = guard.denies().into_iter().find(|d| d.ip == DENIED).expect("the drop was reported");
@@ -226,6 +226,19 @@ fn a_cell_reaches_only_what_its_profile_and_dns_allow() {
         guard.allow(41, Ipv4Addr::from(0x0A00_0000 + i), Duration::from_secs(60)).unwrap();
     }
     println!("allow takes {:.2?}", t.elapsed() / 1000);
+
+    // A quarantined cell reaches nothing, not the DNS proxy and not what it resolved before.
+    let mut allowed = guard.dns_allow().unwrap();
+    guard.set_cell(ifindex, &CellNet { profile: Profile::QUARANTINE, ..cell }).unwrap();
+    let t = Instant::now();
+    assert_eq!(allowed.forget(41).unwrap(), 1002);
+    println!("forgetting 1002 answers takes {:.2?}", t.elapsed());
+    net.send(CELL, RESOLVED, 9);
+    assert!(!got(&resolved));
+    net.send(CELL, DNS_VIP, 53);
+    assert!(!got(&dns));
+    assert_eq!(allowed.forget(41).unwrap(), 0);
+    guard.set_cell(ifindex, &cell).unwrap();
 
     let stats = guard.stats().unwrap();
     println!("passed {} dropped {}: {stats:?}", stats.passed(), stats.dropped());

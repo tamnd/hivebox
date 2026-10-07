@@ -119,6 +119,25 @@ async def test_many_cells_at_once_and_bulk_calls():
             assert await other.cells.list({"test": RUN}) == []
 
 
+async def test_a_quarantined_cell_stays_frozen_until_it_is_stopped():
+    async with hivebox.AsyncHive(ENDPOINT, project="sdk-test") as hive:
+        cell = await hive.cells.create(spec(labels={"test": "quarantine"}))
+        try:
+            await cell.files.write("/tmp/evidence", "kept")
+            q = await cell.quarantine("a live test")
+            assert q.network in ("cut", "loopback", "unmanaged")
+            assert (q.snapshot is None) == (q.snapshot_error is not None)
+            await cell.refresh()
+            assert cell.state == "paused" and cell.quarantined
+            with pytest.raises(hivebox.PolicyDenied):
+                await cell.resume()
+            with pytest.raises(hivebox.PolicyDenied):
+                await cell.run("true")
+            print(f"quarantined: network {q.network}, snapshot {q.snapshot or q.snapshot_error}")
+        finally:
+            await cell.stop()
+
+
 GIT_IMAGE = os.environ.get("HIVE_TEST_GIT_IMAGE")
 GIT_WORKDIR = os.environ.get("HIVE_TEST_GIT_WORKDIR", "/testbed")
 

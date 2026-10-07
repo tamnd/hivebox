@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hivectl quarantine ID... | -l KEY=VALUE... [--reason TEXT]`, `Quarantine` on the API and the gate, and `quarantine` in the Python SDK freeze a cell, cut it off the network, not even DNS, and keep an unscrubbed disk snapshot of it. It stays paused and cut off until it is stopped, across comb restarts too, and resume, exec and file calls on it are refused. On server3 the freeze and the cut took 8 to 319 ms, 40 ms or less in 6 of 10, the snapshot of a cell that had written 64 MiB took 2.5 to 4.9 s, and the cell could no longer resolve names or reach the address it had resolved before.
+
 ## 0.0.32
 
 An audit log on every node, with every API call in it and its roots held by the keeper.

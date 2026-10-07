@@ -144,11 +144,12 @@ impl Api {
 
     /// Runs a bulk call on every node and adds up the answers. A node that fails shows up as
     /// one failure with no cell id, since which of its cells matched is not known.
-    async fn everywhere<T, F, Fut>(&self, project: &Caller, msg: T, call: F) -> v1::BulkResult
+    async fn everywhere<T, R, F, Fut>(&self, project: &Caller, msg: T, call: F) -> R
     where
         T: Clone + Send + 'static,
+        R: Bulk + Send + 'static,
         F: Fn(CellsClient<Channel>, Request<T>) -> Fut,
-        Fut: Future<Output = Result<Response<v1::BulkResult>, Status>> + Send + 'static,
+        Fut: Future<Output = Result<Response<R>, Status>> + Send + 'static,
     {
         let mut calls = JoinSet::new();
         for node in self.inner.nodes.all() {
@@ -161,22 +162,48 @@ impl Api {
                 (node, r)
             });
         }
-        let mut total = v1::BulkResult::default();
+        let mut total = R::default();
         while let Some(done) = calls.join_next().await {
             let Ok((node, r)) = done else { continue };
             match r {
-                Ok(r) => {
-                    total.matched += r.matched;
-                    total.succeeded += r.succeeded;
-                    total.failures.extend(r.failures);
-                }
-                Err(s) => total.failures.push(v1::BulkFailure {
+                Ok(r) => total.add(r),
+                Err(s) => total.result().failures.push(v1::BulkFailure {
                     cell_id: String::new(),
                     error: Some(on_node(node, &s)),
                 }),
             }
         }
         total
+    }
+}
+
+/// The answer to a bulk call, which [`Api::everywhere`] adds up over the nodes.
+trait Bulk: Default {
+    fn result(&mut self) -> &mut v1::BulkResult;
+
+    fn add(&mut self, other: Self);
+}
+
+impl Bulk for v1::BulkResult {
+    fn result(&mut self) -> &mut v1::BulkResult {
+        self
+    }
+
+    fn add(&mut self, other: Self) {
+        self.matched += other.matched;
+        self.succeeded += other.succeeded;
+        self.failures.extend(other.failures);
+    }
+}
+
+impl Bulk for v1::QuarantineResponse {
+    fn result(&mut self) -> &mut v1::BulkResult {
+        self.result.get_or_insert_default()
+    }
+
+    fn add(&mut self, other: Self) {
+        self.result().add(other.result.unwrap_or_default());
+        self.cells.extend(other.cells);
     }
 }
 
@@ -363,6 +390,22 @@ impl Cells for Api {
             return self.owner(id)?.stop(out(&project, req)).await;
         }
         let r = self.everywhere(&project, req, |mut c, r| async move { c.stop(r).await }).await;
+        Ok(Response::new(r))
+    }
+
+    async fn quarantine(
+        &self,
+        req: Request<v1::QuarantineRequest>,
+    ) -> Result<Response<v1::QuarantineResponse>, Status> {
+        let project = allowed(&req, "quarantine", selected(req.get_ref().selector.as_ref()))?;
+        let req = req.into_inner();
+        if let Some(v1::cell_selector::By::Id(id)) =
+            req.selector.as_ref().and_then(|s| s.by.as_ref())
+        {
+            return self.owner(id)?.quarantine(out(&project, req)).await;
+        }
+        let r =
+            self.everywhere(&project, req, |mut c, r| async move { c.quarantine(r).await }).await;
         Ok(Response::new(r))
     }
 
