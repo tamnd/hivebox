@@ -122,6 +122,54 @@ async fn a_hardened_drone_runs_commands_but_not_escapes() {
     assert_ne!(code, 0, "mount worked");
 }
 
+/// Each request, then what it got: `ok` or the errno's name.
+const IOCTLS: &str = r#"python3 -c '
+import errno, fcntl, os, struct
+f = os.open("f", os.O_RDWR | os.O_CREAT)
+def code(req, arg=bytes(64)):
+    try:
+        fcntl.ioctl(f, req, arg)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+r, w = os.pipe()
+os.write(w, b"abc")
+print("FIONREAD", struct.unpack("i", fcntl.ioctl(r, 0x541B, bytes(4)))[0])
+print("FS_IOC_GETFLAGS", code(0x80086601))
+print("FS_IOC_FSGETXATTR", code(0x801C581F))
+print("XFS_IOC_SWAPEXT", code(0xC0C0586D, bytes(192)))
+print("TIOCSTI", code(0x5412, b"x"))
+print("EXT4_IOC_MOVE_EXT", code(0xC028660F, bytes(40)))
+'"#;
+
+#[tokio::test]
+async fn a_hardened_drone_lets_the_usual_ioctls_through_and_not_the_rest() {
+    if !std::process::Command::new("python3").arg("-V").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: needs python3");
+        return;
+    }
+    let answers = |text: &str| -> std::collections::HashMap<String, String> {
+        text.lines().filter_map(|l| l.split_once(' ')).map(|(k, v)| (k.into(), v.into())).collect()
+    };
+    let plain = start("ioctl-plain", false).await;
+    let (code, text) = out(&plain.client, IOCTLS).await;
+    assert_eq!(code, 0, "{text}");
+    let plain = answers(&text);
+    let hard = start("ioctl-hard", true).await;
+    let (code, text) = out(&hard.client, IOCTLS).await;
+    assert_eq!(code, 0, "{text}");
+    let hard = answers(&text);
+    assert_eq!(hard["FIONREAD"], "3");
+    assert_eq!(hard["FS_IOC_GETFLAGS"], plain["FS_IOC_GETFLAGS"], "file flags read as before");
+    // A filesystem that answers it unhardened shows the whole `X` family is cut off.
+    if plain["FS_IOC_FSGETXATTR"] == "ok" {
+        assert_eq!(hard["FS_IOC_FSGETXATTR"], "ENOTTY");
+    }
+    assert_eq!(hard["XFS_IOC_SWAPEXT"], "ENOTTY");
+    assert_eq!((plain["TIOCSTI"].as_str(), hard["TIOCSTI"].as_str()), ("ENOTTY", "EPERM"));
+    assert_eq!(hard["EXT4_IOC_MOVE_EXT"], "EPERM");
+}
+
 #[tokio::test]
 async fn init_passes_a_stop_on_and_exits_as_the_drone_did() {
     let mut d = start("init", false).await;
@@ -153,6 +201,20 @@ async fn a_second_secret_source_is_refused() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// A million `FIONREAD`s on a pipe, and the same loop with no syscall in it.
+const IOCTL_COST: &str = r#"python3 -c '
+import fcntl, os, time
+r, w = os.pipe()
+b = bytearray(4)
+t = time.perf_counter()
+for _ in range(1000000): fcntl.ioctl(r, 0x541B, b)
+a = time.perf_counter() - t
+t = time.perf_counter()
+for _ in range(1000000): len(b)
+e = time.perf_counter() - t
+print("1M ioctls in %.0f ms (%.0f ns each past the loop)" % (a * 1e3, (a - e) * 1e3))
+' 2>/dev/null || echo no python"#;
 
 /// What hardening costs, next to the same drone without it. Run it with
 /// `cargo test --release -p hive-drone --test harden -- --ignored --nocapture`.
@@ -191,11 +253,15 @@ async fn harden_cost() {
             out(&d.client, "i=0; while [ $i -lt 300 ]; do sh -c : ; i=$((i+1)); done").await;
         assert_eq!(code, 0);
         let forks = t.elapsed();
+        // An ioctl the filter looks at the request of, from python, and python's own loop alone.
+        let (code, ioctls) = out(&d.client, IOCTL_COST).await;
+        assert_eq!(code, 0, "{ioctls}");
         println!(
-            "{name}: run true p50 {:?} p99 {:?}, 2M syscalls in {dd:?} ({:.0} ns each), 300 fork and exec in {forks:?}",
+            "{name}: run true p50 {:?} p99 {:?}, 2M syscalls in {dd:?} ({:.0} ns each), 300 fork and exec in {forks:?}, {}",
             runs[n / 2],
             runs[n * 99 / 100],
-            dd.as_nanos() as f64 / 2e6
+            dd.as_nanos() as f64 / 2e6,
+            ioctls.trim()
         );
     }
 }

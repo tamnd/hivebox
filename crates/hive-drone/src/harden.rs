@@ -1,6 +1,7 @@
 //! Locks the drone down before it serves anything, so every command it runs inherits the same
 //! limits. Two things are applied, both for good, to the calling thread, which has to be the only
-//! one: a Landlock ruleset that makes some paths read only, and two seccomp filters.
+//! one: a Landlock ruleset that makes some paths read only, and three seccomp filters, joined
+//! into one program.
 //!
 //! The first filter is an allowlist, and a syscall not on it fails with ENOSYS. That is the answer
 //! libc expects from an old kernel, so it falls back on its own, as it does from `clone3` to
@@ -9,9 +10,17 @@
 //! a program that checks for a missing privilege expects. When both filters answer with an errno,
 //! the kernel takes the one installed last, so the named calls get EPERM.
 //!
-//! On kernel 5.11 and later, a syscall a filter allows without looking at its arguments is cached
-//! per filter, and after its first use it costs close to nothing. Only `clone` and `personality`
-//! look at their arguments.
+//! The third looks only at `ioctl`, which reaches every driver and filesystem in the kernel. It
+//! lets through the requests normal programs make, for terminals, sockets, file flags and
+//! reflinks, and fails the rest with ENOTTY, the answer for a request the file does not know. That
+//! takes in `XFS_IOC_SWAPEXT`, which in DSec swapped the blocks of a file the agent could not read
+//! into one it could and shut the filesystem down. Pushing input into a terminal, changing its
+//! line discipline and moving extents on ext4 fail with EPERM.
+//!
+//! On kernel 5.11 and later, a syscall allowed without a look at its arguments is cached, and after
+//! its first use it costs close to nothing. Only `clone`, `personality` and `ioctl` are looked at
+//! more closely, and those run every filter installed, so joined it is one program to run and not
+//! three.
 
 use landlock::{
     ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
@@ -19,7 +28,7 @@ use landlock::{
 };
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-    SeccompRule, TargetArch,
+    SeccompRule, TargetArch, sock_filter,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +43,8 @@ pub struct Hardened {
     pub allowed: usize,
     /// Syscalls failed with EPERM.
     pub denied: usize,
+    /// Kinds of `ioctl` request let through: families by their type byte, and single requests.
+    pub ioctls: usize,
 }
 
 /// Makes `protect` read only for the drone and everything it starts, then installs the seccomp
@@ -52,10 +63,14 @@ pub fn apply(protect: &[PathBuf]) -> Result<Hardened, String> {
         .map_err(|e| format!("seccomp on {}: {e:?}", std::env::consts::ARCH))?;
     let allow = allow_filter(arch)?;
     let deny = deny_filter(arch)?;
-    // The allowlist has to go on first, so the named calls answer with the deny filter's EPERM.
-    seccompiler::apply_filter(&allow).map_err(|e| format!("installing the allowlist: {e}"))?;
-    seccompiler::apply_filter(&deny).map_err(|e| format!("installing the denylist: {e}"))?;
-    Ok(Hardened { landlock, allowed: ALLOW.len() + ARGS.len(), denied: DENY.len() })
+    let filter = join(vec![ioctl_filter(), deny, allow]);
+    seccompiler::apply_filter(&filter).map_err(|e| format!("installing the filter: {e}"))?;
+    Ok(Hardened {
+        landlock,
+        allowed: ALLOW.len() + ARGS.len(),
+        denied: DENY.len(),
+        ioctls: IOCTL_TYPES.len() + IOCTLS.len(),
+    })
 }
 
 fn landlock(protect: &[PathBuf]) -> Result<&'static str, String> {
@@ -135,6 +150,124 @@ fn deny_filter(arch: TargetArch) -> Result<BpfProgram, String> {
     let rules = DENY.iter().map(|&nr| (nr, Vec::new())).collect();
     compile(rules, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32), arch)
 }
+
+/// `filters` as one program, which asks each in turn and the next only when it allows the call
+/// with [`SECCOMP_RET_ALLOW`].
+/// The kernel runs filters stacked on one another newest first and keeps the strongest answer, or
+/// the newest of equal ones, which for these, where the only answers are an errno, allowing the
+/// call and killing a process from another architecture before anything else, comes to the same.
+fn join(filters: Vec<BpfProgram>) -> BpfProgram {
+    let last = filters.len().saturating_sub(1);
+    let mut prog: BpfProgram = Vec::with_capacity(filters.iter().map(Vec::len).sum());
+    for (n, filter) in filters.into_iter().enumerate() {
+        let next = prog.len() + filter.len();
+        for mut ins in filter {
+            if n < last && ins.code == RET && ins.k == SECCOMP_RET_ALLOW {
+                ins = sock_filter { code: JA, jt: 0, jf: 0, k: (next - prog.len() - 1) as u32 };
+            }
+            prog.push(ins);
+        }
+    }
+    prog
+}
+
+const LD: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+const JA: u16 = (libc::BPF_JMP | libc::BPF_JA) as u16;
+const JEQ: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+const AND: u16 = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
+const RET: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+
+/// Where a check in [`ioctl_filter`] goes.
+#[derive(Clone, Copy)]
+enum To {
+    /// On to the next check either way.
+    Next,
+    /// Allowed when it matches, without asking the filters after this one.
+    Allow,
+    /// Refused with EPERM when it matches.
+    Refuse,
+    /// Left to the filters after this one when it does not match.
+    PassUnless,
+}
+
+/// The `ioctl` filter, written out by hand, since a filter compiled from rules cannot say "every
+/// request but these". Only the low 32 bits of the request are looked at, as the kernel reads it
+/// as an `unsigned int`, so high bits set on purpose change nothing.
+fn ioctl_filter() -> BpfProgram {
+    // The offsets into `struct seccomp_data`, and the low half of `args[1]`, little endian.
+    const NR: u32 = 0;
+    const ARCH: u32 = 4;
+    const REQUEST: u32 = 24;
+    let op = |code, k| sock_filter { code, jt: 0, jf: 0, k };
+    // The checks, each with where it jumps when it matches, then the three ways out.
+    let mut checks: Vec<(sock_filter, To)> = vec![
+        (op(LD, ARCH), To::Next),
+        // A syscall from another architecture is left to the other filters, which refuse it.
+        (op(JEQ, AUDIT_ARCH), To::PassUnless),
+        (op(LD, NR), To::Next),
+        (op(JEQ, libc::SYS_ioctl as u32), To::PassUnless),
+        (op(LD, REQUEST), To::Next),
+    ];
+    checks.extend(IOCTLS_REFUSED.iter().map(|&r| (op(JEQ, r), To::Refuse)));
+    checks.extend(IOCTLS.iter().map(|&r| (op(JEQ, r), To::Allow)));
+    // The type byte and the number, whatever the size and direction.
+    checks.push((op(AND, 0xffff), To::Next));
+    checks.extend(IOCTL_NUMBERS_REFUSED.iter().map(|&r| (op(JEQ, r), To::Refuse)));
+    checks.push((op(AND, 0xff00), To::Next));
+    checks.extend(IOCTL_TYPES.iter().map(|&t| (op(JEQ, u32::from(t) << 8), To::Allow)));
+    let (refuse, allow, pass) = (checks.len() + 1, checks.len() + 2, checks.len() + 3);
+    let mut prog: BpfProgram = Vec::with_capacity(pass + 1);
+    for (i, (mut ins, to)) in checks.into_iter().enumerate() {
+        // The program is a few dozen long, so every jump fits in a byte.
+        let jump = |to: usize| (to - i - 1) as u8;
+        match to {
+            To::Next => {}
+            To::Allow => ins.jt = jump(allow),
+            To::Refuse => ins.jt = jump(refuse),
+            To::PassUnless => ins.jf = jump(pass),
+        }
+        prog.push(ins);
+    }
+    prog.push(op(RET, SECCOMP_RET_ERRNO | libc::ENOTTY as u32));
+    prog.push(op(RET, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    prog.push(op(RET, SECCOMP_RET_ALLOW_HERE));
+    prog.push(op(RET, SECCOMP_RET_ALLOW));
+    prog
+}
+
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+/// Allows the call, since the kernel ignores the low bits of an allow, and tells [`join`] not to
+/// ask the filters after this one. The `ioctl` filter answers with it, as the others allow
+/// `ioctl` whatever its arguments, and that way an `ioctl` runs about 20 instructions and not about
+/// 140.
+const SECCOMP_RET_ALLOW_HERE: u32 = SECCOMP_RET_ALLOW | 1;
+
+/// The `AUDIT_ARCH_*` a syscall from this architecture carries.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xc000_00b7;
+#[cfg(target_arch = "riscv64")]
+const AUDIT_ARCH: u32 = 0xc000_00f3;
+
+/// Families of `ioctl` request let through, by their type byte: terminals and the `FIO*` calls
+/// on any file (`T`), sockets (0x89), the file flags, `FIEMAP`, fscrypt and fs-verity (`f`), and
+/// the inode generation (`v`).
+const IOCTL_TYPES: [u8; 4] = [b'T', 0x89, b'f', b'v'];
+
+/// Single requests let through from other families: `FICLONE`, `FICLONERANGE` and
+/// `FIDEDUPERANGE`, which `cp` uses for reflinks and which only reach files the caller has open,
+/// and `RNDGETENTCNT`, which some programs ask of `/dev/random`.
+const IOCTLS: [u32; 4] = [0x4004_9409, 0x4020_940d, 0xc018_9436, 0x8004_5200];
+
+/// Requests in an allowed family that are refused: `TIOCSTI`, which pushes input into a terminal
+/// as if typed, `TIOCSETD`, which loads a line discipline, and `TIOCLINUX`.
+const IOCTLS_REFUSED: [u32; 3] = [0x5412, 0x5423, 0x541c];
+
+/// Requests refused by type byte and number, whatever their size: `EXT4_IOC_MOVE_EXT`, which
+/// swaps blocks between files as `XFS_IOC_SWAPEXT` does, and `EXT4_IOC_SWAP_BOOT`.
+const IOCTL_NUMBERS_REFUSED: [u32; 2] = [0x660f, 0x6611];
 
 fn rule(arg: u8, op: SeccompCmpOp, value: u64) -> Result<SeccompRule, String> {
     let len = match op {
@@ -572,5 +705,108 @@ mod tests {
         assert_eq!(w, vec![root.join("a/b"), root.join("a/file"), root.join("c")]);
         assert!(writable(&root, &["relative".into()]).is_err());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Runs `prog` on a syscall, as the kernel would, for the few instructions it uses.
+    fn run(prog: &[sock_filter], arch: u32, nr: i64, request: u64) -> u32 {
+        let jump = |c: u32| libc::BPF_JMP | c | libc::BPF_K;
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&(nr as u32).to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        data[24..32].copy_from_slice(&request.to_le_bytes());
+        let (mut a, mut pc) = (0u32, 0usize);
+        loop {
+            let ins = &prog[pc];
+            pc += 1;
+            match u32::from(ins.code) {
+                c if c == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS => {
+                    let k = ins.k as usize;
+                    a = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
+                }
+                c if c == libc::BPF_JMP | libc::BPF_JA => pc += ins.k as usize,
+                c if c == jump(libc::BPF_JEQ) => {
+                    pc += usize::from(if a == ins.k { ins.jt } else { ins.jf });
+                }
+                c if c == jump(libc::BPF_JGT) => {
+                    pc += usize::from(if a > ins.k { ins.jt } else { ins.jf });
+                }
+                c if c == jump(libc::BPF_JGE) => {
+                    pc += usize::from(if a >= ins.k { ins.jt } else { ins.jf });
+                }
+                c if c == libc::BPF_ALU | libc::BPF_AND | libc::BPF_K => a &= ins.k,
+                c if c == libc::BPF_RET | libc::BPF_K => return ins.k,
+                c => panic!("instruction {c:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ioctls_normal_programs_make_pass_and_the_rest_are_refused() {
+        let prog = ioctl_filter();
+        let ioctl = |request| run(&prog, AUDIT_ARCH, libc::SYS_ioctl, request);
+        let (ok, enotty, eperm) = (
+            SECCOMP_RET_ALLOW_HERE,
+            SECCOMP_RET_ERRNO | libc::ENOTTY as u32,
+            SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+        for (name, request, want) in [
+            ("TCGETS", 0x5401, ok),
+            ("TIOCGWINSZ", 0x5413, ok),
+            ("FIONREAD", 0x541b, ok),
+            ("FIOCLEX", 0x5451, ok),
+            ("TIOCGPTN", 0x8004_5430, ok),
+            ("SIOCGIFCONF", 0x8912, ok),
+            ("FS_IOC_GETFLAGS", 0x8008_6601, ok),
+            ("FS_IOC_FIEMAP", 0xc020_660b, ok),
+            ("FS_IOC_GETVERSION", 0x8008_7601, ok),
+            ("FICLONE", 0x4004_9409, ok),
+            ("RNDGETENTCNT", 0x8004_5200, ok),
+            ("TIOCSTI", 0x5412, eperm),
+            ("TIOCSTI with the high bits set", 0xffff_ffff_0000_5412, eperm),
+            ("TIOCSETD", 0x5423, eperm),
+            ("EXT4_IOC_MOVE_EXT", 0xc028_660f, eperm),
+            ("XFS_IOC_SWAPEXT", 0xc0c0_586d, enotty),
+            ("FIFREEZE", 0xc004_5877, enotty),
+            ("BTRFS_IOC_SNAP_CREATE", 0x5000_9401, enotty),
+            ("NS_GET_USERNS", 0xb701, enotty),
+            ("LOOP_SET_FD", 0x4c00, enotty),
+        ] {
+            assert_eq!(ioctl(request), want, "{name}");
+        }
+        let pass = SECCOMP_RET_ALLOW;
+        assert_eq!(run(&prog, AUDIT_ARCH, libc::SYS_read, 0xc0c0_586d), pass, "another syscall");
+        assert_eq!(run(&prog, 0x4000_0003, libc::SYS_ioctl, 0xc0c0_586d), pass, "another arch");
+    }
+
+    #[test]
+    fn the_joined_filter_answers_as_the_three_stacked_would() {
+        let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+        let filters = [ioctl_filter(), deny_filter(arch).unwrap(), allow_filter(arch).unwrap()];
+        let joined = join(filters.to_vec());
+        assert!(joined.len() < 4096, "{} instructions", joined.len());
+        // The kernel keeps the answer with the lowest action as a signed number, newest first.
+        let stacked = |arch, nr, request| {
+            let action = |r: u32| (r & 0xffff_0000) as i32;
+            filters
+                .iter()
+                .map(|f| run(f, arch, nr, request))
+                .fold(SECCOMP_RET_ALLOW, |kept, r| if action(r) < action(kept) { r } else { kept })
+        };
+        for arch in [AUDIT_ARCH, 0x4000_0003] {
+            for nr in 0..=600 {
+                for request in [0, 0x5412, 0x541b, 0xc0c0_586d, 0x0001_0000_0000] {
+                    // An allow is an allow, whatever its low bits.
+                    let got = match run(&joined, arch, nr, request) {
+                        SECCOMP_RET_ALLOW_HERE => SECCOMP_RET_ALLOW,
+                        r => r,
+                    };
+                    let want = match stacked(arch, nr, request) {
+                        SECCOMP_RET_ALLOW_HERE => SECCOMP_RET_ALLOW,
+                        r => r,
+                    };
+                    assert_eq!(got, want, "{arch:#x} {nr} {request:#x}");
+                }
+            }
+        }
     }
 }

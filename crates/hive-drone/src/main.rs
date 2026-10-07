@@ -131,8 +131,8 @@ fn main() -> ExitCode {
     if args.harden {
         match hive_drone::harden::apply(&args.protect) {
             Ok(h) => eprintln!(
-                "hive-drone: hardened, landlock {}, {} syscalls allowed, {} refused",
-                h.landlock, h.allowed, h.denied
+                "hive-drone: hardened, landlock {}, {} syscalls allowed, {} refused, {} kinds of ioctl allowed",
+                h.landlock, h.allowed, h.denied, h.ioctls
             ),
             Err(e) => {
                 eprintln!("hive-drone: hardening: {e}");
