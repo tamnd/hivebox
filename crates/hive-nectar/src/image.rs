@@ -124,6 +124,10 @@ pub struct Scrubbed {
     /// Secrets found in paths the caller allowed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed: Vec<Finding>,
+    /// Secrets found in files still as a Debian package shipped them, such as the test keys in
+    /// libgnutls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shipped: Vec<Finding>,
     /// Files too big to search for secrets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsearched: Vec<String>,

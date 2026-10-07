@@ -368,10 +368,12 @@ async fn commit(
     );
     if let Some(s) = &w.scrubbed {
         eprintln!(
-            "scrubbed: {} files left out, {} rewritten, {} secrets allowed, {} too big to search",
+            "scrubbed: {} files left out, {} rewritten, {} secrets allowed, {} in files packages \
+             shipped, {} too big to search",
             s.removed.len(),
             s.rewritten.len(),
             s.allowed.len(),
+            s.shipped.len(),
             s.unsearched.len(),
         );
     }
