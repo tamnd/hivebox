@@ -1213,7 +1213,7 @@ dependencies = [
  "hive-proto",
  "hive-types",
  "libcontainer",
- "nix 0.29.0",
+ "nix 0.31.3",
  "rustix 1.1.5",
  "serde",
  "serde_json",
