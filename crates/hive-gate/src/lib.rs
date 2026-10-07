@@ -56,6 +56,10 @@ pub const PROJECT_HEADER: &str = "x-hive-project";
 /// key away lately, which the gate sets once every node in the key's order turned it away.
 pub const ANYWAY_HEADER: &str = "x-hive-anyway";
 
+/// The header that tells a comb who made a call, for its audit log. The gate sets it from the
+/// key or token and drops whatever the caller put there.
+pub const PRINCIPAL_HEADER: &str = "x-hive-principal";
+
 /// A token the call came with, which the services ask what it allows once they know the call's
 /// cell. A call with an API key has none.
 #[derive(Clone, Debug)]
@@ -161,6 +165,20 @@ enum Credential {
     Token(Grant),
 }
 
+impl Credential {
+    /// The caller as the audit log names it: `key:` or `token:` and the first 16 hex digits of
+    /// the key's hash, which a token carries too. That is enough to tell keys apart and too
+    /// little to stand in for one.
+    fn principal(&self) -> String {
+        let (kind, hash) = match self {
+            Self::Key(k) => ("key", &k.0),
+            Self::Token(g) => ("token", &g.0.key),
+        };
+        let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        format!("{kind}:{hex}")
+    }
+}
+
 impl Service<http::Request<Body>> for Gate {
     type Response = http::Response<Body>;
     type Error = Infallible;
@@ -200,6 +218,7 @@ impl Service<http::Request<Body>> for Gate {
             }
         };
         self.calls.with(&[op, "ok"]).inc();
+        let principal = credential.principal();
         match credential {
             Credential::Key(hash) => req.extensions_mut().insert(hash).map(drop),
             Credential::Token(grant) => req.extensions_mut().insert(grant).map(drop),
@@ -208,6 +227,9 @@ impl Service<http::Request<Body>> for Gate {
         headers.remove(http::header::AUTHORIZATION);
         if let Ok(v) = http::HeaderValue::from_str(&project) {
             headers.insert(PROJECT_HEADER, v);
+        }
+        if let Ok(v) = http::HeaderValue::from_str(&principal) {
+            headers.insert(PRINCIPAL_HEADER, v);
         }
         match to {
             To::Cells => Box::pin(self.cells.call(req)),

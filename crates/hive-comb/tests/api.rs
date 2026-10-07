@@ -569,6 +569,83 @@ async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
     api.stop.cancel();
 }
 
+/// The events in the audit log in `dir`, oldest first.
+fn audited(dir: &Path) -> Vec<hive_telemetry::AuditEvent> {
+    let mut hours: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    hours.sort();
+    let mut out = Vec::new();
+    for h in hours {
+        for line in std::fs::read_to_string(h).unwrap().lines() {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            out.push(serde_json::from_value(v["event"].take()).unwrap());
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_call_goes_into_the_audit_log_with_who_made_it() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let cell = create(&mut api.cells(), "p", 1, v1_spec("python", &[])).await.remove(0);
+    let id = cell.id.as_str();
+
+    // A gate says who the caller is, and the trace id comes from the W3C header.
+    let trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let run = v1::RunRequest { cell_id: id.into(), shell: "echo hi".into(), ..Default::default() };
+    let mut r = req("p", run);
+    r.metadata_mut().insert(api::PRINCIPAL_HEADER, "key:0123456789abcdef".parse().unwrap());
+    r.metadata_mut()
+        .insert("traceparent", format!("00-{trace}-00f067aa0ba902b7-01").parse().unwrap());
+    api.exec().run(r).await.unwrap();
+    let path = s.0.join("files/secret.txt");
+    write(&mut api.files(), "p", id, path.to_str().unwrap(), b"hunter2", 3).await.unwrap();
+    let e = api.cells().get(req("q", v1::GetCellRequest { id: id.into() })).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::CellNotFound);
+    // An empty principal is refused, not logged as no one.
+    let mut r = req("p", v1::GetCellRequest { id: id.into() });
+    r.metadata_mut().insert(api::PRINCIPAL_HEADER, "".parse().unwrap());
+    assert_eq!(reason(&api.cells().get(r).await.unwrap_err()), Reason::InvalidArgument);
+    let stop = v1::StopRequest { selector: Some(by_id(id)), snapshot: false };
+    api.cells().stop(req("p", stop)).await.unwrap();
+
+    let log = api.comb.audit().unwrap();
+    tokio::task::block_in_place(|| log.flush()).unwrap();
+    let dir = s.0.join("audit");
+    let got = audited(&dir);
+    let seen: Vec<_> = got
+        .iter()
+        .map(|e| (e.principal.as_str(), e.project.as_str(), e.op.as_str(), e.result.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("local", "p", "cell.create", "ok"),
+            ("key:0123456789abcdef", "p", "exec.run", "exit=0 out=3 err=0"),
+            ("local", "p", "file.write", "ok bytes=7"),
+            ("local", "q", "cell.get", "NotFound"),
+            ("local", "p", "cell.stop", "ok"),
+        ]
+    );
+    assert!(got.iter().all(|e| e.cell == id && e.args.len() == 64));
+    assert_eq!(got[1].trace, trace);
+    assert!(got.iter().filter(|e| e.op != "exec.run").all(|e| e.trace.is_empty()));
+    // The file's contents are only in the log as part of a hash.
+    let text: String = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert!(!text.contains("hunter2"));
+    let v = hive_telemetry::audit::verify(&dir).unwrap().unwrap();
+    assert_eq!(v.events, 5);
+    api.stop.cancel();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_socket_is_the_owners_only_and_replaced_on_restart() {
     use std::os::unix::fs::PermissionsExt;

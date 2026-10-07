@@ -55,7 +55,7 @@ impl Api {
     async fn send(
         &self,
         node: u16,
-        project: &str,
+        project: &cells::Caller,
         msg: v1::VerifyRequest,
     ) -> Result<v1::VerifyResult, Status> {
         let channel = self.channel(node)?;

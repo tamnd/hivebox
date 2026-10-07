@@ -281,6 +281,7 @@ impl Drop for Scratch {
 pub fn config(dir: &Path) -> Config {
     Config {
         data_dir: dir.to_path_buf(),
+        audit_dir: Some(dir.join("audit")),
         mem_mib: Some(4096),
         create_deadline: Duration::from_secs(5),
         stop_grace: Duration::from_millis(100),

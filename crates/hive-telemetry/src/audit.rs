@@ -9,6 +9,8 @@
 //!
 //! [`AuditLog`] appends from a thread of its own, writing whatever has queued up as one batch and
 //! syncing the file once per batch, so a busy node pays for one sync per batch and not per event.
+//! Syncs are at least a gap apart, [`SYNC_GAP`] unless the log is opened with another, so a
+//! steady trickle of events shares them too.
 //! [`AuditLog::record`] returns once the event is queued, and [`AuditLog::flush`] waits until
 //! everything queued so far is on disk. [`verify`] walks a node's files and says where the chain
 //! breaks, if it does.
@@ -17,16 +19,23 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// The hash the first line of a node's chain points back at.
 pub const GENESIS: [u8; 32] = [0; 32];
 
 /// The most events one batch writes before it syncs.
 const BATCH: usize = 4096;
+
+/// The least time between two syncs, unless the log is opened with another. Each sync of the
+/// log commits the file system's journal, which on ext4 also writes out data the cells wrote, so
+/// a node that syncs often slows down every cell writing to the same disk. An event after a quiet
+/// spell is synced at once, and a flush never waits.
+pub const SYNC_GAP: Duration = Duration::from_secs(1);
 
 /// How many events may wait for the writer before [`AuditLog::record`] blocks.
 const QUEUE: usize = 1 << 16;
@@ -350,6 +359,8 @@ enum Msg {
 /// A node's audit log, appended to from a thread of its own.
 pub struct AuditLog {
     tx: Option<SyncSender<Msg>>,
+    /// Set by a flush or a close, to wake the writer from waiting out the gap between syncs.
+    urgent: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     counters: Arc<Counters>,
     root: Arc<Mutex<(u64, [u8; 32])>>,
@@ -536,16 +547,27 @@ impl AuditLog {
     /// The directory cannot be read or written, the chain in it is broken anywhere but a torn
     /// last line, or it is another node's chain.
     pub fn open(dir: &Path, node: &str) -> io::Result<Self> {
+        Self::open_with_gap(dir, node, SYNC_GAP)
+    }
+
+    /// [`AuditLog::open`], with syncs at least `gap` apart: a longer gap means fewer syncs under
+    /// load and longer for an event to be on disk.
+    ///
+    /// # Errors
+    ///
+    /// As for [`AuditLog::open`].
+    pub fn open_with_gap(dir: &Path, node: &str, gap: Duration) -> io::Result<Self> {
         let mut w = Writer::open(dir, node)?;
         let counters = Arc::new(Counters::default());
         counters.events.store(w.seq, Ordering::Relaxed);
         let root = Arc::new(Mutex::new((w.seq, w.prev)));
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let (c, r) = (counters.clone(), root.clone());
+        let urgent = Arc::new(AtomicBool::new(false));
+        let (c, r, u) = (counters.clone(), root.clone(), urgent.clone());
         let thread = std::thread::Builder::new()
             .name("hive-audit".into())
-            .spawn(move || run(&mut w, &rx, &c, &r))?;
-        Ok(Self { tx: Some(tx), thread: Some(thread), counters, root })
+            .spawn(move || run(&mut w, &rx, gap, &u, &c, &r))?;
+        Ok(Self { tx: Some(tx), urgent, thread: Some(thread), counters, root })
     }
 
     /// Queues `event`. It blocks only while the writer is a whole queue behind.
@@ -567,6 +589,7 @@ impl AuditLog {
             .ok_or_else(|| io::Error::other("the audit log is closed"))?
             .send(Msg::Flush(tx))
             .map_err(|_| io::Error::other("the audit writer is gone"))?;
+        self.wake();
         rx.recv().map_err(|_| io::Error::other("the audit writer is gone"))?
     }
 
@@ -586,37 +609,69 @@ impl AuditLog {
     }
 }
 
+impl AuditLog {
+    fn wake(&self) {
+        self.urgent.store(true, Ordering::Release);
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
+    }
+}
+
 impl Drop for AuditLog {
     fn drop(&mut self) {
         // Closing the queue lets the writer finish what is in it and sync.
         self.tx = None;
+        self.wake();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
 }
 
-fn run(w: &mut Writer, rx: &Receiver<Msg>, counters: &Counters, root: &Mutex<(u64, [u8; 32])>) {
+fn run(
+    w: &mut Writer,
+    rx: &Receiver<Msg>,
+    gap: Duration,
+    urgent: &AtomicBool,
+    counters: &Counters,
+    root: &Mutex<(u64, [u8; 32])>,
+) {
     let mut waiting = Vec::new();
     let mut failed: Option<String> = None;
+    let mut synced: Option<Instant> = None;
     while let Ok(first) = rx.recv() {
         let mut next = Some(first);
         let mut n = 0;
-        while let Some(msg) = next.take() {
-            match msg {
-                Msg::Event(e) => {
-                    n += 1;
-                    if let Err(e) = w.append(e) {
-                        failed = Some(e.to_string());
-                        recover(w, counters);
+        let mut napped = false;
+        loop {
+            while let Some(msg) = next.take() {
+                match msg {
+                    Msg::Event(e) => {
+                        n += 1;
+                        if let Err(e) = w.append(e) {
+                            failed = Some(e.to_string());
+                            recover(w, counters);
+                        }
                     }
+                    Msg::Flush(tx) => waiting.push(tx),
                 }
-                Msg::Flush(tx) => waiting.push(tx),
+                if n < BATCH {
+                    next = rx.try_recv().ok();
+                }
             }
-            if n < BATCH {
-                next = rx.try_recv().ok();
+            if napped || n >= BATCH || !waiting.is_empty() {
+                break;
             }
+            // The rest of the gap since the last sync is waited out in one sleep, not a wakeup
+            // per event, and then whatever came in meanwhile goes into this batch.
+            napped = true;
+            if let Some(due) = synced.map(|t| t + gap) {
+                nap(due, urgent);
+            }
+            next = rx.try_recv().ok();
         }
+        synced = Some(Instant::now());
         if let Err(e) = w.sync() {
             failed = Some(e.to_string());
             recover(w, counters);
@@ -635,6 +690,17 @@ fn run(w: &mut Writer, rx: &Receiver<Msg>, counters: &Counters, root: &Mutex<(u6
         recover(w, counters);
     }
     publish(w, counters, root);
+}
+
+/// Sleeps until `due`, or until a flush or a close says not to wait.
+fn nap(due: Instant, urgent: &AtomicBool) {
+    loop {
+        let now = Instant::now();
+        if urgent.swap(false, Ordering::AcqRel) || now >= due {
+            return;
+        }
+        std::thread::park_timeout(due - now);
+    }
 }
 
 fn publish(w: &Writer, counters: &Counters, root: &Mutex<(u64, [u8; 32])>) {
@@ -857,5 +923,52 @@ mod tests {
         assert!(s.syncs <= 4000);
         drop(log);
         assert_eq!(verify(&d.0).unwrap().unwrap().events, 4000);
+    }
+
+    #[test]
+    fn a_trickle_of_events_shares_syncs() {
+        let d = Scratch::new("trickle");
+        let gap = Duration::from_millis(10);
+        let log = AuditLog::open_with_gap(&d.0, "n1", gap).unwrap();
+        let began = Instant::now();
+        for i in 0..100 {
+            log.record(event(T0 + i, i));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        log.flush().unwrap();
+        let took = began.elapsed();
+        let syncs = log.stats().syncs;
+        let most = took.as_millis() / gap.as_millis() + 2;
+        assert!(u128::from(syncs) <= most, "{syncs} syncs in {took:?}");
+        // After a quiet spell, an event gets a sync of its own.
+        std::thread::sleep(gap * 2);
+        let before = log.stats().syncs;
+        log.record(event(T0 + 100, 100));
+        let t = Instant::now();
+        while log.stats().events < 101 {
+            assert!(t.elapsed() < Duration::from_secs(5), "the event never landed");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        assert_eq!(log.stats().syncs, before + 1);
+    }
+
+    #[test]
+    fn a_flush_or_a_close_does_not_wait_out_the_gap() {
+        let d = Scratch::new("gap");
+        let gap = Duration::from_secs(600);
+        let log = AuditLog::open_with_gap(&d.0, "n1", gap).unwrap();
+        log.record(event(T0, 0));
+        log.flush().unwrap();
+        // The writer is now waiting out the gap with these two queued.
+        log.record(event(T0 + 1, 1));
+        std::thread::sleep(Duration::from_millis(50));
+        log.record(event(T0 + 2, 2));
+        let t = Instant::now();
+        log.flush().unwrap();
+        assert_eq!(log.stats().events, 3);
+        log.record(event(T0 + 3, 3));
+        drop(log);
+        assert!(t.elapsed() < Duration::from_secs(60), "took {:?}", t.elapsed());
+        assert_eq!(verify(&d.0).unwrap().unwrap().events, 4);
     }
 }

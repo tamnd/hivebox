@@ -73,7 +73,12 @@ impl Api {
     }
 
     /// Sends `msg` to every node at once and returns each one's answer.
-    async fn on_every<T, R, F, Fut>(&self, project: &str, msg: T, call: F) -> Vec<Answer<R>>
+    async fn on_every<T, R, F, Fut>(
+        &self,
+        project: &cells::Caller,
+        msg: T,
+        call: F,
+    ) -> Vec<Answer<R>>
     where
         T: Clone + Send + 'static,
         R: Send + 'static,

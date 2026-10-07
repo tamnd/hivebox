@@ -60,6 +60,11 @@ struct FakeLlm {
 }
 
 fn project<T>(r: &Request<T>) -> String {
+    // Every call the gate passes on names the caller by its key, whatever the caller sent.
+    let who = r.metadata().get(hive_gate::PRINCIPAL_HEADER).unwrap().to_str().unwrap();
+    let hash = blake3::hash(KEY.as_bytes());
+    let hex: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    assert!(who == format!("key:{hex}") || who == format!("token:{hex}"), "principal {who}");
     r.metadata().get("x-hive-project").unwrap().to_str().unwrap().to_owned()
 }
 
@@ -667,6 +672,7 @@ fn authed<T>(msg: T) -> Request<T> {
     r.metadata_mut().insert("authorization", format!("Bearer {KEY}").parse().unwrap());
     // Whatever the caller says its project is, the key decides.
     r.metadata_mut().insert("x-hive-project", "someone-else".parse().unwrap());
+    r.metadata_mut().insert(hive_gate::PRINCIPAL_HEADER, "local".parse().unwrap());
     r
 }
 

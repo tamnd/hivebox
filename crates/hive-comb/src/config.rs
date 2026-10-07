@@ -80,6 +80,10 @@ pub struct Config {
     pub listen: Option<SocketAddr>,
     /// Where `/metrics` is served, if anywhere.
     pub metrics: Option<SocketAddr>,
+    /// Where the audit log goes, or `None` for no audit log. It belongs where no cell can reach.
+    pub audit_dir: Option<PathBuf>,
+    /// The least time between two syncs of the audit log.
+    pub audit_sync_gap: Duration,
     /// The container backend.
     pub container: ContainerBackend,
     /// Where images come from.
@@ -283,6 +287,8 @@ impl Default for Config {
             api_socket: PathBuf::from("/run/hivebox/comb.sock"),
             listen: None,
             metrics: None,
+            audit_dir: Some(PathBuf::from("/var/lib/hivebox/audit")),
+            audit_sync_gap: hive_telemetry::audit::SYNC_GAP,
             container: ContainerBackend::default(),
             images: Images::default(),
             network: Network::default(),
@@ -317,6 +323,10 @@ impl Config {
     /// core_scheduling = true
     /// setup_boost = 4
     /// cpu_burst = 2.0
+    ///
+    /// [audit]
+    /// dir = "/var/lib/hivebox/audit"
+    /// sync_gap = "1s"
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -362,7 +372,8 @@ impl Config {
     /// name = "node-7"
     /// ```
     ///
-    /// An empty `cgroup_root` or `netns_dir` turns that pool off.
+    /// An empty `cgroup_root` or `netns_dir` turns that pool off, and an empty `audit.dir` turns
+    /// the audit log off. The audit log goes in `audit` under `data_dir` unless `audit.dir` says.
     ///
     /// # Errors
     ///
@@ -391,6 +402,15 @@ impl Config {
         }
         set(&mut c.reserved_mem_mib, n.reserved_mem_mib);
         set(&mut c.max_cells, n.max_cells);
+        c.audit_dir = match file.audit.dir {
+            Some(dir) => (!dir.as_os_str().is_empty()).then_some(dir),
+            None => Some(c.data_dir.join("audit")),
+        };
+        if let Some(v) = file.audit.sync_gap {
+            c.audit_sync_gap = duration(&v).ok_or_else(|| {
+                format!("audit.sync_gap = {v:?} is not a duration like 10ms or 1s")
+            })?;
+        }
         let p = file.pools;
         if let Some(root) = p.cgroup_root {
             c.cgroup_root = (!root.as_os_str().is_empty()).then_some(root);
@@ -598,6 +618,14 @@ struct File {
     network: NetworkFile,
     scout: ScoutFile,
     keeper: KeeperFile,
+    audit: AuditFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AuditFile {
+    dir: Option<PathBuf>,
+    sync_gap: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -740,6 +768,19 @@ mod tests {
         assert!(c.core_scheduling);
         assert_eq!(c.setup_boost, 4);
         assert_eq!(c.cpu_burst_tenths, 20);
+    }
+
+    #[test]
+    fn the_audit_log_goes_under_the_data_dir_unless_the_file_says() {
+        let c = Config::from_toml("[node]\ndata_dir = \"/tmp/hb\"").unwrap();
+        assert_eq!(c.audit_dir, Some(PathBuf::from("/tmp/hb/audit")));
+        let c = Config::from_toml("[audit]\ndir = \"/srv/audit\"").unwrap();
+        assert_eq!(c.audit_dir, Some(PathBuf::from("/srv/audit")));
+        assert_eq!(Config::from_toml("[audit]\ndir = \"\"").unwrap().audit_dir, None);
+        assert!(Config::from_toml("[audit]\ndri = \"/x\"").is_err());
+        let c = Config::from_toml("[audit]\nsync_gap = \"100ms\"").unwrap();
+        assert_eq!(c.audit_sync_gap, Duration::from_millis(100));
+        assert!(Config::from_toml("[audit]\nsync_gap = \"soon\"").is_err());
     }
 
     #[test]

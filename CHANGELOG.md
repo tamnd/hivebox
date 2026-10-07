@@ -5,6 +5,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 ## Unreleased
 
 - An audit log in `hive_telemetry::audit`: a node's events as a hash chain cut into hourly files, each sealed with its count and root when the hour turns, written in batches with one sync each. `hivectl audit verify DIR` says where a chain breaks. On server3 at load 80, 8 threads recorded 32,000 to 42,000 events a second, and verifying ran at 71,000 to 171,000 a second.
+- The comb records every API call in its audit log: cells, exec, files, snapshots, verify and the LLM gateway, with the principal the gate stamps in `x-hive-principal` (`local` on the comb's own socket), a hash of the arguments, the result and the W3C trace id. It is on by default under the data directory and set with `[audit] dir`, and an empty `dir` turns it off. Syncs are at least `[audit] sync_gap` apart, 1 s unless set, since syncing every batch slowed file writes from cells by about 40 percent on server3. With the gap, at load 84 to 108, `exec.run` through the python SDK ran at 469 to 568 calls a second with the log on against 459 to 553 off, and file writes at 532 to 569 against 508 to 720.
 
 ## 0.0.31
 

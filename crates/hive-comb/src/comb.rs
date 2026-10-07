@@ -23,6 +23,7 @@ use hive_nectar::upper::{Scrub, SecretsFound, Shift};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
 use hive_proto::convert;
 use hive_rt::{OsRng, Rng};
+use hive_telemetry::AuditLog;
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, Reason, Source, is_name};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -97,6 +98,8 @@ pub(crate) struct Inner {
     pub(crate) llm: Option<Arc<Gateway>>,
     images: Option<Nectar>,
     pub(crate) metrics: Metrics,
+    /// The audit log, which every API call goes into, when there is one. Shutting down takes it.
+    audit: Mutex<Option<Arc<AuditLog>>>,
     /// Whether the pressure brake is on, which pauses idle cells and reclaims paused ones early.
     pub(crate) pressure: watch::Sender<bool>,
     pub(crate) shards: Vec<RwLock<HashMap<CellId, Arc<Cell>>>>,
@@ -234,6 +237,20 @@ impl Comb {
             None => None,
         };
         let images = Nectar::open(&cfg)?;
+        let audit = match &cfg.audit_dir {
+            Some(dir) => {
+                // The keeper's name for the node stays the same when its index does not.
+                let node = cfg
+                    .keeper
+                    .as_ref()
+                    .map_or_else(|| format!("node-{}", cfg.node), |k| k.name.clone());
+                Some(Arc::new(
+                    AuditLog::open_with_gap(dir, &node, cfg.audit_sync_gap)
+                        .map_err(at("opening the audit log in", dir))?,
+                ))
+            }
+            None => None,
+        };
         let mut records = replay.records;
         let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
         let inner = Arc::new(Inner {
@@ -248,6 +265,7 @@ impl Comb {
             llm,
             images,
             metrics: Metrics::default(),
+            audit: Mutex::new(audit),
             pressure: watch::Sender::new(false),
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             idem: Mutex::default(),
@@ -696,6 +714,12 @@ impl Comb {
         &self.inner.metrics
     }
 
+    /// The audit log, when the comb keeps one and has not shut down.
+    #[must_use]
+    pub fn audit(&self) -> Option<Arc<AuditLog>> {
+        self.inner.audit.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
     /// What the WAL has done since the comb opened.
     #[must_use]
     pub fn wal_stats(&self) -> WalStats {
@@ -725,6 +749,12 @@ impl Comb {
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         self.inner.wal.close().await;
+        // Closing the audit log waits for its writer to sync the last batch and go, so the next
+        // comb is the only one writing the chain.
+        let audit = self.inner.audit.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(log) = audit {
+            let _ = tokio::task::spawn_blocking(move || drop(log)).await;
+        }
     }
 }
 

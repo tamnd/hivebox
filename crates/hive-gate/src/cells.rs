@@ -23,7 +23,7 @@ use tonic::{Request, Response, Status};
 
 use crate::nodes::Nodes;
 use crate::quota::Quotas;
-use crate::{ANYWAY_HEADER, Grant, PROJECT_HEADER};
+use crate::{ANYWAY_HEADER, Grant, PRINCIPAL_HEADER, PROJECT_HEADER};
 
 /// The most cells one create call may ask for.
 pub const MAX_COUNT: u32 = 32_768;
@@ -144,7 +144,7 @@ impl Api {
 
     /// Runs a bulk call on every node and adds up the answers. A node that fails shows up as
     /// one failure with no cell id, since which of its cells matched is not known.
-    async fn everywhere<T, F, Fut>(&self, project: &str, msg: T, call: F) -> v1::BulkResult
+    async fn everywhere<T, F, Fut>(&self, project: &Caller, msg: T, call: F) -> v1::BulkResult
     where
         T: Clone + Send + 'static,
         F: Fn(CellsClient<Channel>, Request<T>) -> Fut,
@@ -397,7 +397,7 @@ impl Cells for Api {
 /// One create call on its way through the cluster.
 struct Batch {
     api: Api,
-    project: String,
+    project: Caller,
     wire: v1::CellSpec,
     spec: CellSpec,
     key: String,
@@ -609,7 +609,7 @@ impl Batch {
 /// away.
 async fn watch_all(
     api: Api,
-    project: String,
+    project: Caller,
     labels: v1::LabelSelector,
     tx: mpsc::Sender<Result<v1::CellEvent, Status>>,
 ) {
@@ -635,7 +635,7 @@ async fn watch_all(
 async fn watch_node(
     api: Api,
     node: u16,
-    project: String,
+    project: Caller,
     labels: v1::LabelSelector,
     tx: mpsc::Sender<Result<v1::CellEvent, Status>>,
 ) {
@@ -680,7 +680,7 @@ fn parse_token(t: &str) -> Result<(u16, Option<CellId>), Status> {
 
 /// The project the gate stamped on the call, once the call's token, if it came with one, allows
 /// `op` on `cell`. A token held to some cells allows no call that is not about one cell.
-pub(crate) fn allowed<T>(req: &Request<T>, op: &str, cell: Option<&str>) -> Result<String, Status> {
+pub(crate) fn allowed<T>(req: &Request<T>, op: &str, cell: Option<&str>) -> Result<Caller, Status> {
     // The id as the comb reads it, so two ways of writing one id can not get past a check.
     let cell = cell.map(|c| c.parse::<CellId>().map_or_else(|_| c.to_owned(), |id| id.to_string()));
     Grant::check(req.extensions().get::<Grant>(), op, cell.as_deref())?;
@@ -695,20 +695,36 @@ fn selected(sel: Option<&v1::CellSelector>) -> Option<&str> {
     }
 }
 
-/// The project the gate stamped on the call when it checked the key.
-fn project<T>(req: &Request<T>) -> Result<String, Status> {
-    req.metadata()
-        .get(PROJECT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .ok_or_else(|| Status::unauthenticated("no project"))
+/// Who a call came from: the project the gate stamped on it when it checked the key, and the
+/// principal, which goes on to the comb's audit log. It reads as the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Caller {
+    pub(crate) project: String,
+    pub(crate) principal: String,
 }
 
-/// `msg` as a call for `project`.
-pub(crate) fn out<T>(project: &str, msg: T) -> Request<T> {
+impl std::ops::Deref for Caller {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.project
+    }
+}
+
+fn project<T>(req: &Request<T>) -> Result<Caller, Status> {
+    let header = |name| req.metadata().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let project = header(PROJECT_HEADER).ok_or_else(|| Status::unauthenticated("no project"))?;
+    Ok(Caller { project, principal: header(PRINCIPAL_HEADER).unwrap_or_default() })
+}
+
+/// `msg` as a call from `caller`.
+pub(crate) fn out<T>(caller: &Caller, msg: T) -> Request<T> {
     let mut r = Request::new(msg);
-    if let Ok(v) = project.parse() {
+    if let Ok(v) = caller.project.parse() {
         r.metadata_mut().insert(PROJECT_HEADER, v);
+    }
+    if let Ok(v) = caller.principal.parse() {
+        r.metadata_mut().insert(PRINCIPAL_HEADER, v);
     }
     r
 }
