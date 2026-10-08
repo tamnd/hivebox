@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `Verify.Run` leaves `conftest.py`, `pytest.ini`, `.pytest.ini`, `tox.ini`, `setup.cfg` and installed package metadata out of the subject's diff even when the request names no protected paths, and reports them in `tampered`, so a `conftest.py` hook that marks every test passed no longer earns a reward. `[verify] protected_paths` in the comb's config changes the list, and `[]` turns it off.
+
 ## 0.0.35
 
 Git squashing for snapshots, a static shell the cell cannot overwrite, and disk quotas for container cells.

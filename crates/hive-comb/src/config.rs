@@ -84,6 +84,10 @@ pub struct Config {
     pub audit_dir: Option<PathBuf>,
     /// The least time between two syncs of the audit log.
     pub audit_sync_gap: Duration,
+    /// Globs of files a verification leaves out of the subject's diff whatever the caller asks,
+    /// on top of the caller's own. By default these are the files that set up a test run and not
+    /// the tests, which a change could use to make every test pass. `[verify] protected_paths`.
+    pub protected_paths: Vec<String>,
     /// The container backend.
     pub container: ContainerBackend,
     /// Where images come from.
@@ -270,6 +274,18 @@ impl Default for ContainerBackend {
     }
 }
 
+/// The files a verification leaves out of the diff by default: what pytest reads before it runs a
+/// test, and what pip installed. `pyproject.toml` is not one, since fixes change it too.
+pub(crate) const PROTECTED_PATHS: [&str; 7] = [
+    "**/conftest.py",
+    "**/pytest.ini",
+    "**/.pytest.ini",
+    "**/tox.ini",
+    "**/setup.cfg",
+    "**/*.egg-info/**",
+    "**/*.dist-info/**",
+];
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -308,6 +324,7 @@ impl Default for Config {
             metrics: None,
             audit_dir: Some(PathBuf::from("/var/lib/hivebox/audit")),
             audit_sync_gap: hive_telemetry::audit::SYNC_GAP,
+            protected_paths: PROTECTED_PATHS.iter().map(|&p| p.to_owned()).collect(),
             container: ContainerBackend::default(),
             images: Images::default(),
             network: Network::default(),
@@ -347,6 +364,9 @@ impl Config {
     /// [audit]
     /// dir = "/var/lib/hivebox/audit"
     /// sync_gap = "1s"
+    ///
+    /// [verify]
+    /// protected_paths = ["**/conftest.py", "tests/**"]
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -471,6 +491,9 @@ impl Config {
                 return Err(format!("density.cpu_burst = {v} must be from 1 to 16"));
             }
             c.cpu_burst_tenths = (v * 10.0).round() as u32;
+        }
+        if let Some(p) = file.verify.protected_paths {
+            c.protected_paths = p;
         }
         let l = file.lifecycle;
         for (field, value, name) in [
@@ -641,6 +664,7 @@ struct File {
     pools: PoolsFile,
     density: DensityFile,
     lifecycle: LifecycleFile,
+    verify: VerifyFile,
     backends: BackendsFile,
     images: ImagesFile,
     network: NetworkFile,
@@ -765,6 +789,12 @@ struct LifecycleFile {
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct VerifyFile {
+    protected_paths: Option<Vec<String>>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct BackendsFile {
     create_limit: BTreeMap<String, usize>,
     container: ContainerFile,
@@ -799,6 +829,16 @@ mod tests {
         assert!(c.core_scheduling);
         assert_eq!(c.setup_boost, 4);
         assert_eq!(c.cpu_burst_tenths, 20);
+        assert!(c.protected_paths.iter().any(|p| p == "**/conftest.py"));
+    }
+
+    #[test]
+    fn the_verify_section_replaces_the_protected_paths() {
+        let c = Config::from_toml("[verify]\nprotected_paths = [\"tests/**\"]").unwrap();
+        assert_eq!(c.protected_paths, ["tests/**"]);
+        let c = Config::from_toml("[verify]\nprotected_paths = []").unwrap();
+        assert!(c.protected_paths.is_empty());
+        assert!(Config::from_toml("[verify]\nprotected = []").is_err());
     }
 
     #[test]
