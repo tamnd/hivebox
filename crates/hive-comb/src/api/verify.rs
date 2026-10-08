@@ -4,6 +4,8 @@
 //!
 //! The diff is taken against the checkout's `HEAD` with a throwaway index, so the subject's own
 //! index is left alone and new files count. Changes to protected paths are left out and reported.
+//! The comb's own protected paths count on top of the caller's, and by default they are the files
+//! that set up a test run, such as `conftest.py`, so a change cannot make every test pass with them.
 //! The verifier cell gets no network, then the diff, then the caller's files such as hidden tests,
 //! and runs the command as many times as asked. It is stopped when the call ends, however it ends.
 //!
@@ -141,7 +143,12 @@ impl Job<'_> {
         if let Some(id) = self.subject {
             let t = Instant::now();
             match self.take_diff(id).await {
-                Ok(d) => (diff, tampered) = screen(&d, &self.req.protected_paths),
+                Ok(d) => {
+                    let node = &self.api.comb.inner.cfg.protected_paths;
+                    let protected: Vec<String> =
+                        node.iter().chain(&self.req.protected_paths).cloned().collect();
+                    (diff, tampered) = screen(&d, &protected);
+                }
                 Err(e) => return failed(e, tampered, self.scores),
             }
             self.time("diff", t);
@@ -569,6 +576,24 @@ index 0000000..5555555
         let (kept, tampered) = screen(DIFF.as_bytes(), &[]);
         assert_eq!(kept, DIFF.as_bytes());
         assert!(tampered.is_empty());
+    }
+
+    #[test]
+    fn the_default_paths_cut_out_what_sets_up_a_test_run() {
+        let node: Vec<String> =
+            crate::config::PROTECTED_PATHS.iter().map(|&p| p.to_owned()).collect();
+        let (kept, tampered) = screen(DIFF.as_bytes(), &node);
+        assert!(String::from_utf8(kept).unwrap().contains("b/test_requests.py"));
+        assert_eq!(tampered, ["tests/unit/conftest.py"]);
+        let hit = |p: &str| node.iter().any(|g| glob(g, p));
+        assert!(hit("conftest.py"));
+        assert!(hit("setup.cfg"));
+        assert!(hit("pkg/tox.ini"));
+        assert!(hit("requests.egg-info/PKG-INFO"));
+        assert!(hit("venv/lib/python3.12/site-packages/pytest-8.3.dist-info/RECORD"));
+        assert!(!hit("requests/sessions.py"));
+        assert!(!hit("pyproject.toml"));
+        assert!(!hit("tests/test_config.py"));
     }
 
     #[test]
