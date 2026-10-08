@@ -233,6 +233,12 @@ pub struct ContainerBackend {
     pub enabled: bool,
     /// The static drone binary put in every container.
     pub drone: PathBuf,
+    /// A static POSIX shell put in every container at `/.hive/sh`, read only, which the drone
+    /// runs commands and sessions with, so a cell that writes over its own `/bin/sh`, `/bin/bash`
+    /// or libc cannot take over how later commands run. It must not run its own applets in place
+    /// of the image's tools, as Debian's and Ubuntu's busybox do. The busybox in the
+    /// `busybox:musl` image does not.
+    pub shell: Option<PathBuf>,
     /// Where each container cell gets its bundle, its state and its log.
     pub state_dir: PathBuf,
     /// Processes kept to make containers, which is how many creates go on at once.
@@ -248,6 +254,7 @@ impl Default for ContainerBackend {
         Self {
             enabled: true,
             drone: PathBuf::from("/usr/lib/hivebox/hive-drone"),
+            shell: None,
             state_dir: PathBuf::from("/run/hivebox/oci"),
             workers: 8,
             uid_base: 1_000_000,
@@ -484,6 +491,7 @@ impl Config {
         let b = &mut c.container;
         set(&mut b.enabled, k.enabled);
         set(&mut b.drone, k.drone);
+        b.shell = k.shell.or(b.shell.take());
         set(&mut b.state_dir, k.state_dir);
         set(&mut b.workers, k.workers);
         set(&mut b.uid_base, k.uid_base);
@@ -759,6 +767,7 @@ struct BackendsFile {
 struct ContainerFile {
     enabled: Option<bool>,
     drone: Option<PathBuf>,
+    shell: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     workers: Option<usize>,
     uid_base: Option<u32>,
@@ -864,6 +873,7 @@ mod tests {
 
             [backends.container]
             drone = "/opt/hive-drone"
+            shell = "/opt/busybox"
             workers = 2
 
             [images]
@@ -908,6 +918,7 @@ mod tests {
         assert_eq!(c.create_limit[&Backend::Container], 8);
         assert_eq!(c.create_limit[&Backend::Microvm], 64);
         assert_eq!(c.container.drone, PathBuf::from("/opt/hive-drone"));
+        assert_eq!(c.container.shell, Some(PathBuf::from("/opt/busybox")));
         assert_eq!(c.container.workers, 2);
         assert_eq!(c.container.uid_base, 1_000_000);
         assert_eq!(c.images.store, Some(PathBuf::from("/srv/store")));

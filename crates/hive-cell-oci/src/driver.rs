@@ -36,6 +36,10 @@ pub struct Config {
     /// The drone binary put in every container. It has to be static, since it runs on the
     /// image's libc or none.
     pub drone: PathBuf,
+    /// A static POSIX shell put in every container, read only, that the drone starts commands
+    /// and sessions with in place of the image's `/bin/sh` and `/bin/bash`. Without one, a cell
+    /// that writes over its own shell or libc changes how every later command in it is run.
+    pub shell: Option<PathBuf>,
     /// Where each cell gets a directory for its bundle, its state and its log.
     pub state_dir: PathBuf,
     /// The first host id that root in a cell maps to. Images are shifted to it when they are
@@ -51,6 +55,7 @@ impl Default for Config {
             worker: vec!["/proc/self/exe".into(), "--oci-worker".into()],
             workers: 8,
             drone: PathBuf::from("/usr/lib/hivebox/hive-drone"),
+            shell: None,
             state_dir: PathBuf::from("/run/hivebox/oci"),
             uid_base: 1_000_000,
             uid_count: 65536,
@@ -87,8 +92,19 @@ impl OciDriver {
     ///
     /// # Errors
     ///
-    /// The state directory cannot be made.
+    /// The shell cannot be read or is not a static binary, or the state directory cannot be made.
     pub fn new(cfg: Config) -> std::io::Result<Self> {
+        if let Some(shell) = &cfg.shell
+            && !is_static(&std::fs::read(shell)?)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a static ELF binary, so it would run on the cell's libc",
+                    shell.display()
+                ),
+            ));
+        }
         std::fs::DirBuilder::new().recursive(true).mode(0o711).create(&cfg.state_dir)?;
         let (jobs, rx) = mpsc::channel(1024);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -153,6 +169,7 @@ impl OciDriver {
         }
         let host = Host {
             drone: &self.cfg.drone,
+            shell: self.cfg.shell.as_deref(),
             cgroup: &Path::new("/").join(cgroup),
             uid_base: self.cfg.uid_base,
             uid_count: self.cfg.uid_count,
@@ -553,8 +570,51 @@ fn spawn_worker(cmd: &[OsString], exits: Arc<Exits>) -> Option<(Child, ChildStdi
     Some((child, stdin, rx))
 }
 
+/// Whether `elf` is a 64 bit little endian ELF binary with no program interpreter, so it runs
+/// without the dynamic loader and libraries of the image it is started in.
+fn is_static(elf: &[u8]) -> bool {
+    let at = |off: usize, len: usize| elf.get(off..off + len);
+    let num = |off: usize, len: usize| {
+        at(off, len).map(|b| b.iter().rev().fold(0usize, |n, &x| n << 8 | usize::from(x)))
+    };
+    if at(0, 6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1][..]) {
+        return false;
+    }
+    let (Some(phoff), Some(size), Some(count)) = (num(0x20, 8), num(0x36, 2), num(0x38, 2)) else {
+        return false;
+    };
+    // PT_INTERP is 3.
+    (0..count).all(|i| num(phoff + i * size, 4).is_some_and(|kind| kind != 3))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_static_elf_passes_for_the_shell() {
+        // A header with one program header of the given kind, at offset 64.
+        let elf = |kind: u32| {
+            let mut b = vec![0u8; 64 + 56];
+            b[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+            b[0x20] = 64;
+            b[0x36] = 56;
+            b[0x38] = 1;
+            b[64..68].copy_from_slice(&kind.to_le_bytes());
+            b
+        };
+        assert!(is_static(&elf(1)));
+        assert!(!is_static(&elf(3)), "it has an interpreter");
+        assert!(!is_static(&elf(1)[..66]), "cut short");
+        assert!(!is_static(b"#!/bin/sh\necho hi\n"));
+        let script = std::env::temp_dir().join(format!("hive-sh-{}", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let cfg = Config { shell: Some(script.clone()), ..Config::default() };
+        // It is refused before any worker starts, so this needs no runtime.
+        let e = OciDriver::new(cfg).err().unwrap();
+        assert!(e.to_string().contains("not a static ELF"), "{e}");
+        std::fs::remove_file(&script).unwrap();
+    }
+
     use super::*;
 
     #[test]

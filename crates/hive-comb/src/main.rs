@@ -234,6 +234,7 @@ async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
     if c.enabled {
         let oci = hive_cell_oci::Config {
             drone: c.drone.clone(),
+            shell: c.shell.clone(),
             state_dir: c.state_dir.clone(),
             workers: c.workers,
             uid_base: c.uid_base,
