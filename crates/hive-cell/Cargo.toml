@@ -18,6 +18,7 @@ futures.workspace = true
 hive-types.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 rustix = { workspace = true, features = ["fs", "mount", "net", "param", "process", "thread"] }
 
 [lints]

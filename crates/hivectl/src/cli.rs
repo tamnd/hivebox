@@ -16,7 +16,7 @@ pub const USAGE: &str = "\
 usage: hivectl [--socket PATH | --endpoint URL] [--project NAME] COMMAND
 
 Cells:
-  create IMAGE [-n COUNT] [-l KEY=VALUE]... [--mem MIB] [--cpu MILLICORES]
+  create IMAGE [-n COUNT] [-l KEY=VALUE]... [--mem MIB] [--cpu MILLICORES] [--disk GIB]
          [--net PROFILE] [--ttl DURATION] [--idle DURATION] [--on-idle pause|stop] [--key KEY]
          [--boost DURATION]
   ls [-l KEY=VALUE]... [--state STATE]...
@@ -210,6 +210,7 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
         "-l",
         "--label",
         "--mem",
+        "--disk",
         "--cpu",
         "--net",
         "--ttl",
@@ -232,6 +233,7 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
     spec.resources = Resources {
         mem_mib: number("--mem")?.unwrap_or(Resources::DEFAULT.mem_mib),
         vcpu_milli: number("--cpu")?.unwrap_or(Resources::DEFAULT.vcpu_milli),
+        disk_gib: number("--disk")?.unwrap_or(Resources::DEFAULT.disk_gib),
         ..Resources::DEFAULT
     };
     if let Some(n) = args.one(&["--net"]) {

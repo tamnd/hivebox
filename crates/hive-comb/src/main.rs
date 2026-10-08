@@ -232,9 +232,14 @@ async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
     let mut drivers = hive_cell::DriverRegistry::new();
     let c = &cfg.container;
     if c.enabled {
+        // The cells' uppers go under it, so its filesystem is the one with the quotas.
+        if c.disk_quota {
+            let _ = std::fs::create_dir_all(&cfg.data_dir);
+        }
         let oci = hive_cell_oci::Config {
             drone: c.drone.clone(),
             shell: c.shell.clone(),
+            disk_quota: c.disk_quota.then(|| cfg.data_dir.clone()),
             state_dir: c.state_dir.clone(),
             workers: c.workers,
             uid_base: c.uid_base,

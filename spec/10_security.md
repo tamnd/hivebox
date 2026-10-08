@@ -96,7 +96,7 @@ Project policy sets `max_isolation_floor`. For example, `rl-*` projects cannot r
 | Overwriting the harness (`/bin/bash`, python, the test runner) | The verifier uses its own toolchain layer (read-only) and fresh processes. Session control uses the drone's own shell, a static one mounted read-only at `/.hive/sh` when the node sets `[backends.container] shell` (09 section 4). |
 | Timing / exit-code spoofing | The verifier parses structured results (JUnit XML written to a path only the verifier can write) instead of relying on stdout or exit code alone. Hard timeouts come from the host. |
 | Environment probing (detecting eval versus train) | Identical templates and network profiles for train and eval. The drone exposes no mode flags. |
-| Resource exhaustion (fork bombs, `yes > f`, 10s of GB) | pids, disk and output caps. Classified as the agent's fault (`output_limit`, `disk_quota`), not infra. |
+| Resource exhaustion (fork bombs, `yes > f`, 10s of GB) | pids, disk and output caps, the disk cap being a project quota on the cell's upper (08 section 7). Classified as the agent's fault (`output_limit`, `disk_quota`), not infra. |
 | Kernel poking (`/proc/kpage*`, exotic ioctls) | Masks and the ioctl allowlist. Such attempts are logged as `policy_violation` security events and can feed a penalty signal. |
 
 The platform also emits per-cell tamper signals in the rollout metadata: protected-path writes, denied syscalls, denied egress, and drone-channel anomalies. The trainer can penalize these or filter the samples.

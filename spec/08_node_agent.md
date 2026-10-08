@@ -97,6 +97,7 @@ OOM policy: each cell has `memory.max` and `memory.oom.group=1`. Comb sets `oom_
 ## 7. Disk and I/O limits
 
 - The upper (writable) layer is a per-cell sparse file on XFS with project quotas (prjquota), or a ublk CoW device with a size cap. There is also an inode limit.
+  - What is in now: for container cells, with `[backends.container] disk_quota = true`, the OCI driver gives each cell's upper and overlay work directory a project id of its own with the inherit flag, and limits that id to the cell's `disk_gib` and to 65,536 files a GiB, all through `quotactl_fd` and the `FS_IOC_FSSETXATTR` ioctl on paths, so no block device has to be found. On XFS a write past the limit fails with `ENOSPC` and `df /` in the cell shows the cell's own size. ext4 should do the same with `EDQUOT`, but only XFS has been tried. Ids start at 0x48420000, and a cell gets the first one no live cell has and that holds nothing, so the files of a cell still being removed are never counted against the next one. The ids go into the cell's handle, so a comb that restarts keeps them. The filesystem under `data_dir` has to enforce project quotas, or the node runs no container cells and its log says why. Without the option, `disk_gib` is not enforced for containers.
 - Each cell gets `io.max` (read/write bps and iops) and `io.weight` by class. Protection against `yes > file` comes from the quota plus output caps.
 - Stdout/stderr ring buffer caps in the drone (09) protect memory and the gate.
 

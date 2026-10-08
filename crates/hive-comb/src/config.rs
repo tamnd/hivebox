@@ -239,6 +239,12 @@ pub struct ContainerBackend {
     /// of the image's tools, as Debian's and Ubuntu's busybox do. The busybox in the
     /// `busybox:musl` image does not.
     pub shell: Option<PathBuf>,
+    /// Holds what each cell writes to its `disk_gib`, and its files to 65,536 a GiB, with a
+    /// project quota on its upper, so `yes > f` fills the cell's share and not the node's disk.
+    /// The filesystem `data_dir` is on has to enforce project quotas: XFS mounted with
+    /// `prjquota`, or ext4 with the `project` and `quota` features mounted with `prjquota`.
+    /// Without that the node runs no container cells, and its log says why.
+    pub disk_quota: bool,
     /// Where each container cell gets its bundle, its state and its log.
     pub state_dir: PathBuf,
     /// Processes kept to make containers, which is how many creates go on at once.
@@ -255,6 +261,7 @@ impl Default for ContainerBackend {
             enabled: true,
             drone: PathBuf::from("/usr/lib/hivebox/hive-drone"),
             shell: None,
+            disk_quota: false,
             state_dir: PathBuf::from("/run/hivebox/oci"),
             workers: 8,
             uid_base: 1_000_000,
@@ -490,6 +497,7 @@ impl Config {
         let k = file.backends.container;
         let b = &mut c.container;
         set(&mut b.enabled, k.enabled);
+        set(&mut b.disk_quota, k.disk_quota);
         set(&mut b.drone, k.drone);
         b.shell = k.shell.or(b.shell.take());
         set(&mut b.state_dir, k.state_dir);
@@ -768,6 +776,7 @@ struct ContainerFile {
     enabled: Option<bool>,
     drone: Option<PathBuf>,
     shell: Option<PathBuf>,
+    disk_quota: Option<bool>,
     state_dir: Option<PathBuf>,
     workers: Option<usize>,
     uid_base: Option<u32>,
@@ -874,6 +883,7 @@ mod tests {
             [backends.container]
             drone = "/opt/hive-drone"
             shell = "/opt/busybox"
+            disk_quota = true
             workers = 2
 
             [images]
@@ -919,6 +929,7 @@ mod tests {
         assert_eq!(c.create_limit[&Backend::Microvm], 64);
         assert_eq!(c.container.drone, PathBuf::from("/opt/hive-drone"));
         assert_eq!(c.container.shell, Some(PathBuf::from("/opt/busybox")));
+        assert!(c.container.disk_quota);
         assert_eq!(c.container.workers, 2);
         assert_eq!(c.container.uid_base, 1_000_000);
         assert_eq!(c.images.store, Some(PathBuf::from("/srv/store")));
