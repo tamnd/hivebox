@@ -40,6 +40,11 @@ message SnapshotRequest {
   // Paths, relative to the cell's root, where scrubbing lets keys and tokens stay, like test
   // fixtures.
   repeated string allow = 5;
+  // Work trees of git repositories, as absolute paths, each rebuilt before the snapshot with one
+  // commit holding what HEAD holds. Other commits, branches, tags, the reflog and stashes are
+  // gone, so a testbed cloned from upstream does not carry the fix a task asks for. The cell has
+  // to be running and have git.
+  repeated string squash_git = 6;
 }
 
 message RestoreRequest {

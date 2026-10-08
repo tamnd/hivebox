@@ -269,21 +269,7 @@ impl Job<'_> {
         script: &str,
         timeout_ms: u64,
     ) -> Result<drone::RunResult, Error> {
-        let env = [
-            ("GIT_CONFIG_COUNT", "2"),
-            ("GIT_CONFIG_KEY_0", "safe.directory"),
-            ("GIT_CONFIG_VALUE_0", "*"),
-            ("GIT_CONFIG_KEY_1", "core.quotePath"),
-            ("GIT_CONFIG_VALUE_1", "false"),
-        ];
-        let command = drone::Command {
-            shell: script.into(),
-            cwd: self.req.workdir.clone(),
-            env: env.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            timeout_ms,
-            ..Default::default()
-        };
-        drone.run(&drone::RunRequest { command: Some(command), stdin: Default::default() }).await
+        git_sh(drone, &self.req.workdir, script, timeout_ms).await
     }
 
     fn time(&mut self, step: &str, since: Instant) {
@@ -340,7 +326,31 @@ fn failed(e: Error, tampered: Vec<String>, scores: BTreeMap<String, f64>) -> v1:
 }
 
 /// A command in a cell that failed, which is the cell's doing rather than hivebox's.
-fn file_error(what: &str, out: &drone::RunResult) -> Error {
+/// Runs a shell script in `cwd`, with git trusting a checkout someone else owns.
+pub(super) async fn git_sh(
+    drone: &Client,
+    cwd: &str,
+    script: &str,
+    timeout_ms: u64,
+) -> Result<drone::RunResult, Error> {
+    let env = [
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "safe.directory"),
+        ("GIT_CONFIG_VALUE_0", "*"),
+        ("GIT_CONFIG_KEY_1", "core.quotePath"),
+        ("GIT_CONFIG_VALUE_1", "false"),
+    ];
+    let command = drone::Command {
+        shell: script.into(),
+        cwd: cwd.into(),
+        env: env.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+        timeout_ms,
+        ..Default::default()
+    };
+    drone.run(&drone::RunRequest { command: Some(command), stdin: Default::default() }).await
+}
+
+pub(super) fn file_error(what: &str, out: &drone::RunResult) -> Error {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let tail = stderr.trim().lines().rev().take(5).collect::<Vec<_>>();
     let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");

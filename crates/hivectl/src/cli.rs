@@ -30,8 +30,10 @@ Cells:
   watch [ID | -l KEY=VALUE...]
 
 Snapshots:
-  snapshot ID [--scrub] [--allow PATH]...          prints the snapshot id. With --scrub,
-         secrets are taken out, and one left outside an allowed path fails it
+  snapshot ID [--scrub] [--allow PATH]... [--squash-git DIR]...
+                                                   prints the snapshot id. With --scrub,
+         secrets are taken out, and one left outside an allowed path fails it. Each
+         --squash-git repository is first left with one commit, what HEAD holds
   commit SNAPSHOT NAME                             names a scrubbed snapshot as an image
   create snapshot:SNAPSHOT ...                     makes cells from a snapshot
 
@@ -260,10 +262,11 @@ async fn create(client: &Client, args: &Args) -> Result<i32, String> {
 }
 
 async fn snapshot(client: &Client, args: &Args) -> Result<i32, String> {
-    args.check(&["--scrub", "--allow"])?;
+    args.check(&["--scrub", "--allow", "--squash-git"])?;
     let [id] = exactly(args, 1, "a cell id")? else { unreachable!() };
     let allow: Vec<String> = args.all(&["--allow"]).into_iter().map(String::from).collect();
-    let snap = client.snapshot(id, args.has("--scrub"), &allow).await.map_err(err)?;
+    let squash: Vec<String> = args.all(&["--squash-git"]).into_iter().map(String::from).collect();
+    let snap = client.snapshot(id, args.has("--scrub"), &allow, &squash).await.map_err(err)?;
     println!("{snap}");
     Ok(0)
 }

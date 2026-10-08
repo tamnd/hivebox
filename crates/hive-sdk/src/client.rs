@@ -314,19 +314,29 @@ impl Client {
 
     /// Takes a disk snapshot of the container cell `id` and returns its id. A running cell is
     /// frozen while its changes are sealed. With `scrub`, secrets are taken out first, and a
-    /// file that still holds one fails the snapshot unless it is under a path in `allow`. To
-    /// restore it, make cells with [`Source::Snapshot`](hive_types::Source::Snapshot).
+    /// file that still holds one fails the snapshot unless it is under a path in `allow`. Each
+    /// git work tree in `squash_git` is first rebuilt with one commit holding what `HEAD` holds,
+    /// and no other history. To restore it, make cells with
+    /// [`Source::Snapshot`](hive_types::Source::Snapshot).
     ///
     /// # Errors
     ///
     /// The cell is not running or paused, is not a container, or the node cannot take
-    /// snapshots. With `scrub`, a secret was found outside `allow`.
-    pub async fn snapshot(&self, id: &str, scrub: bool, allow: &[String]) -> Result<String, Error> {
+    /// snapshots. With `scrub`, a secret was found outside `allow`. A repository in
+    /// `squash_git` could not be squashed.
+    pub async fn snapshot(
+        &self,
+        id: &str,
+        scrub: bool,
+        allow: &[String],
+        squash_git: &[String],
+    ) -> Result<String, Error> {
         let r = v1::SnapshotRequest {
             cell_id: id.to_string(),
             kind: v1::SnapshotKind::Disk.into(),
             scrub,
             allow: allow.to_vec(),
+            squash_git: squash_git.to_vec(),
             ..Default::default()
         };
         let mut c = SnapshotsClient::new(self.channel.clone());
@@ -587,8 +597,13 @@ impl Cell {
     /// # Errors
     ///
     /// The snapshot could not be taken.
-    pub async fn snapshot(&self, scrub: bool, allow: &[String]) -> Result<String, Error> {
-        self.client.snapshot(self.id(), scrub, allow).await
+    pub async fn snapshot(
+        &self,
+        scrub: bool,
+        allow: &[String],
+        squash_git: &[String],
+    ) -> Result<String, Error> {
+        self.client.snapshot(self.id(), scrub, allow, squash_git).await
     }
 
     /// Runs `cmd` and waits for it to end.
