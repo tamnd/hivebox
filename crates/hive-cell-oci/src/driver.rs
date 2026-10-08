@@ -40,6 +40,11 @@ pub struct Config {
     /// and sessions with in place of the image's `/bin/sh` and `/bin/bash`. Without one, a cell
     /// that writes over its own shell or libc changes how every later command in it is run.
     pub shell: Option<PathBuf>,
+    /// A directory on the filesystem the cells' uppers are made on, when each cell's writes are
+    /// to be held to its `disk_gib` with a project quota, and its files to 65,536 a GiB. That
+    /// filesystem has to enforce project quotas, or [`OciDriver::new`] fails. With `None`, a
+    /// cell can write until the filesystem is full.
+    pub disk_quota: Option<PathBuf>,
     /// Where each cell gets a directory for its bundle, its state and its log.
     pub state_dir: PathBuf,
     /// The first host id that root in a cell maps to. Images are shifted to it when they are
@@ -56,6 +61,7 @@ impl Default for Config {
             workers: 8,
             drone: PathBuf::from("/usr/lib/hivebox/hive-drone"),
             shell: None,
+            disk_quota: None,
             state_dir: PathBuf::from("/run/hivebox/oci"),
             uid_base: 1_000_000,
             uid_count: 65536,
@@ -72,7 +78,18 @@ pub struct OciDriver {
     /// Each prepared cell's first secret, until its start hands it to the drone. Kept here
     /// rather than in the handle, since the comb writes handles to its WAL.
     secrets: Mutex<HashMap<CellId, [u8; 32]>>,
+    /// The project id each cell's upper is counted under, with a disk quota.
+    projects: Mutex<HashMap<CellId, u32>>,
 }
+
+/// The key in a handle's `extra` for its project id.
+const PROJECT: &str = "project";
+
+/// The project ids cells get, from here on. Ids other software on the node uses are mostly small.
+const PROJECT_BASE: u32 = 0x4842_0000;
+/// How many there are, which is more cells than a node ever holds, with room for the ids of
+/// cells whose files are still being removed.
+const PROJECTS: u32 = 1 << 20;
 
 #[derive(Debug)]
 struct Job {
@@ -92,8 +109,22 @@ impl OciDriver {
     ///
     /// # Errors
     ///
-    /// The shell cannot be read or is not a static binary, or the state directory cannot be made.
+    /// The shell cannot be read or is not a static binary, the disk quota's filesystem does not
+    /// enforce project quotas, or the state directory cannot be made.
     pub fn new(cfg: Config) -> std::io::Result<Self> {
+        if let Some(dir) = &cfg.disk_quota {
+            let no = |why: String| {
+                std::io::Error::other(format!(
+                    "the disk quota needs project quotas on the filesystem of {}, {why}",
+                    dir.display()
+                ))
+            };
+            match hive_cell::quota::enforced(dir) {
+                Ok(true) => {}
+                Ok(false) => return Err(no("which counts them but does not enforce them".into())),
+                Err(e) => return Err(no(format!("which has none ({e})"))),
+            }
+        }
         if let Some(shell) = &cfg.shell
             && !is_static(&std::fs::read(shell)?)
         {
@@ -112,7 +143,7 @@ impl OciDriver {
         for _ in 0..cfg.workers.max(1) {
             tokio::spawn(run_worker(cfg.worker.clone(), rx.clone(), exits.clone()));
         }
-        Ok(Self { cfg, jobs, exits, secrets: Mutex::default() })
+        Ok(Self { cfg, jobs, exits, secrets: Mutex::default(), projects: Mutex::default() })
     }
 
     fn dir(&self, id: CellId) -> PathBuf {
@@ -138,6 +169,18 @@ impl OciDriver {
         rustix::fs::chown(&rootfs.upper, uid, gid)?;
         let work = slot.dir.join("work");
         std::fs::create_dir_all(&work)?;
+        let mut extra = BTreeMap::new();
+        if self.cfg.disk_quota.is_some() {
+            // The work directory is where overlay makes a file before it moves it into the upper,
+            // and a move between two project ids fails, so both get the cell's.
+            let project = self.project(id, &rootfs.upper)?;
+            for d in [&rootfs.upper, &work] {
+                hive_cell::quota::tag(d, project)?;
+            }
+            let bytes = u64::from(spec.resources.disk_gib) << 30;
+            hive_cell::quota::limit(&rootfs.upper, project, bytes, bytes >> 14)?;
+            extra.insert(PROJECT.to_string(), project.to_string());
+        }
         let lowers: Vec<String> = rootfs.lowers.iter().map(|l| l.display().to_string()).collect();
         // volatile skips every sync, which a cell's scratch layer never needs.
         let options = std::ffi::CString::new(format!(
@@ -185,8 +228,21 @@ impl OciDriver {
             channel: GuestChannel::Unix(dir.join("drone.sock")),
             cgroup: slot.cgroup.clone(),
             netns: slot.netns.clone(),
-            extra: BTreeMap::new(),
+            extra,
         })
+    }
+
+    /// A project id for `id`'s upper: the first one no other cell has and that holds nothing on
+    /// the upper's filesystem, so files of a cell still being removed are not counted twice.
+    fn project(&self, id: CellId, upper: &Path) -> std::io::Result<u32> {
+        let mut projects = self.projects.lock().unwrap_or_else(PoisonError::into_inner);
+        let taken: std::collections::HashSet<u32> = projects.values().copied().collect();
+        let free = (PROJECT_BASE..PROJECT_BASE + PROJECTS)
+            .filter(|p| !taken.contains(p))
+            .find(|&p| hive_cell::quota::usage(upper, p).is_ok_and(|u| u == Default::default()))
+            .ok_or_else(|| std::io::Error::other("no project id is free for the disk quota"))?;
+        projects.insert(id, free);
+        Ok(free)
     }
 
     /// Takes down whatever `prepare` made. Fine to call on a cell that is half made or gone.
@@ -195,6 +251,7 @@ impl OciDriver {
     /// held up every other call on the node.
     async fn clean(&self, id: CellId) {
         self.secrets.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        self.projects.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
         let dir = self.dir(id);
         let _ = tokio::task::spawn_blocking(move || {
             let _ = rustix::mount::unmount(dir.join("rootfs"), rustix::mount::UnmountFlags::DETACH);
@@ -436,6 +493,10 @@ impl CellDriver for OciDriver {
                     .unwrap_or_default();
                 exit.oom = cgroup::oom_kills(&h.cgroup) > 0;
                 return Ok(Liveness::Gone(exit));
+            }
+            // A cell from before a restart keeps its project id.
+            if let Some(p) = h.extra.get(PROJECT).and_then(|p| p.parse().ok()) {
+                self.projects.lock().unwrap_or_else(PoisonError::into_inner).insert(h.id, p);
             }
             if cgroup::frozen(&h.cgroup).unwrap_or(false) {
                 return Ok(Liveness::Paused);

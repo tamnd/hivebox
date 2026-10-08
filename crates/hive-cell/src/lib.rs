@@ -6,13 +6,15 @@
 //! keeps them in. The design is in `spec/07_backends_snapshots.md`.
 
 // Unsafe is denied everywhere but the one `unshare` call in `netns`, which is how a network
-// namespace is made.
+// namespace is made, and the quota calls in `quota`, which nothing safe wraps.
 #![deny(unsafe_code)]
 
 pub mod cgroup;
 mod driver;
 #[cfg(target_os = "linux")]
 pub mod netns;
+#[cfg(target_os = "linux")]
+pub mod quota;
 
 use std::fmt;
 
