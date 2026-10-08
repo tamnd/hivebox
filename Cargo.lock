@@ -1172,14 +1172,14 @@ dependencies = [
 
 [[package]]
 name = "hive-auth"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "biscuit-auth",
 ]
 
 [[package]]
 name = "hive-blockd"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "futures",
  "libc",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cell"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "futures",
  "hive-types",
@@ -1198,15 +1198,15 @@ dependencies = [
 
 [[package]]
 name = "hive-cell-ch"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-cell-fc"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-cell-oci"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "futures",
  "hive-cell",
@@ -1224,23 +1224,23 @@ dependencies = [
 
 [[package]]
 name = "hive-cell-plugin"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-cell-proc"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-cell-qemu"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-cell-wasm"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-comb"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "bytes",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "hive-drone"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "bytes",
  "futures",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "hive-gate"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1328,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "hive-guard"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "aya",
  "hickory-proto",
@@ -1338,11 +1338,11 @@ dependencies = [
 
 [[package]]
 name = "hive-imaged"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-keeper"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "futures",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "hive-nectar"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "bytes",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "hive-pollen"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "futures",
  "hive-proto",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "hive-proto"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "bytes",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "hive-rt"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "futures",
  "getrandom 0.4.3",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "hive-scout"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "futures",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "hive-sdk"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "bytes",
  "futures",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "hive-sim"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "hive-gate",
  "hive-keeper",
@@ -1468,11 +1468,11 @@ dependencies = [
 
 [[package]]
 name = "hive-snap"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "hive-telemetry"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "serde",
@@ -1483,14 +1483,14 @@ dependencies = [
 
 [[package]]
 name = "hive-types"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "hive-uffd"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "libc",
  "serde",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "hive-waggle"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "blake3",
  "hive-types",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "hivectl"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "futures",
  "hive-proto",
@@ -4116,7 +4116,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.0.34"
+version = "0.0.35"
 
 [[package]]
 name = "yoke"
