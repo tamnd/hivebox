@@ -21,7 +21,7 @@ SNAPSHOT_KIND_DISK_MEM: SnapshotKind
 SNAPSHOT_KIND_PROC: SnapshotKind
 
 class SnapshotRequest(_message.Message):
-    __slots__ = ("cell_id", "kind", "labels", "scrub", "allow")
+    __slots__ = ("cell_id", "kind", "labels", "scrub", "allow", "squash_git")
     class LabelsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -34,12 +34,14 @@ class SnapshotRequest(_message.Message):
     LABELS_FIELD_NUMBER: _ClassVar[int]
     SCRUB_FIELD_NUMBER: _ClassVar[int]
     ALLOW_FIELD_NUMBER: _ClassVar[int]
+    SQUASH_GIT_FIELD_NUMBER: _ClassVar[int]
     cell_id: str
     kind: SnapshotKind
     labels: _containers.ScalarMap[str, str]
     scrub: bool
     allow: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, cell_id: _Optional[str] = ..., kind: _Optional[_Union[SnapshotKind, str]] = ..., labels: _Optional[_Mapping[str, str]] = ..., scrub: _Optional[bool] = ..., allow: _Optional[_Iterable[str]] = ...) -> None: ...
+    squash_git: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, cell_id: _Optional[str] = ..., kind: _Optional[_Union[SnapshotKind, str]] = ..., labels: _Optional[_Mapping[str, str]] = ..., scrub: _Optional[bool] = ..., allow: _Optional[_Iterable[str]] = ..., squash_git: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class RestoreRequest(_message.Message):
     __slots__ = ("snapshot", "count", "spec", "idempotency_key")

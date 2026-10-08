@@ -362,16 +362,19 @@ class AsyncHive:
         )
         return VerifyResult._from(await self._call(self._verify.Run, req))
 
-    async def snapshot(self, cell: Cell | str, *, scrub: bool = False, allow: Iterable[str] = ()) -> str:
+    async def snapshot(self, cell: Cell | str, *, scrub: bool = False, allow: Iterable[str] = (),
+                       squash_git: Iterable[str] = ()) -> str:
         """Takes a disk snapshot of a container cell and returns its id. A running cell is frozen
         while its changes are sealed. With `scrub`, secrets are taken out first, and a file that
-        still holds one fails the snapshot unless it is under a path in `allow`. Make cells from
-        it with Spec(snapshot=id)."""
+        still holds one fails the snapshot unless it is under a path in `allow`. Each git work
+        tree in `squash_git` is first left with one commit holding what HEAD holds and no other
+        history. Make cells from it with Spec(snapshot=id)."""
         allow = list(allow)
         if allow and not scrub:
             raise _errors.InvalidArgument("allow only means something with scrub on")
         cell_id = cell.id if isinstance(cell, Cell) else cell
-        req = snapshots_pb2.SnapshotRequest(cell_id=cell_id, kind=snapshots_pb2.SNAPSHOT_KIND_DISK, scrub=scrub, allow=allow)
+        req = snapshots_pb2.SnapshotRequest(cell_id=cell_id, kind=snapshots_pb2.SNAPSHOT_KIND_DISK, scrub=scrub, allow=allow,
+                                            squash_git=list(squash_git))
         return (await self._call(self._snapshots.Snapshot, req)).id
 
     async def commit(self, snapshot: str, name: str) -> None:
@@ -611,9 +614,9 @@ class Cell:
     def quarantined(self) -> bool:
         return self.info.quarantined
 
-    async def snapshot(self, *, scrub: bool = False, allow: Iterable[str] = ()) -> str:
+    async def snapshot(self, *, scrub: bool = False, allow: Iterable[str] = (), squash_git: Iterable[str] = ()) -> str:
         """Takes a disk snapshot of the cell, as AsyncHive.snapshot does."""
-        return await self._hive.snapshot(self, scrub=scrub, allow=allow)
+        return await self._hive.snapshot(self, scrub=scrub, allow=allow, squash_git=squash_git)
 
     async def run(self, cmd: str | Sequence[str], *, timeout: float | str | None = None, stdin: bytes = b"",
                   env: Mapping[str, str] | None = None, cwd: str = "", user: str = "", max_output_bytes: int = 0) -> RunResult:
