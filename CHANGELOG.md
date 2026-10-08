@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `[backends.container] shell` names a static shell on the host that the drone runs every command and session with, mounted read-only at `/.hive/sh`. A cell that overwrites its own `/bin/sh`, `/bin/bash` or libc can no longer fake the exit codes of later commands. With a dynamically linked shell the node runs no container cells, and its log says why.
 - A snapshot can squash git repositories first with `squash_git` in the API, `hivectl snapshot --squash-git DIR` and the SDKs. Each one is rebuilt in the cell with a single commit holding what `HEAD` holds, so a testbed cloned from upstream no longer carries the fix in a later commit, a branch, a tag, the reflog, a stash or a pack. The Rust SDK's `snapshot` takes the paths as a new argument.
 
 ## 0.0.34

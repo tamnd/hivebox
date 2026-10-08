@@ -40,6 +40,7 @@
 ## 4. Shell sessions (chronus semantics)
 
 - Each session is `bash --noprofile --norc` or a shell the user picks. It runs from the drone layer's own copy of bash (`/.hive/bin/bash`), which is read-only. Overwriting `/bin/bash` in the workspace cannot break session control.
+  - What is in now: in containers, `[backends.container] shell` names a static POSIX shell on the host, and the driver mounts it read-only at `/.hive/sh` and starts the drone with `--shell /.hive/sh --session-shell /.hive/sh`. Commands and sessions then run with it, so a cell that writes over `/bin/sh`, `/bin/bash` or libc changes nothing about how later commands are run or how their exit codes come back. A shell with a program interpreter would load the cell's libc, so with one the node runs no container cells and its log says why. The shell has to look up commands on `PATH`, which the busybox in the `busybox:musl` image does and Debian's and Ubuntu's busybox does not (it runs its own `ls`, `cat` and so on first). It is a POSIX shell, not bash, so sessions lose bash's extras. Without the option the drone uses the image's `/bin/sh` and `/bin/bash` as before.
 - Command framing: for each `SessionRun(cmd)`, the drone writes:
   ```
   { <cmd>

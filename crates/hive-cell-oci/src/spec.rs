@@ -7,6 +7,10 @@ use std::path::Path;
 /// Where the drone binary shows up inside every container.
 pub(crate) const DRONE: &str = "/.hive/drone";
 
+/// Where the node's static shell shows up, when it has one. A multi call binary such as busybox
+/// picks what to be by the name it is started as, so the name is `sh`.
+pub(crate) const SHELL: &str = "/.hive/sh";
+
 /// The PATH a command gets when the cell does not set one. Most images set this one anyway.
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -56,6 +60,8 @@ const READ_ONLY: [&str; 5] =
 pub(crate) struct Host<'a> {
     /// The drone binary on the host.
     pub(crate) drone: &'a Path,
+    /// The static shell on the host the drone runs commands and sessions with, if any.
+    pub(crate) shell: Option<&'a Path>,
     /// The cell's cgroup, as a path under `/sys/fs/cgroup`.
     pub(crate) cgroup: &'a Path,
     /// The first host id that root in the cell maps to.
@@ -83,6 +89,9 @@ pub(crate) fn config(spec: &CellSpec, host: &Host<'_>) -> Value {
         "--secret-stdin".into(),
         "--harden".into(),
     ];
+    if host.shell.is_some() {
+        args.extend(["--shell", SHELL, "--session-shell", SHELL].map(String::from));
+    }
     let mut env = vec![("PATH", PATH), ("HOME", "/root"), ("LANG", "C.UTF-8")];
     env.retain(|(k, _)| !spec.env.contains_key(*k));
     for (k, v) in env.into_iter().chain(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
@@ -115,6 +124,9 @@ pub(crate) fn config(spec: &CellSpec, host: &Host<'_>) -> Value {
         json!({"destination": "/sys/fs/cgroup", "type": "cgroup", "source": "cgroup", "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]}),
         json!({"destination": DRONE, "type": "bind", "source": host.drone, "options": ["bind", "ro", "nosuid", "nodev"]}),
     ];
+    if let Some(shell) = host.shell {
+        mounts.push(json!({"destination": SHELL, "type": "bind", "source": shell, "options": ["bind", "ro", "nosuid", "nodev"]}));
+    }
     // Writable, as docker has them, since test suites add names to the hosts file.
     for name in ["hosts", "hostname"] {
         let source = host.etc.join(name);
@@ -159,6 +171,7 @@ mod tests {
     fn host() -> Host<'static> {
         Host {
             drone: Path::new("/opt/hive/drone"),
+            shell: None,
             cgroup: Path::new("/hive.slice/std.slice/c1"),
             uid_base: 1_000_000,
             uid_count: 65536,
@@ -178,6 +191,23 @@ mod tests {
         assert_eq!(&args[..6], [DRONE, "--init", "--listen", "fd:3", "--secret-stdin", "--harden"]);
         let env: Vec<&str> = args[6..].chunks(2).map(|p| p[1]).collect();
         assert_eq!(env, ["HOME=/root", "LANG=C.UTF-8", "A=b c", "PATH=/opt/bin"]);
+    }
+
+    #[test]
+    fn with_a_shell_of_its_own_the_drone_runs_everything_with_it() {
+        let spec = CellSpec::new(Source::Image("python".into()), Backend::Container);
+        let shell = Path::new("/usr/lib/hivebox/busybox");
+        let c = config(&spec, &Host { shell: Some(shell), ..host() });
+        let args: Vec<&str> =
+            c["process"]["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+        assert_eq!(&args[6..10], ["--shell", SHELL, "--session-shell", SHELL]);
+        let mounts = c["mounts"].as_array().unwrap();
+        let m = mounts.iter().find(|m| m["destination"] == SHELL).unwrap();
+        assert_eq!(m["source"], "/usr/lib/hivebox/busybox");
+        assert_eq!(m["options"][1], "ro");
+        let c = config(&spec, &host());
+        assert!(c["mounts"].as_array().unwrap().iter().all(|m| m["destination"] != SHELL));
+        assert!(c["process"]["args"].as_array().unwrap().iter().all(|a| a != "--shell"));
     }
 
     #[test]
