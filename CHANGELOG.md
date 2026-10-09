@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.41
+
+Adapters for SWE-ReX, Harbor, OpenEnv and MCP.
+
 - MCP server. `python -m hivebox.mcp` gives an agent tools to make cells, run commands in a shell that keeps its state, read, write and list files, fork and stop cells. It only reaches the cells it made, limits how many run and which images and network profiles they use, and stops them when it exits. Started over stdio by the MCP SDK's own client against a real comb on server3 at a load of 97 to 102, `run_command` took p50 7.69 and 7.37 ms and p99 56.28 and 75.31 ms over two runs, and `create_cell` took 1.8 and 2.6 s.
 
 - OpenEnv environment. `hivebox.openenv.HiveboxEnv` is an OpenEnv environment where each episode is a bash shell in a fresh cell, and `create_hivebox_app` serves it for OpenEnv clients. An action is a command, and a submitted action ends the episode with a reward from a check in the cell or from `Verify.Run`. Driven by OpenEnv's own client against a real comb on server3, 8 sessions side by side ran 200 steps in 1.64 s, and a step took p50 28.45 ms and p99 96.67 ms through OpenEnv's WebSocket.
