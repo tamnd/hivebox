@@ -197,11 +197,19 @@ impl Cells for FakeComb {
         Ok(Response::new(v1::ListCellsResponse { cells: page, next_page_token }))
     }
 
+    /// The cells the selector picks as they are now, and then nothing until the caller leaves.
     async fn watch(
         &self,
-        _req: Request<v1::WatchCellsRequest>,
+        req: Request<v1::WatchCellsRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        Err(Status::unimplemented("watch"))
+        let project = project(&req);
+        let ids = self.picked(&project, req.into_inner().selector);
+        let cells = self.cells.lock().unwrap();
+        let now: Vec<_> = ids
+            .iter()
+            .map(|id| Ok(v1::CellEvent { cell: Some(cells[id].clone()), from: 0 }))
+            .collect();
+        Ok(Response::new(futures::stream::iter(now).chain(futures::stream::pending()).boxed()))
     }
 
     async fn pause(
@@ -971,6 +979,83 @@ async fn a_call_about_a_cell_of_another_unit_goes_through_its_gate() {
     let e =
         peer(baddr).await.get(Request::new(v1::GetCellRequest { id: theirs })).await.unwrap_err();
     assert_eq!(e.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lists_and_calls_by_label_cover_every_unit() {
+    let ((pa, aaddr), (pb, baddr)) = (listen().await, listen().await);
+    let a = Cluster::unit(1, [(2, format!("http://{baddr}"))].into(), pa).await;
+    let b = Cluster::unit(2, [(1, format!("http://{aaddr}"))].into(), pb).await;
+    create(&a, 3, "x").await;
+    create(&b, 4, "x").await;
+    create(&b, 2, "y").await;
+    let unit = |id: &str| id.parse::<CellId>().unwrap().unit();
+
+    // Pages of 2 walk this unit's nodes and then the other unit's, and see every cell once.
+    for (c, first) in [(&a, 1), (&b, 2)] {
+        let (mut seen, mut tokens, mut token) = (Vec::new(), Vec::new(), String::new());
+        loop {
+            let req =
+                v1::ListCellsRequest { page_size: 2, page_token: token, ..Default::default() };
+            let page = c.cells().list(authed(req)).await.unwrap().into_inner();
+            assert!(page.cells.len() <= 2);
+            seen.extend(page.cells.into_iter().map(|c| c.id));
+            token = page.next_page_token;
+            if token.is_empty() {
+                break;
+            }
+            tokens.push(token.clone());
+        }
+        assert_eq!(seen.len(), 9, "{seen:?}");
+        assert_eq!(seen.iter().collect::<HashSet<_>>().len(), 9);
+        let mine = if first == 1 { 3 } else { 6 };
+        assert!(seen[..mine].iter().all(|id| unit(id) == first), "{seen:?}");
+        assert!(seen[mine..].iter().all(|id| unit(id) != first), "{seen:?}");
+        assert!(
+            tokens.iter().any(|t| t.starts_with('u')),
+            "a token names the next unit: {tokens:?}"
+        );
+    }
+    let all = a.cells().list(authed(v1::ListCellsRequest::default())).await.unwrap().into_inner();
+    assert_eq!((all.cells.len(), all.next_page_token.as_str()), (9, ""));
+    let bad = v1::ListCellsRequest { page_token: "u9".into(), ..Default::default() };
+    let e = a.cells().list(authed(bad)).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+
+    // A watch by label through gate A hears of the cells of unit 2.
+    let by = |run: &str| v1::CellSelector {
+        by: Some(v1::cell_selector::By::Labels(v1::LabelSelector {
+            r#match: [("run".to_string(), run.to_string())].into(),
+        })),
+    };
+    let req = v1::WatchCellsRequest { selector: Some(by("y")) };
+    let mut events = a.cells().watch(authed(req)).await.unwrap().into_inner();
+    let mut heard = Vec::new();
+    for _ in 0..2 {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.message()).await;
+        heard.push(ev.unwrap().unwrap().unwrap().cell.unwrap().id);
+    }
+    assert!(heard.iter().all(|id| unit(id) == 2), "{heard:?}");
+
+    // A stop by label through gate A takes the cells of both units.
+    let stop = v1::StopRequest { selector: Some(by("x")), snapshot: false };
+    let r = a.cells().stop(authed(stop)).await.unwrap().into_inner();
+    assert_eq!((r.matched, r.succeeded, r.failures.len()), (7, 7, 0));
+    let req = v1::ListCellsRequest::default();
+    let stopped = b.cells().list(authed(req)).await.unwrap().into_inner().cells;
+    assert_eq!(stopped.iter().filter(|c| c.state == i32::from(v1::CellState::Stopped)).count(), 7);
+
+    // The peer listener answers for its own unit only.
+    let ch = tonic::transport::Endpoint::from_shared(format!("http://{baddr}")).unwrap();
+    let mut peer = CellsClient::new(ch.connect().await.unwrap());
+    let mut req = Request::new(v1::ListCellsRequest::default());
+    req.metadata_mut().insert("x-hive-project", "swe".parse().unwrap());
+    let hash = blake3::hash(KEY.as_bytes());
+    let hex: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    req.metadata_mut().insert(hive_gate::PRINCIPAL_HEADER, format!("key:{hex}").parse().unwrap());
+    let own = peer.list(req).await.unwrap().into_inner().cells;
+    assert_eq!(own.len(), 6);
+    assert!(own.iter().all(|c| unit(&c.id) == 2));
 }
 
 async fn verify(c: &Cluster, subject: &str) -> Result<v1::VerifyResult, Status> {

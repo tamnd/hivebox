@@ -86,6 +86,16 @@ impl Nodes {
         Ok(self)
     }
 
+    /// The gates of the other units, in the order of their units, for the calls that go to every
+    /// unit.
+    #[must_use]
+    pub fn peers(&self) -> Vec<(u8, Channel)> {
+        let mut peers: Vec<_> =
+            self.units.peers.iter().map(|(&u, (_, c))| (u, c.clone())).collect();
+        peers.sort_unstable_by_key(|&(u, _)| u);
+        peers
+    }
+
     /// The unit the gate serves, if it was told.
     #[must_use]
     pub fn unit(&self) -> Option<u8> {
@@ -297,6 +307,7 @@ mod tests {
         let peers = BTreeMap::from([(2, "http://127.0.0.1:1".to_owned())]);
         let unit = nodes().with_units(1, &peers).unwrap();
         assert_eq!(unit.unit(), Some(1));
+        assert_eq!(unit.peers().iter().map(|p| p.0).collect::<Vec<_>>(), [2]);
         let there = CellId::new(2, 1, 1, 7, 9).unwrap();
         assert!(unit.owner(there, Origin::Caller).is_ok());
         let e = unit.owner(there, Origin::Peer).unwrap_err();

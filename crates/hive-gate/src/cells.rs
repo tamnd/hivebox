@@ -1,6 +1,7 @@
 //! The Cells service across the cluster. A call about one cell goes to its comb. Create places
 //! the batch with waggle and splits it over the nodes, and calls by label go to every node and
-//! have their answers merged.
+//! have their answers merged. A gate that knows the gates of other units sends lists, calls by
+//! label and watches to them too, and they answer for their own units only.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -105,6 +106,98 @@ impl Api {
         Ok(self.client(self.inner.nodes.channel(node).map_err(|e| convert::error_to_status(&e))?))
     }
 
+    /// The gates of the other units a call from `caller` also goes to, which is none when the
+    /// call came from one of them.
+    fn peers(&self, caller: &Caller) -> Vec<(u8, Channel)> {
+        if caller.peer { Vec::new() } else { self.inner.nodes.peers() }
+    }
+
+    /// A page of this unit's cells of at most `size`, going on from `token`.
+    async fn list_here(
+        &self,
+        project: &Caller,
+        req: &v1::ListCellsRequest,
+        token: &str,
+        size: u32,
+    ) -> Result<v1::ListCellsResponse, Status> {
+        let (from, after) = parse_token(token)?;
+
+        let nodes: Vec<u16> = self.inner.nodes.all().into_iter().filter(|&n| n >= from).collect();
+        let mut page = v1::ListCellsResponse::default();
+        let mut left = size;
+        // Cell ids sort by node, so the pages walk the nodes in order and a token says which
+        // node to go on from and after which cell.
+        for window in nodes.chunks(LIST_WINDOW) {
+            let mut calls = JoinSet::new();
+            for (i, &node) in window.iter().enumerate() {
+                let one = v1::ListCellsRequest {
+                    page_size: left,
+                    page_token: after
+                        .filter(|a| a.node() == node)
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                    ..req.clone()
+                };
+                let client = self.node(node);
+                let project = project.clone();
+                calls.spawn(async move {
+                    let r = match client {
+                        Ok(mut c) => c.list(out(&project, one)).await.map(Response::into_inner),
+                        Err(s) => Err(s),
+                    };
+                    (i, r)
+                });
+            }
+            let mut answers: Vec<Option<v1::ListCellsResponse>> = vec![None; window.len()];
+            while let Some(done) = calls.join_next().await {
+                let (i, r) = done.map_err(|_| Status::internal("a list call panicked"))?;
+                let r = r.map_err(|s| convert::error_to_status(&node_error(window[i], &s)))?;
+                answers[i] = Some(r);
+            }
+            for (i, answer) in answers.into_iter().enumerate() {
+                let answer = answer.unwrap_or_default();
+                let more = !answer.next_page_token.is_empty();
+                let n = answer.cells.len();
+                let take = n.min(left as usize);
+                page.cells.extend(answer.cells.into_iter().take(take));
+                left -= take as u32;
+                if left == 0 {
+                    // Full: go on after the last cell, or from the next node when this one had
+                    // no more.
+                    page.next_page_token = if take < n || more {
+                        page.cells.last().map(|c| c.id.clone()).unwrap_or_default()
+                    } else {
+                        nodes
+                            .iter()
+                            .find(|&&m| m > window[i])
+                            .map(|m| format!("n{m}"))
+                            .unwrap_or_default()
+                    };
+                    return Ok(page);
+                }
+            }
+        }
+        Ok(page)
+    }
+
+    /// Where a list page goes on from: the unit, as 0 for this one and then 1 on for `peers`,
+    /// and the token to give it. `uUNIT` starts another unit, `uUNIT.nNODE` goes on in it from a
+    /// node, and a cell id goes on after that cell in its own unit.
+    fn unit_token(&self, t: &str, peers: &[(u8, Channel)]) -> Result<(usize, String), Status> {
+        let bad = || invalid("the page token is not valid");
+        let at = |unit: u8| peers.iter().position(|p| p.0 == unit).map(|i| i + 1).ok_or_else(bad);
+        if let Some(rest) = t.strip_prefix('u') {
+            let (unit, inner) = rest.split_once('.').unwrap_or((rest, ""));
+            return Ok((at(unit.parse().map_err(|_| bad())?)?, inner.to_owned()));
+        }
+        if let (Some(home), Ok(id)) = (self.inner.nodes.unit(), t.parse::<CellId>())
+            && id.unit() != home
+        {
+            return Ok((at(id.unit())?, t.to_owned()));
+        }
+        Ok((0, t.to_owned()))
+    }
+
     /// The nodes the gate knows.
     pub(crate) fn nodes(&self) -> &Nodes {
         &self.inner.nodes
@@ -167,21 +260,42 @@ impl Api {
                     Ok(f) => f.await.map(Response::into_inner),
                     Err(s) => Err(s),
                 };
-                (node, r)
+                (At::Node(node), r)
             });
+        }
+        for (unit, channel) in self.peers(project) {
+            let fut = call(self.client(channel), out(project, msg.clone()));
+            calls.spawn(async move { (At::Unit(unit), fut.await.map(Response::into_inner)) });
         }
         let mut total = R::default();
         while let Some(done) = calls.join_next().await {
-            let Ok((node, r)) = done else { continue };
+            let Ok((at, r)) = done else { continue };
             match r {
                 Ok(r) => total.add(r),
-                Err(s) => total.result().failures.push(v1::BulkFailure {
-                    cell_id: String::new(),
-                    error: Some(on_node(node, &s)),
-                }),
+                Err(s) => total
+                    .result()
+                    .failures
+                    .push(v1::BulkFailure { cell_id: String::new(), error: Some(at.error(&s)) }),
             }
         }
         total
+    }
+}
+
+/// Where a call that goes everywhere went: a node of this unit, or the gate of another.
+#[derive(Clone, Copy)]
+enum At {
+    Node(u16),
+    Unit(u8),
+}
+
+impl At {
+    /// `s` from there as an error for the caller, saying where.
+    fn error(self, s: &Status) -> v1::Error {
+        match self {
+            Self::Node(node) => on_node(node, s),
+            Self::Unit(unit) => convert::error_to_v1(&unit_error(unit, s)),
+        }
     }
 }
 
@@ -281,60 +395,44 @@ impl Cells for Api {
             0 => PAGE,
             n => n.min(MAX_PAGE),
         };
-        let (from, after) = parse_token(&req.page_token)?;
-        let nodes: Vec<u16> = self.inner.nodes.all().into_iter().filter(|&n| n >= from).collect();
+        // This unit's cells first, then each other unit's in the order of their units, with the
+        // token saying which unit to go on in. A page may run on from one unit into the next.
+        let peers = self.peers(&project);
+        let (start, mut token) = self.unit_token(&req.page_token, &peers)?;
         let mut page = v1::ListCellsResponse::default();
-        let mut left = size;
-        // Cell ids sort by node, so the pages walk the nodes in order and a token says which
-        // node to go on from and after which cell.
-        for window in nodes.chunks(LIST_WINDOW) {
-            let mut calls = JoinSet::new();
-            for (i, &node) in window.iter().enumerate() {
-                let one = v1::ListCellsRequest {
-                    page_size: left,
-                    page_token: after
-                        .filter(|a| a.node() == node)
-                        .map(|a| a.to_string())
-                        .unwrap_or_default(),
-                    ..req.clone()
-                };
-                let client = self.node(node);
-                let project = project.clone();
-                calls.spawn(async move {
-                    let r = match client {
-                        Ok(mut c) => c.list(out(&project, one)).await.map(Response::into_inner),
-                        Err(s) => Err(s),
+        for at in start..=peers.len() {
+            let left = size - page.cells.len() as u32;
+            let part = match at.checked_sub(1).map(|i| &peers[i]) {
+                None => self.list_here(&project, &req, &token, left).await?,
+                Some((unit, channel)) => {
+                    let one = v1::ListCellsRequest {
+                        page_size: left,
+                        page_token: std::mem::take(&mut token),
+                        ..req.clone()
                     };
-                    (i, r)
-                });
-            }
-            let mut answers: Vec<Option<v1::ListCellsResponse>> = vec![None; window.len()];
-            while let Some(done) = calls.join_next().await {
-                let (i, r) = done.map_err(|_| Status::internal("a list call panicked"))?;
-                let r = r.map_err(|s| convert::error_to_status(&node_error(window[i], &s)))?;
-                answers[i] = Some(r);
-            }
-            for (i, answer) in answers.into_iter().enumerate() {
-                let answer = answer.unwrap_or_default();
-                let more = !answer.next_page_token.is_empty();
-                let n = answer.cells.len();
-                let take = n.min(left as usize);
-                page.cells.extend(answer.cells.into_iter().take(take));
-                left -= take as u32;
-                if left == 0 {
-                    // Full: go on after the last cell, or from the next node when this one had
-                    // no more.
-                    page.next_page_token = if take < n || more {
-                        page.cells.last().map(|c| c.id.clone()).unwrap_or_default()
-                    } else {
-                        nodes
-                            .iter()
-                            .find(|&&m| m > window[i])
-                            .map(|m| format!("n{m}"))
-                            .unwrap_or_default()
-                    };
-                    return Ok(Response::new(page));
+                    let mut part = self
+                        .client(channel.clone())
+                        .list(out(&project, one))
+                        .await
+                        .map_err(|s| convert::error_to_status(&unit_error(*unit, &s)))?
+                        .into_inner();
+                    // Its own node tokens say nothing of the unit, and its cell ids do.
+                    if part.next_page_token.starts_with('n') {
+                        part.next_page_token = format!("u{unit}.{}", part.next_page_token);
+                    }
+                    part
                 }
+            };
+            token.clear();
+            page.cells.extend(part.cells);
+            if !part.next_page_token.is_empty() {
+                page.next_page_token = part.next_page_token;
+                return Ok(Response::new(page));
+            }
+            if page.cells.len() as u32 >= size {
+                page.next_page_token =
+                    peers.get(at).map(|(u, _)| format!("u{u}")).unwrap_or_default();
+                return Ok(Response::new(page));
             }
         }
         Ok(Response::new(page))
@@ -670,6 +768,10 @@ async fn watch_all(
     let mut snaps = api.inner.nodes.subscribe();
     let mut watching: HashSet<u16> = HashSet::new();
     let mut tasks = JoinSet::new();
+    for (_, channel) in api.peers(&project) {
+        let (api, project, labels, tx) = (api.clone(), project.clone(), labels.clone(), tx.clone());
+        tasks.spawn(watch_unit(api, channel, project, labels, tx));
+    }
     loop {
         for node in api.inner.nodes.all() {
             if watching.insert(node) {
@@ -681,6 +783,47 @@ async fn watch_all(
         tokio::select! {
             () = tx.closed() => return,
             r = snaps.changed() => if r.is_err() { return },
+        }
+    }
+}
+
+/// Follows the gate of another unit, which follows the nodes of its own, asking again when the
+/// stream breaks.
+async fn watch_unit(
+    api: Api,
+    channel: Channel,
+    project: Caller,
+    labels: v1::LabelSelector,
+    tx: mpsc::Sender<Result<v1::CellEvent, Status>>,
+) {
+    let req = v1::WatchCellsRequest {
+        selector: Some(v1::CellSelector { by: Some(v1::cell_selector::By::Labels(labels)) }),
+    };
+    while !tx.is_closed() {
+        if let Ok(r) = api.client(channel.clone()).watch(out(&project, req.clone())).await
+            && relay(r.into_inner(), &tx).await
+        {
+            return;
+        }
+        tokio::select! {
+            () = tx.closed() => return,
+            () = tokio::time::sleep(REWATCH) => {}
+        }
+    }
+}
+
+/// Passes `events` on to `tx` until the stream ends, and says whether `tx` is gone.
+async fn relay(
+    mut events: tonic::Streaming<v1::CellEvent>,
+    tx: &mpsc::Sender<Result<v1::CellEvent, Status>>,
+) -> bool {
+    loop {
+        tokio::select! {
+            () = tx.closed() => return true,
+            ev = events.message() => match ev {
+                Ok(Some(ev)) => if tx.send(Ok(ev)).await.is_err() { return true },
+                _ => return false,
+            },
         }
     }
 }
@@ -699,17 +842,9 @@ async fn watch_node(
     while !tx.is_closed() && api.inner.nodes.all().contains(&node) {
         if let Ok(mut c) = api.node(node)
             && let Ok(r) = c.watch(out(&project, req.clone())).await
+            && relay(r.into_inner(), &tx).await
         {
-            let mut events = r.into_inner();
-            loop {
-                tokio::select! {
-                    () = tx.closed() => return,
-                    ev = events.message() => match ev {
-                        Ok(Some(ev)) => if tx.send(Ok(ev)).await.is_err() { return },
-                        _ => break,
-                    },
-                }
-            }
+            return;
         }
         tokio::select! {
             () = tx.closed() => return,
@@ -797,12 +932,21 @@ pub(crate) fn invalid(msg: impl Into<String>) -> Status {
 
 /// `s` from `node` as an error for the caller, saying which node.
 pub(crate) fn node_error(node: u16, s: &Status) -> Error {
+    relayed(&format!("node {node}"), s)
+}
+
+/// `s` from the gate of `unit` as an error for the caller, saying which unit.
+fn unit_error(unit: u8, s: &Status) -> Error {
+    relayed(&format!("unit {unit}"), s)
+}
+
+fn relayed(from: &str, s: &Status) -> Error {
     let mut e = convert::error_from_status(s);
-    // A status with no hivebox reason and this code came from the connection, not the comb.
+    // A status with no hivebox reason and this code came from the connection, not the far end.
     if e.reason == Reason::Internal && s.code() == tonic::Code::Unavailable {
         e.reason = Reason::DroneUnreachable;
     }
-    e.message = format!("node {node}: {}", e.message);
+    e.message = format!("{from}: {}", e.message);
     e
 }
 
