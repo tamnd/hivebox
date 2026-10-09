@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.40
+
+Driver plugins over a Unix socket and WIT policy plugins.
+
 - Driver plugins. A backend can run in a process of its own that serves `hivebox.plugin.v1.Driver` on a Unix socket, and the comb uses it in place of its own driver for that backend when the socket is listed in `[backends] plugins`. `hive-cell-plugin` has the client and `serve`, so any `CellDriver` becomes a plugin in a few lines, and `hive-comb --plugin container --socket PATH` serves the built in container driver that way. Plugins of another API version are refused, errors keep their reason, and either side can restart. On server3 a call through the plugin took 159 us at p50 and creating a container cell took 106 to 113 ms at p50 through it, against 105 to 156 ms in process.
 
 - Policy plugins. `[policy] plugins` names WebAssembly components of the world in `crates/hive-cell-wasm/wit/policy.wit`, and the comb asks each one about every cell before it makes it. A policy can allow the cell, turn it away with a reason (`POLICY_DENIED`) or change its network profile, hard TTL and labels. It sees env var names but not their values, runs with a memory and time limit, and turns the cell away if it traps or runs late. The comb will not start with a policy it cannot compile, and `hive_policy_seconds` times each one. On server3 a verdict took 169 us at p50.
