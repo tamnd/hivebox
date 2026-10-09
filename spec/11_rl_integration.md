@@ -50,7 +50,7 @@ The verifier is most of each sample's time, and it slows down as more run at onc
 | AReaL | `RolloutWorkflow` using the async SDK | fully async; interruptible generation |
 | ROLL / ROCK | ROCK-compatible env provider (`GEM` API) | |
 | SkyRL | `SkyRL-gym` env backed by hivebox | |
-| OpenRLHF / NeMo-RL | generic Gym/OpenEnv adapter | |
+| OpenRLHF / NeMo-RL / TRL | `hivebox.openenv.create_hivebox_app`, an OpenEnv server whose episodes are a shell in a fresh cell | scored by a check in the cell or by `Verify.Run` |
 | Harbor / Terminal-Bench | `hivebox.harbor:HiveboxEnvironment`, a Harbor environment that is one cell per trial | reuse datasets unchanged, with images imported on the node |
 | SWE-agent / SWE-ReX | `hivebox.swerex.HiveboxDeployment`, a SWE-ReX deployment whose runtime is a cell | no swerex server in the image |
 | rLLM / DeepSWE (R2E-Gym) | R2E env backed by hivebox | |
