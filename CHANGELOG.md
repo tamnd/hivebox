@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- MCP server. `python -m hivebox.mcp` gives an agent tools to make cells, run commands in a shell that keeps its state, read, write and list files, fork and stop cells. It only reaches the cells it made, limits how many run and which images and network profiles they use, and stops them when it exits. Started over stdio by the MCP SDK's own client against a real comb on server3 at a load of 97 to 102, `run_command` took p50 7.69 and 7.37 ms and p99 56.28 and 75.31 ms over two runs, and `create_cell` took 1.8 and 2.6 s.
+
 - OpenEnv environment. `hivebox.openenv.HiveboxEnv` is an OpenEnv environment where each episode is a bash shell in a fresh cell, and `create_hivebox_app` serves it for OpenEnv clients. An action is a command, and a submitted action ends the episode with a reward from a check in the cell or from `Verify.Run`. Driven by OpenEnv's own client against a real comb on server3, 8 sessions side by side ran 200 steps in 1.64 s, and a step took p50 28.45 ms and p99 96.67 ms through OpenEnv's WebSocket.
 
 - Harbor environment. `hivebox.harbor:HiveboxEnvironment` runs Harbor trials in cells, passed to `harbor run` with `-e`. Commands, uploads and downloads go through the hivebox API, the task's network mode picks the network profile, and its CPUs, memory and storage become the cell's limits. A real `harbor run` with the oracle agent on two local tasks gave reward 1 to the right answer and 0 to the wrong one, and on server3 at a load of 83 to 85 setting up a trial's cell took 3.7 to 5.7 s over two runs.

@@ -21,6 +21,7 @@ dev = ["grpcio-tools>=1.84"]
 swerex = ["swe-rex>=1.4"]
 harbor = ["harbor>=0.24"]
 openenv = ["openenv-core>=0.3"]
+mcp = ["mcp>=2.3"]
 
 [project.urls]
 Repository = "https://github.com/tamnd/hivebox"
