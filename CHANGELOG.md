@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.37
+
+Cloud bursting and an offline rebalancer.
+
 - Cloud bursting. A comb with `cloud = true` in `[node]` takes cells only once the on-prem nodes have 80% of their memory given out, and only of the images staged in its `data_dir/images`. `burst_above` in `[gate]` moves the line. Keyed creates and snapshots stay on-prem.
 - An offline rebalancer in scout. Every 60 s it plans moves of idle cells, the paused ones and the ones unused for 5 minutes, off nodes past 90% onto the emptiest ones, and once the on-prem nodes have stayed past the burst line for 5 rounds it says how much memory is over it and how much the cloud nodes have free. Plans go in scout's metrics and log. `hive-scout --rebalance SECS` changes the interval and `--burst-above` the line. Combs report their idle cells for it.
 

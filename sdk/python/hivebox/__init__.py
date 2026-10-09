@@ -50,7 +50,7 @@ from ._errors import (
     QuotaExceeded,
 )
 
-__version__ = "0.0.36"
+__version__ = "0.0.37"
 
 __all__ = [
     "DEFAULT_SOCKET", "AsyncHive", "BulkResult", "Cell", "CellGroup", "Cells", "Choice", "FileInfo", "Files", "Llm",
