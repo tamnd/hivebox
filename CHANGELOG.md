@@ -4,7 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
-- A gate can front one unit of several. `unit` and `peer_listen` in `[gate]` and a `[units]` table naming the other units' gates send a get, stop, exec, file call or verify about a cell of another unit through that unit's gate, so a client needs only one gate. Creates, lists and calls by label still cover the gate's own unit.
+- Lists, pauses, resumes and stops by label, and watches through a gate with `[units]` cover the cells of every unit, the gate's own first, so a client of one gate sees the whole fleet. A list of 10 cells over two units took 3.5 ms at the median through one gate on a loaded host, against 2.2 ms for the 4 cells of one unit.
+- A gate can front one unit of several. `unit` and `peer_listen` in `[gate]` and a `[units]` table naming the other units' gates send a get, stop, exec, file call or verify about a cell of another unit through that unit's gate, so a client needs only one gate. Creates still go to the gate's own unit.
 - `Verify.Run` leaves `conftest.py`, `pytest.ini`, `.pytest.ini`, `tox.ini`, `setup.cfg` and installed package metadata out of the subject's diff even when the request names no protected paths, and reports them in `tampered`, so a `conftest.py` hook that marks every test passed no longer earns a reward. `[verify] protected_paths` in the comb's config changes the list, and `[]` turns it off.
 
 ## 0.0.35
