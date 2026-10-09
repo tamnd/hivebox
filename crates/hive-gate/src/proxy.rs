@@ -17,8 +17,8 @@ use tonic::body::Body;
 use tonic::codegen::http;
 use tower::ServiceExt;
 
-use crate::Grant;
-use crate::nodes::Nodes;
+use crate::nodes::{Nodes, Origin};
+use crate::{Grant, Peer};
 
 /// The most of the first message read to find the cell id. Every request puts it first, so this
 /// is far more than it ever takes.
@@ -38,7 +38,9 @@ async fn route(nodes: &Nodes, req: http::Request<Body>) -> Result<http::Response
     let id = cell_of(&first)?;
     let op = if head.uri.path().starts_with("/hivebox.v1.Exec/") { "exec" } else { "files" };
     Grant::check(head.extensions.get::<Grant>(), op, Some(&id.to_string()))?;
-    let channel = nodes.owner(id).map_err(|e| convert::error_to_status(&e))?;
+    let origin =
+        if head.extensions.get::<Peer>().is_some() { Origin::Peer } else { Origin::Caller };
+    let channel = nodes.owner(id, origin).map_err(|e| convert::error_to_status(&e))?;
     let body = Body::new(Prepend { first: Some(first), rest: body });
     let resp = channel.oneshot(http::Request::from_parts(head, body)).await.map_err(|e| {
         let e = Error::new(Reason::DroneUnreachable, format!("node {}: {e}", id.node()));

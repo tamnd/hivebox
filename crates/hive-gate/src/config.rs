@@ -1,6 +1,6 @@
 //! The gate's config file.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -27,6 +27,15 @@ pub struct Config {
     pub e2b: Option<E2b>,
     /// Where security events, such as a caller with a bad key, go, if anywhere.
     pub siem: Option<hive_telemetry::siem::Link>,
+    /// The unit whose cells the gate serves. Without one it serves the cells of any unit as its
+    /// own, which is all a gate in front of a single unit needs.
+    pub unit: Option<u8>,
+    /// The peer listener of the gate of each other unit, like `http://10.0.1.5:7402`, where calls
+    /// about that unit's cells go.
+    pub units: BTreeMap<u8, String>,
+    /// Where the gates of other units reach this one, if they do. It takes the project those
+    /// gates stamped without a key, so it belongs on the network only the gates reach.
+    pub peer_listen: Option<SocketAddr>,
 }
 
 /// How E2B sandboxes become cells.
@@ -104,6 +113,9 @@ impl Config {
     ///
     /// [siem]
     /// sink = "udp://10.0.0.9:514"
+    ///
+    /// [units]
+    /// 2 = "http://10.0.1.5:7402"
     /// ```
     ///
     /// With `keeper`, the gate takes the keys the keeper holds, and `[[key]]` is for keys that
@@ -112,6 +124,8 @@ impl Config {
     /// `hive-gate key PROJECT` makes one and prints the lines to add here. With `[e2b]`, the
     /// gate serves the E2B REST API and the parts of envd that run commands and move files, so
     /// the E2B SDK works with `E2B_API_URL` and `E2B_SANDBOX_URL` both set to the gate.
+    /// With `unit` in `[gate]`, a call about a cell of another unit goes to the gate `[units]`
+    /// names for it, at that gate's `peer_listen`.
     ///
     /// # Errors
     ///
@@ -187,7 +201,46 @@ impl Config {
             }
         }
         let siem = file.siem.link()?;
-        Ok(Self { listen, metrics, scout, keys, keeper: g.keeper, name, e2b, siem })
+        let peer_listen = g.peer_listen.map(|t| addr(&t, "gate.peer_listen")).transpose()?;
+        let unit = g
+            .unit
+            .map(|u| {
+                u8::try_from(u).map_err(|_| format!("gate.unit = {u} is not a unit, 0 to 255"))
+            })
+            .transpose()?;
+        if unit.is_none() && (!file.units.is_empty() || peer_listen.is_some()) {
+            return Err(
+                "[units] and gate.peer_listen need gate.unit, the unit this gate serves".into()
+            );
+        }
+        let self_unit = unit;
+        let mut units = BTreeMap::new();
+        for (k, url) in file.units {
+            let unit: u8 =
+                k.parse().map_err(|_| format!("units has {k:?}, which is not a unit"))?;
+            if Some(unit) == self_unit {
+                return Err(format!("units has {unit}, which is this gate's own unit"));
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!(
+                    "units.{unit} = {url:?} is not a URL like http://10.0.1.5:7402"
+                ));
+            }
+            units.insert(unit, url);
+        }
+        Ok(Self {
+            listen,
+            metrics,
+            scout,
+            keys,
+            keeper: g.keeper,
+            name,
+            e2b,
+            siem,
+            unit,
+            units,
+            peer_listen,
+        })
     }
 }
 
@@ -241,6 +294,8 @@ struct File {
     e2b: Option<E2bFile>,
     #[serde(default)]
     siem: hive_telemetry::siem::Table,
+    #[serde(default)]
+    units: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +318,8 @@ struct Gate {
     #[serde(default)]
     keeper: Vec<String>,
     name: Option<String>,
+    unit: Option<i64>,
+    peer_listen: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -317,6 +374,23 @@ mod tests {
     }
 
     #[test]
+    fn units_name_the_gates_of_the_others() {
+        let c = Config::from_toml(
+            "[gate]\nscout = \"http://s:7410\"\nkeeper = [\"k:7430\"]\nunit = 1\n\
+             peer_listen = \"10.0.0.4:7402\"\n[units]\n2 = \"http://10.0.1.5:7402\"\n\
+             3 = \"https://g3:7402\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.unit, Some(1));
+        assert_eq!(c.peer_listen, Some("10.0.0.4:7402".parse().unwrap()));
+        assert_eq!(c.units[&2], "http://10.0.1.5:7402");
+        assert_eq!(c.units.keys().copied().collect::<Vec<_>>(), [2, 3]);
+        let one = Config::from_toml("[gate]\nscout = \"http://s:7410\"\nkeeper = [\"k:7430\"]\n")
+            .unwrap();
+        assert!(one.unit.is_none() && one.units.is_empty() && one.peer_listen.is_none());
+    }
+
+    #[test]
     fn mistakes_are_errors() {
         let key = "[[key]]\nproject = \"swe\"\nblake3 = \"".to_string() + &"ab".repeat(32) + "\"\n";
         let scout = "[gate]\nscout = \"http://s:7410\"\n";
@@ -335,6 +409,14 @@ mod tests {
             (format!("{scout}{key}[e2b]\nimage_key = \"a b\"\n"), "e2b.image_key"),
             (format!("{scout}{key}[e2b]\nimage = \"x\"\n"), "unknown field"),
             (format!("{scout}{key}[e2b]\nimage_key = \"i\"\nbackend = \"auto\"\n"), "e2b.backend"),
+            (format!("{scout}{key}[units]\n2 = \"http://g:7402\"\n"), "need gate.unit"),
+            (format!("{scout}peer_listen = \"0.0.0.0:7402\"\n{key}"), "need gate.unit"),
+            (format!("{scout}unit = 1\npeer_listen = \"7402\"\n{key}"), "gate.peer_listen"),
+            (format!("{scout}unit = 1\n{key}[units]\nx = \"http://g:7402\"\n"), "not a unit"),
+            (format!("{scout}unit = 1\n{key}[units]\n256 = \"http://g:7402\"\n"), "not a unit"),
+            (format!("{scout}unit = 1\n{key}[units]\n1 = \"http://g:7402\"\n"), "own unit"),
+            (format!("{scout}unit = 1\n{key}[units]\n2 = \"g:7402\"\n"), "units.2"),
+            (format!("{scout}unit = 300\n{key}"), "0 to 255"),
         ];
         for (text, want) in cases {
             let e = Config::from_toml(&text).unwrap_err();

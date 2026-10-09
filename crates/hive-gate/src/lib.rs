@@ -11,6 +11,10 @@
 //!
 //! With an `[e2b]` table in its config, the gate also speaks enough of the E2B API and of envd,
 //! the daemon in an E2B sandbox, for the E2B SDK to make cells and run commands in them.
+//!
+//! A gate told its unit sends a call about a cell of another unit to that unit's gate, on the
+//! listener that gate keeps for its peers. That listener takes the project from the call as the
+//! first gate stamped it, like a comb does, so it belongs on the network only gates reach.
 
 #![forbid(unsafe_code)]
 
@@ -79,6 +83,10 @@ impl Grant {
     }
 }
 
+/// Marks a call that came in on the peer listener, from the gate of another unit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Peer;
+
 /// The biggest request message, which is mostly stdin for a run. The same as a comb takes.
 const MAX_REQUEST: usize = 64 << 20;
 
@@ -95,6 +103,8 @@ pub struct Gate {
     e2b: Option<Arc<e2b::E2b>>,
     calls: CounterVec,
     siem: Option<Arc<Siem>>,
+    /// Serving the gates of other units rather than callers.
+    peer: bool,
 }
 
 impl Gate {
@@ -118,6 +128,7 @@ impl Gate {
             tokens: None,
             e2b: None,
             siem: None,
+            peer: false,
             calls: registry.counter(
                 "hive_gate_calls_total",
                 "Calls the gate took, by method and whether the key was good.",
@@ -145,6 +156,14 @@ impl Gate {
     pub fn with_siem(mut self, siem: Arc<Siem>) -> Self {
         self.siem = Some(siem);
         self
+    }
+
+    /// The same gate for the peer listener, which the gates of other units call. It takes the
+    /// project and the principal those gates stamped, checks no key, sends nothing on to another
+    /// unit, and serves neither E2B, Connect nor Tokens, which only a caller uses.
+    #[must_use]
+    pub fn for_peers(&self) -> Self {
+        Self { peer: true, ..self.clone() }
     }
 
     /// Tells the SIEM, if there is one, that the caller of `req` was turned away from `op`, and
@@ -215,6 +234,9 @@ impl Service<http::Request<Body>> for Gate {
     }
 
     fn call(&mut self, mut req: http::Request<Body>) -> Self::Future {
+        if self.peer {
+            return self.peer_call(req);
+        }
         // Before Connect, which would take the E2B calls for its own, being JSON too.
         if let Some(e2b) = &self.e2b
             && let Some(kind) = e2b::Kind::of(&req)
@@ -224,14 +246,7 @@ impl Service<http::Request<Body>> for Gate {
         if let Some(codec) = connect::Codec::of(req.headers()) {
             return Box::pin(connect::call(self.clone(), codec, req).map(Ok));
         }
-        let (to, op) = match req.uri().path().strip_prefix('/').and_then(|p| p.split_once('/')) {
-            Some(("hivebox.v1.Cells", m)) => (To::Cells, m),
-            Some(("hivebox.v1.Exec" | "hivebox.v1.Files", m)) => (To::Comb, m),
-            Some(("hivebox.v1.Verify", m)) => (To::Verify, m),
-            Some(("hivebox.v1.Llm", m)) => (To::Llm, m),
-            Some(("hivebox.v1.Tokens", m)) => (To::Tokens, m),
-            _ => (To::Nowhere, "unknown"),
-        };
+        let (to, op) = Self::to(&req);
         let (project, credential) = match self.caller(&req) {
             Ok(c) => c,
             Err(why) => {
@@ -255,6 +270,48 @@ impl Service<http::Request<Body>> for Gate {
         if let Ok(v) = http::HeaderValue::from_str(&principal) {
             headers.insert(PRINCIPAL_HEADER, v);
         }
+        self.serve(to, req)
+    }
+}
+
+impl Gate {
+    /// Where a call goes by its path, and the method for the metrics.
+    fn to(req: &http::Request<Body>) -> (To, &str) {
+        match req.uri().path().strip_prefix('/').and_then(|p| p.split_once('/')) {
+            Some(("hivebox.v1.Cells", m)) => (To::Cells, m),
+            Some(("hivebox.v1.Exec" | "hivebox.v1.Files", m)) => (To::Comb, m),
+            Some(("hivebox.v1.Verify", m)) => (To::Verify, m),
+            Some(("hivebox.v1.Llm", m)) => (To::Llm, m),
+            Some(("hivebox.v1.Tokens", m)) => (To::Tokens, m),
+            _ => (To::Nowhere, "unknown"),
+        }
+    }
+
+    /// A call from the gate of another unit, which stamped the project when it checked the key.
+    fn peer_call(
+        &mut self,
+        mut req: http::Request<Body>,
+    ) -> BoxFuture<http::Response<Body>, Infallible> {
+        let (to, op) = Self::to(&req);
+        let to = if matches!(to, To::Tokens) { To::Nowhere } else { to };
+        // A gate always stamps both, so a call without them did not come from one.
+        if ![PROJECT_HEADER, PRINCIPAL_HEADER].iter().all(|h| req.headers().contains_key(*h)) {
+            self.calls.with(&[op, "denied"]).inc();
+            let status =
+                Status::unauthenticated("a call from a peer gate names no project or principal");
+            return Box::pin(async move { Ok(status.into_http()) });
+        }
+        self.calls.with(&[op, "peer"]).inc();
+        req.headers_mut().remove(http::header::AUTHORIZATION);
+        req.extensions_mut().insert(Peer);
+        self.serve(to, req)
+    }
+
+    fn serve(
+        &mut self,
+        to: To,
+        req: http::Request<Body>,
+    ) -> BoxFuture<http::Response<Body>, Infallible> {
         match to {
             To::Cells => Box::pin(self.cells.call(req)),
             To::Verify => Box::pin(self.verify.call(req)),

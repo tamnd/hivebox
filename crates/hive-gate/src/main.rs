@@ -101,8 +101,17 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .map_err(|e| std::io::Error::new(e.kind(), format!("listening on {}: {e}", cfg.listen)))?;
+    let peers = match cfg.peer_listen {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("listening for peer gates on {addr}: {e}"))
+        })?),
+        None => None,
+    };
     let stop = CancellationToken::new();
-    let nodes = Nodes::new(hive_scout::follow(cfg.scout.clone(), stop.clone()));
+    let mut nodes = Nodes::new(hive_scout::follow(cfg.scout.clone(), stop.clone()));
+    if let Some(unit) = cfg.unit {
+        nodes = nodes.with_units(unit, &cfg.units).map_err(std::io::Error::other)?;
+    }
     let keys = hive_gate::Keys::new(cfg.keys);
     if !cfg.keeper.is_empty() {
         hive_gate::keys::follow(keys.clone(), &cfg.keeper, stop.clone())
@@ -147,7 +156,20 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         cfg.listen,
         cfg.scout
     );
-    let served = hive_gate::serve(gate, listener, stop).await;
+    if let Some(unit) = cfg.unit {
+        let others: Vec<String> = cfg.units.iter().map(|(u, a)| format!("{u} at {a}")).collect();
+        let peer = cfg.peer_listen.map_or_else(String::new, |a| format!(", peer gates on {a}"));
+        eprintln!("hive-gate: unit {unit}, other units: [{}]{peer}", others.join(", "));
+    }
+    let served = match peers {
+        // Either failing stops the gate.
+        Some(p) => tokio::try_join!(
+            hive_gate::serve(gate.for_peers(), p, stop.clone()),
+            hive_gate::serve(gate, listener, stop)
+        )
+        .map(drop),
+        None => hive_gate::serve(gate, listener, stop).await,
+    };
     if let Some(q) = quotas {
         // So the other gates can have this one's shares now rather than when they run out.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), q.give_back()).await;
