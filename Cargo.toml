@@ -55,7 +55,7 @@ hivectl = { version = "=0.0.41", path = "crates/hivectl" }
 # Third party crates. Versions are bumped by dependabot in groups, and a new one here needs a line
 # in the pull request saying why the standard library or an existing one is not enough.
 aya = { version = "0.14", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 # Capability tokens that holders can narrow down offline and the gate checks with a public key.
 biscuit-auth = { version = "6", default-features = false, features = ["datalog-macro"] }
 blake3 = "1.8"
