@@ -142,7 +142,8 @@ class VerifyResult:
     `not_passed` is those of `must_pass` the last report did not show passing. `error` is why the
     check could not be done, if it could not, in which case `passed` says nothing about the
     subject. `scores` has the test counts from the report, or pytest's summary line without one,
-    the diff's size and how long each step took in milliseconds."""
+    the diff's size and how long each step took in milliseconds. With a grader, `reward` is its
+    reward and `grade_detail` what it said, or `grade_error` is why it gave none."""
 
     passed: bool
     exit_code: int
@@ -153,6 +154,9 @@ class VerifyResult:
     runs_passed: int
     error: _errors.HiveError | None
     not_passed: list[str] = field(default_factory=list)
+    reward: float | None = None
+    grade_detail: str = ""
+    grade_error: str = ""
 
     @classmethod
     def _from(cls, r) -> VerifyResult:
@@ -160,8 +164,9 @@ class VerifyResult:
         if r.HasField("error"):
             err = _errors.make(r.error.reason, r.error.message, is_infra_error=r.error.is_infra_error,
                                errno_name=r.error.errno or None)
+        reward = r.reward if r.HasField("reward") else None
         return cls(r.passed, r.exit_code, r.output, dict(r.scores), list(r.tampered), r.flaky, r.runs_passed, err,
-                   list(r.not_passed))
+                   list(r.not_passed), reward, r.grade_detail, r.grade_error)
 
     @property
     def is_infra_error(self) -> bool:
@@ -334,7 +339,8 @@ class AsyncHive:
     async def verify(self, argv: Sequence[str], *, verifier: Spec, workdir: str, subject: Cell | str | None = None,
                      protected_paths: Iterable[str] = (), files: Mapping[str, bytes | str] | None = None,
                      repeats: int = 1, timeout: float | str | None = None, report: str | None = None,
-                     must_pass: Iterable[str] = ()) -> VerifyResult:
+                     must_pass: Iterable[str] = (), grader: str | None = None, task: bytes | str = b"",
+                     grader_files: Iterable[str] = ()) -> VerifyResult:
         """Checks the changes `subject` made to the git checkout at `workdir` in a fresh cell
         made from `verifier`, with no network, and runs `argv` there `repeats` times. Changes to
         `protected_paths`, globs like tests/** under `workdir`, are left out and reported in
@@ -343,7 +349,9 @@ class AsyncHive:
         for each run. With `report`, the path of a JUnit report `argv` writes, as with pytest's
         --junitxml, a run passes only when the report is there with no test failed and every test
         in `must_pass`, pytest node ids, passed. Without one, a sys.exit(0) in the code under test
-        passes on its exit code alone. A check that could not be done returns with
+        passes on its exit code alone. `grader` names a reward plugin on the node, which is given
+        every run's output, `task` and the files in `grader_files` as they were after the last run,
+        and whose reward comes back in `reward`. A check that could not be done returns with
         `error` set rather than raising, unless the request itself was wrong."""
         if isinstance(argv, str):
             raise _errors.InvalidArgument("argv is a list, like [\"bash\", \"-c\", script]")
@@ -359,6 +367,9 @@ class AsyncHive:
             timeout=_seconds(timeout),
             report=report or "",
             must_pass=list(must_pass),
+            grader=grader or "",
+            task=task.encode() if isinstance(task, str) else task,
+            grader_files=list(grader_files),
         )
         return VerifyResult._from(await self._call(self._verify.Run, req))
 

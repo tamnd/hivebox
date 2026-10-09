@@ -22,7 +22,7 @@ hive-proto.workspace = true
 hive-types.workspace = true
 rustix = { workspace = true, features = ["time"] }
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt", "sync", "time"] }
-wasmtime = { workspace = true, features = ["async", "cranelift", "parallel-compilation", "pooling-allocator", "runtime", "std"] }
+wasmtime = { workspace = true, features = ["async", "component-model", "cranelift", "parallel-compilation", "pooling-allocator", "runtime", "std"] }
 wasmtime-wasi = { workspace = true, features = ["preview1"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

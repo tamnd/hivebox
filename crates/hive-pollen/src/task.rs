@@ -127,6 +127,17 @@ pub struct Verify {
     /// A sample that changed a protected path gets no reward even when the tests pass.
     #[serde(default = "yes")]
     pub zero_on_tamper: bool,
+    /// A reward plugin on the node whose reward the sample gets instead of 1 for passing and 0
+    /// for not. A sample it could not grade gets none.
+    #[serde(default)]
+    pub grader: Option<String>,
+    /// The grader's task data, such as the expected answer.
+    #[serde(default)]
+    pub task: String,
+    /// Files the grader is given from the verifier cell after the tests. A relative path is
+    /// under the workdir.
+    #[serde(default)]
+    pub grader_files: Vec<String>,
 }
 
 const fn one() -> u32 {

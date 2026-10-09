@@ -41,6 +41,16 @@ message VerifyRequest {
   // Tests the report has to show passing, as pytest node ids like tests/test_a.py::test_b, or as
   // the report names them, the class name and the name joined by a dot.
   repeated string must_pass = 10;
+  // A reward plugin on the node to grade the runs with, a component of the world
+  // hivebox:reward/grader named <grader>.wasm in the node's graders dir. It is given every run's
+  // output, `task`, the files in `grader_files` and whether the runs passed, and its reward comes
+  // back in the result. Empty for none.
+  string grader = 11;
+  // Data for the grader, such as the expected answer, in whatever form it reads.
+  bytes task = 12;
+  // Files the grader is given, read from the verifier cell after the last run. A relative path
+  // is under `workdir`.
+  repeated string grader_files = 13;
 }
 
 message VerifyResult {
@@ -65,4 +75,10 @@ message VerifyResult {
   // The tests in `must_pass` the last run's report did not show passing, or all of them when it
   // left no report.
   repeated string not_passed = 9;
+  // The grader's reward, when one was asked for and it gave one.
+  optional double reward = 10;
+  // What the grader said about its reward.
+  string grade_detail = 11;
+  // Why the grader gave no reward: it returned an error, trapped or ran out of time.
+  string grade_error = 12;
 }

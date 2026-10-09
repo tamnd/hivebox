@@ -12,6 +12,10 @@
 //! An exit code is easy for the subject to fake, with a `sys.exit(0)` in the code the tests load.
 //! A verify that names a JUnit report passes a run only on what the report says, and a run cut
 //! short leaves none.
+//!
+//! A verify can name a grader, a reward plugin on the node, to turn what the runs did into a
+//! reward. It is given every run's output, the caller's task data and the files asked for, and
+//! runs after the verifier cell is stopped, in the comb, with its own memory and time limits.
 
 use super::junit::{self, Verdict};
 use super::{Api, Args, Call, invalid, millis, parse_id, status};
@@ -37,6 +41,10 @@ const OUTPUT_TAIL: usize = 64 << 10;
 const MAX_REPORT: usize = 16 << 20;
 /// The most runs one call may ask for.
 const MAX_REPEATS: u32 = 16;
+/// The most files one call may hand its grader.
+const MAX_GRADER_FILES: usize = 64;
+/// The biggest file a grader is handed.
+const MAX_GRADER_FILE: usize = 16 << 20;
 /// Takes the diff with an index of its own, so the subject's staged changes count the same as
 /// unstaged ones and its own index is not touched.
 const TAKE_DIFF: &str = r#"set -e
@@ -68,6 +76,13 @@ impl Verify for Api {
             .num(r.repeats.into())
             .str(&r.report)
             .strs(&r.must_pass);
+        // Only a call that asks for a grader hashes its fields, so the calls before there were
+        // graders hash the same as they did.
+        let args = if r.grader.is_empty() && r.task.is_empty() && r.grader_files.is_empty() {
+            args
+        } else {
+            args.str(&r.grader).bytes(&r.task).strs(&r.grader_files)
+        };
         let job = async {
             let subject = match r.subject_cell_id.as_str() {
                 "" => None,
@@ -91,6 +106,18 @@ impl Verify for Api {
             }
             if r.repeats > MAX_REPEATS {
                 return Err(invalid(format!("at most {MAX_REPEATS} repeats")));
+            }
+            if r.grader.is_empty() && (!r.task.is_empty() || !r.grader_files.is_empty()) {
+                return Err(invalid("task and grader_files are for a grader, and none is named"));
+            }
+            if r.grader_files.len() > MAX_GRADER_FILES {
+                return Err(invalid(format!("at most {MAX_GRADER_FILES} grader files")));
+            }
+            if r.workdir.is_empty() && r.grader_files.iter().any(|p| !p.starts_with('/')) {
+                return Err(invalid("a relative grader file needs a workdir"));
+            }
+            if !r.grader.is_empty() {
+                self.graders().map_err(status)?.check(&r.grader).await.map_err(status)?;
             }
             let mut spec =
                 convert::spec_from_v1(r.verifier.clone().unwrap_or_default()).map_err(status)?;
@@ -134,6 +161,10 @@ struct Done {
     /// What the last run's report said, when one was asked for.
     report: Option<Verdict>,
     tampered: Vec<String>,
+    /// Every run, kept only for a grader.
+    runs: Vec<drone::RunResult>,
+    /// The files the grader asked for, as they were after the last run.
+    files: Vec<(String, Option<Vec<u8>>)>,
 }
 
 impl Job<'_> {
@@ -166,7 +197,17 @@ impl Job<'_> {
         match result {
             Ok(mut done) => {
                 done.tampered = tampered;
-                self.result(done)
+                let grade = self.grade(&mut done).await;
+                let mut result = self.result(done);
+                match grade {
+                    Some(Ok((reward, detail))) => {
+                        result.reward = Some(reward);
+                        result.grade_detail = detail;
+                    }
+                    Some(Err(e)) => result.grade_error = e,
+                    None => {}
+                }
+                result
             }
             Err(e) => failed(e, tampered, self.scores),
         }
@@ -218,6 +259,8 @@ impl Job<'_> {
         let mut report = None;
         let report_path = (!self.req.report.is_empty()).then(|| self.path(&self.req.report));
         let repeats = self.req.repeats.max(1);
+        let grading = !self.req.grader.is_empty();
+        let mut runs = Vec::new();
         for _ in 0..repeats {
             if let Some(path) = &report_path {
                 let gone = drone::FsPath { path: path.clone(), ..Default::default() };
@@ -247,9 +290,23 @@ impl Job<'_> {
                 report = Some(verdict);
             }
             runs_passed += u32::from(passed);
+            if grading {
+                runs.push(out.clone());
+            }
             last = Some(out);
         }
         self.time("run", t);
+        let mut files = Vec::with_capacity(self.req.grader_files.len());
+        for path in &self.req.grader_files {
+            let read = drone::FsRead { path: self.path(path), offset: 0, length: 0 };
+            let data = match drone.fs_read(&read, MAX_GRADER_FILE).await {
+                Ok(data) => Some(data.to_vec()),
+                // A file that is not there, or too big, is the run's doing.
+                Err(e) if !e.reason.is_infra() => None,
+                Err(e) => return Err(e),
+            };
+            files.push((path.clone(), data));
+        }
         Ok(Done {
             passed: runs_passed == repeats,
             flaky: runs_passed != 0 && runs_passed != repeats,
@@ -257,7 +314,47 @@ impl Job<'_> {
             last,
             report,
             tampered: Vec::new(),
+            runs,
+            files,
         })
+    }
+
+    /// What the grader made of the runs, when one was asked for.
+    #[cfg(target_os = "linux")]
+    async fn grade(&mut self, done: &mut Done) -> Option<Result<(f64, String), String>> {
+        if self.req.grader.is_empty() {
+            return None;
+        }
+        let input = hive_cell_wasm::Input {
+            task: self.req.task.to_vec(),
+            runs: std::mem::take(&mut done.runs)
+                .into_iter()
+                .map(|r| hive_cell_wasm::Run {
+                    exit_code: if r.timed_out || r.signal != 0 { -1 } else { r.exit_code },
+                    timed_out: r.timed_out,
+                    stdout: r.stdout.to_vec(),
+                    stderr: r.stderr.to_vec(),
+                    wall_ms: r.wall_nanos / 1_000_000,
+                })
+                .collect(),
+            files: std::mem::take(&mut done.files),
+            passed: done.passed,
+            tampered: done.tampered.clone(),
+        };
+        let t = Instant::now();
+        let graders = match self.api.graders() {
+            Ok(g) => g,
+            Err(e) => return Some(Err(e.message)),
+        };
+        let grade = graders.score(&self.req.grader, input).await;
+        self.time("grade", t);
+        Some(grade.unwrap_or_else(|e| Err(e.message)).map(|g| (g.reward, g.detail)))
+    }
+
+    /// Off Linux there are no graders, and a call that names one is refused before it gets here.
+    #[cfg(not(target_os = "linux"))]
+    async fn grade(&mut self, _: &mut Done) -> Option<Result<(f64, String), String>> {
+        None
     }
 
     /// `path` in the verifier, a relative one being under the workdir.
@@ -318,6 +415,7 @@ impl Job<'_> {
             flaky: done.flaky,
             runs_passed: done.runs_passed,
             not_passed,
+            ..Default::default()
         }
     }
 }

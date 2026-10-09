@@ -1,0 +1,50 @@
+package hivebox:reward@0.1.0;
+
+/// Grades one verification. A grader imports nothing, so it sees only what it is given and the
+/// same input always gets the same grade.
+interface score {
+    /// One run of the verifier's command.
+    record run {
+        /// Its exit code, or -1 when a signal or its timeout ended it.
+        exit-code: s32,
+        /// Its timeout ended it.
+        timed-out: bool,
+        /// What it wrote, as much as the node kept.
+        stdout: list<u8>,
+        stderr: list<u8>,
+        /// How long it ran, in milliseconds.
+        wall-ms: u64,
+    }
+
+    /// What a grader is given.
+    record input {
+        /// The task's own data as the caller sent it, such as the expected answer. Its form is
+        /// up to the grader.
+        task: list<u8>,
+        /// Every run, in order.
+        runs: list<run>,
+        /// The files the caller asked for, read from the verifier cell after the last run, by
+        /// the path the caller gave. A file that was not there has none.
+        files: list<tuple<string, option<list<u8>>>>,
+        /// Every run passed, by its exit code and by its report when the caller named one.
+        passed: bool,
+        /// The protected paths the subject changed.
+        tampered: list<string>,
+    }
+
+    /// A grade.
+    record grade {
+        /// The reward. Any finite number.
+        reward: f64,
+        /// Anything the grader wants to say about it, kept with the result.
+        detail: string,
+    }
+
+    /// Grades `input`. An error says the grader could not grade it, and gives no reward.
+    score: func(input: input) -> result<grade, string>;
+}
+
+/// A reward plugin.
+world grader {
+    export score;
+}

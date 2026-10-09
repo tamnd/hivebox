@@ -136,6 +136,8 @@ impl Worker {
             }
         }
         tr.timings.agent_ms = ms(t.elapsed());
+        // The grader's reward, or none when it could not grade, once the tests have run.
+        let mut graded = None;
         if let Some(e) = failure {
             tr.end = "error";
             set_error(&mut tr, &e);
@@ -143,6 +145,12 @@ impl Worker {
             let t = Instant::now();
             match self.client.verify(verify_request(task, cell.id())).await {
                 Ok(r) => {
+                    if r.error.is_none() {
+                        graded = Some(r.reward);
+                        if !r.grade_error.is_empty() {
+                            tr.error = Some(format!("grader: {}", r.grade_error));
+                        }
+                    }
                     if let Some(e) = &r.error {
                         tr.error = Some(format!("{}: {}", e.reason, e.message));
                         tr.is_infra_error = e.is_infra_error;
@@ -155,6 +163,7 @@ impl Worker {
                         exit_code: r.exit_code,
                         scores: r.scores.into_iter().collect(),
                         output: trajectory::tail(&r.output, b""),
+                        grade_detail: r.grade_detail,
                     });
                 }
                 Err(e) => set_error(&mut tr, &e),
@@ -169,6 +178,11 @@ impl Worker {
             !tr.tampered.is_empty(),
             task.verify.zero_on_tamper,
         );
+        // A grader's reward stands in for passing, and a sample it could not grade gets none.
+        if let (Some(_), Some(graded)) = (&task.verify.grader, graded) {
+            let zero = !tr.tampered.is_empty() && task.verify.zero_on_tamper;
+            tr.reward = graded.map(|r| if zero { 0.0 } else { r });
+        }
         tr
     }
 }
@@ -223,6 +237,9 @@ fn verify_request(task: &Task, subject: &str) -> v1::VerifyRequest {
         repeats: v.repeats,
         report: v.report.clone().unwrap_or_default(),
         must_pass: v.must_pass.clone(),
+        grader: v.grader.clone().unwrap_or_default(),
+        task: v.task.clone().into_bytes().into(),
+        grader_files: v.grader_files.clone(),
     }
 }
 
@@ -270,6 +287,7 @@ mod tests {
         );
         assert_eq!(r.timeout.unwrap().seconds, 30);
         assert_eq!(&r.files["hidden.py"][..], b"assert 1\n");
+        assert!(r.grader.is_empty() && r.task.is_empty() && r.grader_files.is_empty());
         let res = r.verifier.unwrap().resources.unwrap();
         assert_eq!((res.mem_mib, res.vcpu_milli), (2048, 2000));
     }

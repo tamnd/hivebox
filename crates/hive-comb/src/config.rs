@@ -92,6 +92,13 @@ pub struct Config {
     /// on top of the caller's own. By default these are the files that set up a test run and not
     /// the tests, which a change could use to make every test pass. `[verify] protected_paths`.
     pub protected_paths: Vec<String>,
+    /// Where the reward plugins a verification may name are, each a component named
+    /// `<name>.wasm`. `[verify] graders`, by default `graders` in the data dir.
+    pub graders: PathBuf,
+    /// The longest one grade may take. `[verify] grader_timeout`.
+    pub grader_timeout: Duration,
+    /// The most memory one grade may have, in MiB. `[verify] grader_mem_mib`.
+    pub grader_mem_mib: u64,
     /// The container backend.
     pub container: ContainerBackend,
     /// The wasm backend.
@@ -361,6 +368,9 @@ impl Default for Config {
             audit_dir: Some(PathBuf::from("/var/lib/hivebox/audit")),
             audit_sync_gap: hive_telemetry::audit::SYNC_GAP,
             protected_paths: PROTECTED_PATHS.iter().map(|&p| p.to_owned()).collect(),
+            graders: PathBuf::from("/var/lib/hivebox/graders"),
+            grader_timeout: Duration::from_secs(10),
+            grader_mem_mib: 256,
             container: ContainerBackend::default(),
             fncall: FncallBackend::default(),
             images: Images::default(),
@@ -404,6 +414,9 @@ impl Config {
     ///
     /// [verify]
     /// protected_paths = ["**/conftest.py", "tests/**"]
+    /// graders = "/var/lib/hivebox/graders"
+    /// grader_timeout = "10s"
+    /// grader_mem_mib = 256
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -535,8 +548,21 @@ impl Config {
             }
             c.cpu_burst_tenths = (v * 10.0).round() as u32;
         }
-        if let Some(p) = file.verify.protected_paths {
+        let v = file.verify;
+        if let Some(p) = v.protected_paths {
             c.protected_paths = p;
+        }
+        c.graders = v.graders.unwrap_or_else(|| c.data_dir.join("graders"));
+        if let Some(t) = v.grader_timeout {
+            c.grader_timeout = duration(&t).filter(|d| !d.is_zero()).ok_or_else(|| {
+                format!("verify.grader_timeout = {t:?} is not a duration like 10s")
+            })?;
+        }
+        if let Some(m) = v.grader_mem_mib {
+            if !(1..=4096).contains(&m) {
+                return Err(format!("verify.grader_mem_mib = {m} must be from 1 to 4096"));
+            }
+            c.grader_mem_mib = m;
         }
         let l = file.lifecycle;
         for (field, value, name) in [
@@ -855,6 +881,9 @@ struct LifecycleFile {
 #[serde(default, deny_unknown_fields)]
 struct VerifyFile {
     protected_paths: Option<Vec<String>>,
+    graders: Option<PathBuf>,
+    grader_timeout: Option<String>,
+    grader_mem_mib: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -914,6 +943,22 @@ mod tests {
         let c = Config::from_toml("[verify]\nprotected_paths = []").unwrap();
         assert!(c.protected_paths.is_empty());
         assert!(Config::from_toml("[verify]\nprotected = []").is_err());
+    }
+
+    #[test]
+    fn graders_follow_the_data_dir_and_their_limits_are_checked() {
+        let c = Config::from_toml("[node]\ndata_dir = \"/srv/hive\"").unwrap();
+        assert_eq!(c.graders, PathBuf::from("/srv/hive/graders"));
+        assert_eq!((c.grader_timeout, c.grader_mem_mib), (Duration::from_secs(10), 256));
+        let c = Config::from_toml(
+            "[verify]\ngraders = \"/g\"\ngrader_timeout = \"500ms\"\ngrader_mem_mib = 64",
+        )
+        .unwrap();
+        assert_eq!(c.graders, PathBuf::from("/g"));
+        assert_eq!((c.grader_timeout, c.grader_mem_mib), (Duration::from_millis(500), 64));
+        assert!(Config::from_toml("[verify]\ngrader_timeout = \"0s\"").is_err());
+        assert!(Config::from_toml("[verify]\ngrader_mem_mib = 0").is_err());
+        assert!(Config::from_toml("[verify]\ngrader_mem_mib = 5000").is_err());
     }
 
     #[test]
