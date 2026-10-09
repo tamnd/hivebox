@@ -65,7 +65,7 @@ jobs:
             echo "CHANGELOG.md has no section for ${TAG#v}"
             exit 1
           }
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
       - run: cargo xtask ci
@@ -124,7 +124,7 @@ jobs:
           path: dist
       # One CycloneDX document for everything in the release. Syft reads the dependency list that
       # cargo-auditable embedded, so the SBOM describes the binaries rather than the lockfile.
-      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: dist
           format: cyclonedx-json
