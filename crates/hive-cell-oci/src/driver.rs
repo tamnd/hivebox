@@ -505,6 +505,12 @@ impl CellDriver for OciDriver {
             if cgroup::frozen(&h.cgroup).unwrap_or(false) {
                 return Ok(Liveness::Paused);
             }
+            // The cgroup is on memory.oom.group, so one OOM kill takes the whole cell, and its
+            // init can still be here for a moment after the drone has gone.
+            if cgroup::oom_kills(&h.cgroup) > 0 {
+                let exit = ExitInfo { signal: Some(9), oom: true, ..ExitInfo::default() };
+                return Ok(Liveness::Gone(exit));
+            }
             Ok(Liveness::Alive)
         })
     }

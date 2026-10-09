@@ -34,6 +34,8 @@ pub struct Guest {
     pub reclaimed: bool,
     pub trims: u32,
     pub exit: Option<ExitInfo>,
+    // Killed for its memory, with its init not reaped yet, so it still looks alive.
+    pub oom: bool,
 }
 
 impl Guest {
@@ -75,6 +77,18 @@ impl Fake {
     /// The channel drops but the cell lives on.
     pub fn cut(&self, id: CellId) {
         self.with(id, Guest::cut_links);
+    }
+
+    /// The OOM killer takes the whole cell, the drone with it, but the cell has not been reaped
+    /// yet when the comb looks.
+    pub fn oom(&self, id: CellId) {
+        self.with(id, |g| {
+            if let Some(l) = g.listener.take() {
+                l.abort();
+            }
+            g.cut_links();
+            g.oom = true;
+        });
     }
 
     pub fn live(&self) -> usize {
@@ -122,6 +136,7 @@ impl CellDriver for Fake {
                 reclaimed: false,
                 trims: 0,
                 exit: None,
+                oom: false,
             };
             self.guests.lock().unwrap().insert(id, guest);
             Ok(CellHandle {
@@ -227,7 +242,11 @@ impl CellDriver for Fake {
         Box::pin(async move {
             self.stops.fetch_add(1, Ordering::Relaxed);
             let exit = self.guests.lock().unwrap().remove(&h.id).map(|mut g| {
-                let exit = g.exit.unwrap_or(ExitInfo { signal: Some(9), ..ExitInfo::default() });
+                let exit = g.exit.unwrap_or(ExitInfo {
+                    signal: Some(9),
+                    oom: g.oom,
+                    ..ExitInfo::default()
+                });
                 g.end(exit);
                 exit
             });
