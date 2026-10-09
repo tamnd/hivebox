@@ -94,6 +94,8 @@ pub struct Config {
     pub protected_paths: Vec<String>,
     /// The container backend.
     pub container: ContainerBackend,
+    /// The wasm backend.
+    pub fncall: FncallBackend,
     /// Where images come from.
     pub images: Images,
     /// How cells reach the network.
@@ -278,6 +280,35 @@ impl Default for ContainerBackend {
     }
 }
 
+/// How the comb runs wasm cells, which are WASI programs on wasmtime in the comb itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FncallBackend {
+    /// On adds the backend where the node can run it. It is off by default.
+    pub enabled: bool,
+    /// Where the programs are, each a WASI command module named `<name>.wasm`, and a cell's
+    /// image is the name of the program its commands run. `data_dir/wasm` by default.
+    pub modules: PathBuf,
+    /// Host directories every wasm cell sees read only, by the absolute path they have in the
+    /// cell.
+    pub mounts: BTreeMap<String, PathBuf>,
+    /// How many programs may run at once over all wasm cells.
+    pub instances: u32,
+    /// The most memory a wasm cell may ask for, in MiB, up to 4096.
+    pub max_mem_mib: u64,
+}
+
+impl Default for FncallBackend {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            modules: PathBuf::from("/var/lib/hivebox/wasm"),
+            mounts: BTreeMap::new(),
+            instances: 1000,
+            max_mem_mib: 4096,
+        }
+    }
+}
+
 /// The files a verification leaves out of the diff by default: what pytest reads before it runs a
 /// test, and what pip installed. `pyproject.toml` is not one, since fixes change it too.
 pub(crate) const PROTECTED_PATHS: [&str; 7] = [
@@ -331,6 +362,7 @@ impl Default for Config {
             audit_sync_gap: hive_telemetry::audit::SYNC_GAP,
             protected_paths: PROTECTED_PATHS.iter().map(|&p| p.to_owned()).collect(),
             container: ContainerBackend::default(),
+            fncall: FncallBackend::default(),
             images: Images::default(),
             network: Network::default(),
             scout: None,
@@ -386,6 +418,11 @@ impl Config {
     /// [backends.container]
     /// drone = "/usr/lib/hivebox/hive-drone"
     /// workers = 8
+    ///
+    /// [backends.fncall]
+    /// enabled = true
+    /// modules = "/var/lib/hivebox/wasm"
+    /// max_mem_mib = 2048
     ///
     /// [network]
     /// cells = "100.64.16.0/20"
@@ -538,6 +575,26 @@ impl Config {
         }
         if b.uid_count == 0 || b.uid_base.checked_add(b.uid_count).is_none() {
             return Err("backends.container ids run past the last uid".into());
+        }
+        let k = file.backends.fncall;
+        let b = &mut c.fncall;
+        set(&mut b.enabled, k.enabled);
+        b.modules = k.modules.unwrap_or_else(|| c.data_dir.join("wasm"));
+        set(&mut b.instances, k.instances);
+        set(&mut b.max_mem_mib, k.max_mem_mib);
+        for (guest, host) in k.mounts {
+            if !guest.starts_with('/') || guest == "/" || !host.is_absolute() {
+                return Err(format!(
+                    "backends.fncall.mounts {guest:?} has to be an absolute path below /, from an absolute one"
+                ));
+            }
+            b.mounts.insert(guest, host);
+        }
+        if b.instances == 0 {
+            return Err("backends.fncall.instances must not be 0".into());
+        }
+        if !(1..=4096).contains(&b.max_mem_mib) {
+            return Err("backends.fncall.max_mem_mib has to be from 1 to 4096".into());
         }
         let i = file.images;
         if let Some(store) = i.store {
@@ -805,6 +862,17 @@ struct VerifyFile {
 struct BackendsFile {
     create_limit: BTreeMap<String, usize>,
     container: ContainerFile,
+    fncall: FncallFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FncallFile {
+    enabled: Option<bool>,
+    modules: Option<PathBuf>,
+    mounts: BTreeMap<String, PathBuf>,
+    instances: Option<u32>,
+    max_mem_mib: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1030,6 +1098,30 @@ mod tests {
             ("[network.llm]\nlabel = \"a b\"", "not a label key"),
             ("[network.llm]\ntimeout = \"0s\"", "network.llm.timeout"),
             ("[node]\nlisten = \"0.0.0.0:7400\"\n[keeper]\nmembers = [\"a:1\"]", "scout.advertise"),
+        ] {
+            let e = Config::from_toml(text).unwrap_err();
+            assert!(e.contains(says), "{text}: {e}");
+        }
+    }
+
+    #[test]
+    fn wasm_cells_are_off_until_asked_for_and_their_programs_follow_the_data_dir() {
+        let c = Config::from_toml("").unwrap();
+        assert_eq!(c.fncall, FncallBackend::default());
+        let c = Config::from_toml(
+            "[node]\ndata_dir = \"/srv/hive\"\n[backends.fncall]\nenabled = true\nmax_mem_mib = 512\n\
+             [backends.fncall.mounts]\n\"/usr/lib/python\" = \"/opt/py\"",
+        )
+        .unwrap();
+        assert!(c.fncall.enabled);
+        assert_eq!(c.fncall.modules, PathBuf::from("/srv/hive/wasm"));
+        assert_eq!(c.fncall.max_mem_mib, 512);
+        assert_eq!(c.fncall.mounts["/usr/lib/python"], PathBuf::from("/opt/py"));
+        for (text, says) in [
+            ("[backends.fncall]\ninstances = 0", "instances"),
+            ("[backends.fncall]\nmax_mem_mib = 8192", "max_mem_mib"),
+            ("[backends.fncall.mounts]\n\"/\" = \"/opt\"", "mounts"),
+            ("[backends.fncall.mounts]\n\"/a\" = \"opt\"", "mounts"),
         ] {
             let e = Config::from_toml(text).unwrap_err();
             assert!(e.contains(says), "{text}: {e}");

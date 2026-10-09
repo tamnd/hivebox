@@ -9,7 +9,7 @@ pub(crate) const HEAD: usize = 64 * 1024;
 /// middle. A build log that runs to a gigabyte still shows the command line at the top and the
 /// error at the bottom, and memory stays bounded.
 #[derive(Debug)]
-pub(crate) struct Ring {
+pub struct Ring {
     head_cap: usize,
     tail_cap: usize,
     head: Vec<u8>,
@@ -21,7 +21,8 @@ pub(crate) struct Ring {
 
 impl Ring {
     /// A ring that keeps at most `limit` bytes.
-    pub(crate) fn new(limit: usize) -> Self {
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
         let head_cap = HEAD.min(limit / 2);
         Self {
             head_cap,
@@ -33,7 +34,8 @@ impl Ring {
         }
     }
 
-    pub(crate) fn push(&mut self, mut data: &[u8]) {
+    /// Adds `data` at the end.
+    pub fn push(&mut self, mut data: &[u8]) {
         self.total += data.len() as u64;
         if self.head.len() < self.head_cap {
             let n = (self.head_cap - self.head.len()).min(data.len());
@@ -65,17 +67,19 @@ impl Ring {
     }
 
     /// Bytes written so far, kept or not.
-    pub(crate) fn total(&self) -> u64 {
+    #[must_use]
+    pub fn total(&self) -> u64 {
         self.total
     }
 
     /// Whether anything was dropped.
-    pub(crate) fn truncated(&self) -> bool {
+    #[must_use]
+    pub fn truncated(&self) -> bool {
         self.total > (self.head.len() + self.tail.len()) as u64
     }
 
     /// What was kept, in order.
-    pub(crate) fn take(&mut self) -> Bytes {
+    pub fn take(&mut self) -> Bytes {
         let mut out = std::mem::take(&mut self.head);
         out.reserve(self.tail.len());
         out.extend_from_slice(&self.tail[self.pos..]);

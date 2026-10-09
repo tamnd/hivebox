@@ -23,5 +23,6 @@ pub use client::{
     ArchiveReader, ArchiveWriter, Client, FileReader, FileWriter, Output, Process, ProcessInput,
     ProcessOutput, Watcher,
 };
-pub use config::Config;
+pub use config::{Config, Runner};
+pub use ring::Ring;
 pub use server::Drone;

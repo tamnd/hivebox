@@ -21,6 +21,10 @@ updates:
         update-types: ["patch"]
       minor:
         update-types: ["minor"]
+    ignore:
+      # Its long term support line, held until the MSRV reaches the next one.
+      - dependency-name: "wasmtime*"
+        update-types: ["version-update:semver-major"]
 
   # Actions are pinned to commit SHAs, so something has to move them. This moves the SHA and the
   # version comment beside it together.

@@ -491,7 +491,11 @@ impl Resolved {
             })?;
         let rel = full.strip_prefix(root).unwrap_or(Path::new("")).to_path_buf();
         let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let root = rustix::fs::open(root, flags, Mode::empty()).map_err(|e| {
+        let host = match &cfg.base {
+            Some(base) => base.join(root.strip_prefix("/").unwrap_or(root)),
+            None => root.clone(),
+        };
+        let root = rustix::fs::open(&host, flags, Mode::empty()).map_err(|e| {
             Error::new(Reason::Internal, format!("the root {}: {}", root.display(), e))
         })?;
         Ok(Self { root, rel })

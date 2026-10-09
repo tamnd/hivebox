@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Wasm cells. With `[backends.fncall] enabled = true` the comb runs WASI command modules on wasmtime as `fncall` cells. A cell's image names its program in `data_dir/wasm`, the first word of each command picks the program, and files and runs go through the same API as for other cells. A cell's `mem_mib` caps its program's memory, and a timeout cuts a busy program off within 10 ms. On a loaded host a wasm cell was created in 44.7 ms at the median against 125.5 ms for a container cell, and CPython for WASI ran a CPU bound loop about 6 times slower than python in a container.
+
 ## 0.0.37
 
 Cloud bursting and an offline rebalancer.

@@ -1,4 +1,9 @@
+use futures::future::BoxFuture;
+use hive_proto::drone::api::{RunRequest, RunResult};
+use hive_types::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How the drone runs commands. The defaults suit a cell image with a shell at `/bin/sh`.
@@ -27,6 +32,18 @@ pub struct Config {
     pub max_output: usize,
     /// Reported in health answers and the handshake.
     pub build: String,
+    /// Where `/` is, for a drone that serves a cell from outside it, as the node does for wasm
+    /// cells. File paths, `roots` and `workdir` are then all paths under it.
+    pub base: Option<PathBuf>,
+    /// Runs `process.run` in place of a process, for a cell whose programs are not processes.
+    /// With one set, streamed processes and sessions are refused.
+    pub runner: Option<Arc<dyn Runner>>,
+}
+
+/// Runs commands for a drone whose cell has no processes of its own, such as a wasm cell.
+pub trait Runner: Send + Sync + fmt::Debug {
+    /// Runs `req` to completion.
+    fn run(&self, req: RunRequest) -> BoxFuture<'static, Result<RunResult, Error>>;
 }
 
 impl Default for Config {
@@ -51,6 +68,8 @@ impl Default for Config {
             default_output: 1 << 20,
             max_output: 64 << 20,
             build: concat!("hive-drone ", env!("CARGO_PKG_VERSION")).into(),
+            base: None,
+            runner: None,
         }
     }
 }
