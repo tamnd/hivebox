@@ -142,6 +142,19 @@ HIVE_ENDPOINT=unix:/run/hivebox/comb.sock harbor run -p tasks/ -a oracle \
 
 The cell is made from the `image` kwarg, or else the task's `docker_image`, and the node must already have that image. hivebox does not build Dockerfiles, so a task with only a Dockerfile needs its image imported first and named with `image`. A task with `network_mode = "no-network"` gets the `none` network profile, and any other gets the `network_profile` kwarg (`open` unless set). Allowlists are not supported, and Harbor turns those tasks away before they start. The task's CPUs, memory and storage become the cell's limits, unless `cpu_milli` or `mem_mib` are given. Install it with `pip install hivebox[harbor]`.
 
+## OpenEnv
+
+`hivebox.openenv` serves an OpenEnv environment where each episode is a bash shell in a fresh cell, so trainers that speak OpenEnv, such as TRL, OpenRLHF and NeMo-RL, can use hivebox through OpenEnv's own client. An action is a command, its observation is the output and exit code, and an action with `submit` ends the episode with a reward of 1.0 or 0.0.
+
+```python
+from hivebox.openenv import create_hivebox_app
+
+app = create_hivebox_app(image="swe-requests", mem_mib=2048, workdir="/testbed",
+                         check="python -m pytest -q tests/test_fix.py", max_steps=50)
+```
+
+Serve it with `uvicorn module:app` and connect with `GenericEnvClient`. With `check`, a command run in the episode's cell decides the reward. With `verify`, an argv run by `Verify.Run` on the episode's changes in a fresh cell with no network decides it, and when hivebox could not do the check the reward is None and the verdict has `infra_error` set, so a trainer can mask the sample. The verdict is in the last observation. A cell is stopped when its episode ends, when the next reset starts, or when the client closes its session, and every WebSocket session gets its own environment, up to `max_concurrent_envs`. Install it with `pip install hivebox[openenv]`.
+
 ## LLM route
 
 Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.

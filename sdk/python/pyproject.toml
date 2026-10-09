@@ -20,6 +20,7 @@ test = ["pytest>=8", "pytest-asyncio>=0.24"]
 dev = ["grpcio-tools>=1.84"]
 swerex = ["swe-rex>=1.4"]
 harbor = ["harbor>=0.24"]
+openenv = ["openenv-core>=0.3"]
 
 [project.urls]
 Repository = "https://github.com/tamnd/hivebox"
