@@ -42,6 +42,13 @@ reward = None if r.is_infra_error else float(r.passed and not r.tampered)
 
 The verifier takes the subject's diff against HEAD of the git checkout at `workdir`, leaves out changes to protected paths and lists them in `tampered`, writes `files` in and runs the command `repeats` times. `passed` is every run exiting with 0, `flaky` is the runs not agreeing, and `scores` has pytest's counts, the diff's size and how long each step took. With no subject the image is checked as it is, which is how a gold patch or a flaky test is checked. A check hivebox could not do comes back with `error` set, and `is_infra_error` says the sample should be masked rather than scored.
 
+When pass or fail is not enough, `grader` names a reward plugin on the node, a WebAssembly component in its graders dir. It gets every run's output, the `task` bytes you pass, such as the expected answer, and the files in `grader_files` as the last run left them, and its reward comes back in `r.reward`. A grader that fails leaves `reward` as None and says why in `grade_error`. The world graders implement is in `crates/hive-cell-wasm/wit/reward.wit`.
+
+```python
+r = await hive.verify(["python", "solve.py"], verifier=Spec(image="python"), workdir="/work",
+                      grader="oj-checker", task=expected_output, grader_files=["answer.txt"])
+```
+
 Every failure raises a subclass of `HiveError` named after its reason, like `CellNotFound`, with `is_infra_error` set when the failure was hivebox's and not the command's. A file that is missing raises `FileError`, which is also a `FileNotFoundError`, and the same goes for the other common errno values. Calls that are safe to repeat are tried up to three times when the failure was hivebox's.
 
 ## verl

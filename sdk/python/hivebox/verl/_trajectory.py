@@ -141,6 +141,9 @@ class Trajectory:
                     files=v.get("files"),
                     repeats=int(v.get("repeats", 1)),
                     timeout=v.get("timeout_s") or None,
+                    grader=v.get("grader"),
+                    task=v.get("task", ""),
+                    grader_files=v.get("grader_files", ()),
                 )
             except _errors.HiveError as e:
                 self.error = e
@@ -156,14 +159,19 @@ class Trajectory:
     @property
     def reward(self) -> float | None:
         """1 when the tests passed, 0 when they did not or the agent changed a protected path and
-        the task says that counts, and None when hivebox failed and the sample should be masked."""
+        the task says that counts, and None when hivebox failed and the sample should be masked.
+        With `verify.grader` in the task, the grader's reward stands in for the 1, and a sample it
+        could not grade gets None too."""
         if self.is_infra_error:
             return None
         r = self.result
         if r is None or r.error is not None:
             return 0.0
-        zero_on_tamper = (self.task.get("verify") or {}).get("zero_on_tamper", True)
-        return 1.0 if r.passed and not (r.tampered and zero_on_tamper) else 0.0
+        v = self.task.get("verify") or {}
+        tampered = bool(r.tampered) and v.get("zero_on_tamper", True)
+        if v.get("grader"):
+            return None if r.reward is None else (0.0 if tampered else r.reward)
+        return 1.0 if r.passed and not tampered else 0.0
 
     def fields(self) -> dict[str, Any]:
         """What goes in the sample's extra fields. Every sample has every key."""

@@ -44,10 +44,12 @@ Commands:
 Verifying:
   verify IMAGE [--subject ID] --workdir DIR [--protect GLOB]... [--file PATH=LOCAL]...
          [--repeats N] [--timeout DURATION] [--mem MIB] [--cpu MILLICORES]
-         [--report PATH [--must-pass TEST]...] -- ARGV...
+         [--report PATH [--must-pass TEST]...]
+         [--grader NAME [--task TEXT] [--grader-file PATH]...] -- ARGV...
          takes the subject's changes to the git checkout in DIR, minus protected paths, and
          runs ARGV on them in a fresh cell of IMAGE with no network; with --report, a run
-         passes on the JUnit report it writes at PATH, with each TEST in it passed
+         passes on the JUnit report it writes at PATH, with each TEST in it passed; with
+         --grader, the node's reward plugin NAME grades the runs, given TEXT and each PATH
 
 Files:
   cat ID PATH
@@ -340,6 +342,9 @@ async fn verify(client: &Client, args: &Args) -> Result<i32, String> {
         "--cpu",
         "--report",
         "--must-pass",
+        "--grader",
+        "--task",
+        "--grader-file",
     ])?;
     let Some((image, argv)) = args.rest.split_first().filter(|(_, a)| !a.is_empty()) else {
         return Err("verify needs an image and a command".into());
@@ -375,6 +380,9 @@ async fn verify(client: &Client, args: &Args) -> Result<i32, String> {
         repeats: number("--repeats")?.unwrap_or(1),
         report: args.one(&["--report"]).unwrap_or_default().to_string(),
         must_pass: args.all(&["--must-pass"]).into_iter().map(String::from).collect(),
+        grader: args.one(&["--grader"]).unwrap_or_default().to_string(),
+        task: args.one(&["--task"]).unwrap_or_default().as_bytes().to_vec().into(),
+        grader_files: args.all(&["--grader-file"]).into_iter().map(String::from).collect(),
     };
     let r = client.verify(req).await.map_err(err)?;
     std::io::stdout().write_all(&r.output).map_err(|e| e.to_string())?;
@@ -394,6 +402,12 @@ async fn verify(client: &Client, args: &Args) -> Result<i32, String> {
         if e.is_infra_error {
             return Ok(2);
         }
+    }
+    if let Some(reward) = r.reward {
+        eprintln!("hivectl: reward {reward} {}", r.grade_detail);
+    }
+    if !r.grade_error.is_empty() {
+        eprintln!("hivectl: no reward: {}", r.grade_error);
     }
     let verdict = if r.passed { "passed" } else { "failed" };
     let flaky = if r.flaky { ", flaky" } else { "" };

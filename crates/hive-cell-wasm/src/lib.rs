@@ -14,13 +14,18 @@
 //! cell's socket. That drone runs in the node agent and hands `process.run` to the cell's
 //! programs, and its file methods work on the cell's directory. Streamed processes and sessions
 //! are refused, since there is no process to stream and no shell to keep.
+//!
+//! [`Graders`] run reward plugins, components of the world in `wit/reward.wit` that turn what a
+//! verification saw into a reward.
 
 // The drone this leans on only builds for Linux.
 #![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 
 mod driver;
+mod grader;
 mod run;
 mod words;
 
 pub use driver::{Config, TICK, WasmDriver};
+pub use grader::{Grade, GraderConfig, Graders, Input, Run};

@@ -4,6 +4,8 @@
 #![cfg(target_os = "linux")]
 
 mod common;
+#[path = "../../hive-cell-wasm/tests/support/graders.rs"]
+mod graders;
 
 use common::*;
 use hive_comb::api;
@@ -620,6 +622,91 @@ async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
     assert_eq!(reason(&verify.run(req("p", r)).await.unwrap_err()), Reason::InvalidArgument);
     // Every verifier cell is gone, and the subject is still there.
     assert_eq!(fake.live(), 1);
+    api.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_hands_the_runs_to_a_grader_for_a_reward() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let dir = s.0.join("graders");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["fraction", "exact", "echo", "fail", "spin"] {
+        std::fs::write(dir.join(format!("{name}.wasm")), graders::component(name)).unwrap();
+    }
+    let out = s.0.join("out.txt");
+    let base = v1::VerifyRequest {
+        verifier: Some(v1_spec("python", &[])),
+        argv: vec!["sh".into(), "-c".into(), "test -e flip && echo 42; touch flip".into()],
+        workdir: s.0.to_str().unwrap().into(),
+        repeats: 3,
+        ..Default::default()
+    };
+    let mut verify = api.verify();
+
+    // A grader is checked before anything is made, and its fields need one.
+    for r in [
+        v1::VerifyRequest { grader: "none".into(), ..base.clone() },
+        v1::VerifyRequest { grader: "../exact".into(), ..base.clone() },
+        v1::VerifyRequest { task: "42\n".into(), ..base.clone() },
+        v1::VerifyRequest { grader_files: vec!["out.txt".into()], ..base.clone() },
+        v1::VerifyRequest {
+            grader: "exact".into(),
+            grader_files: vec!["out.txt".into()],
+            workdir: String::new(),
+            ..base.clone()
+        },
+    ] {
+        assert_eq!(reason(&verify.run(req("p", r)).await.unwrap_err()), Reason::InvalidArgument);
+    }
+    assert_eq!(fake.live(), 0);
+
+    // Every run goes to the grader, not only the last.
+    let r = v1::VerifyRequest { grader: "exact".into(), task: "42\n".into(), ..base.clone() };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.error.is_none(), "{:?}", got.error);
+    assert_eq!((got.reward, got.grade_detail.as_str()), (Some(1.0), "exact"));
+    assert!(got.grade_error.is_empty());
+    assert!(got.scores.contains_key("grade_ms"));
+    std::fs::remove_file(s.0.join("flip")).unwrap();
+    let r = v1::VerifyRequest { grader: "fraction".into(), ..base.clone() };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.passed);
+    assert_eq!(got.reward, Some(1.0));
+    let r = v1::VerifyRequest {
+        grader: "fraction".into(),
+        argv: vec!["sh".into(), "-c".into(), "test -e flip && exit 1; touch flip".into()],
+        ..base.clone()
+    };
+    std::fs::remove_file(s.0.join("flip")).unwrap();
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.flaky && !got.passed);
+    assert_eq!(got.reward, Some(1.0 / 3.0));
+
+    // The files asked for are read after the last run, and one that is not there is none.
+    std::fs::write(&out, "made").unwrap();
+    let r = v1::VerifyRequest {
+        grader: "echo".into(),
+        task: "the task".into(),
+        grader_files: vec!["out.txt".into(), out.to_str().unwrap().into(), "gone".into()],
+        repeats: 2,
+        ..base.clone()
+    };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert_eq!(got.reward, Some(20000.0 + 2000.0 + 300.0 + 1.0));
+    assert_eq!(got.grade_detail, "the task");
+
+    // A grader that cannot grade leaves the verdict as it was and gives no reward.
+    let r = v1::VerifyRequest { grader: "fail".into(), repeats: 1, ..base.clone() };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert!(got.error.is_none() && got.passed);
+    assert_eq!((got.reward, got.grade_error.as_str()), (None, "no answer"));
+    let r = v1::VerifyRequest { grader: "spin".into(), repeats: 1, ..base.clone() };
+    let got = verify.run(req("p", r)).await.unwrap().into_inner();
+    assert_eq!(got.reward, None);
+    assert_eq!(got.grade_error, "the grader ran past its 2s");
+    assert_eq!(fake.live(), 0);
     api.stop.cancel();
 }
 

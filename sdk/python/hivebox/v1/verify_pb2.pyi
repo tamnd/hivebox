@@ -11,7 +11,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class VerifyRequest(_message.Message):
-    __slots__ = ("subject_cell_id", "verifier", "argv", "timeout", "workdir", "protected_paths", "files", "repeats", "report", "must_pass")
+    __slots__ = ("subject_cell_id", "verifier", "argv", "timeout", "workdir", "protected_paths", "files", "repeats", "report", "must_pass", "grader", "task", "grader_files")
     class FilesEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -29,6 +29,9 @@ class VerifyRequest(_message.Message):
     REPEATS_FIELD_NUMBER: _ClassVar[int]
     REPORT_FIELD_NUMBER: _ClassVar[int]
     MUST_PASS_FIELD_NUMBER: _ClassVar[int]
+    GRADER_FIELD_NUMBER: _ClassVar[int]
+    TASK_FIELD_NUMBER: _ClassVar[int]
+    GRADER_FILES_FIELD_NUMBER: _ClassVar[int]
     subject_cell_id: str
     verifier: _types_pb2.CellSpec
     argv: _containers.RepeatedScalarFieldContainer[str]
@@ -39,10 +42,13 @@ class VerifyRequest(_message.Message):
     repeats: int
     report: str
     must_pass: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, subject_cell_id: _Optional[str] = ..., verifier: _Optional[_Union[_types_pb2.CellSpec, _Mapping]] = ..., argv: _Optional[_Iterable[str]] = ..., timeout: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., workdir: _Optional[str] = ..., protected_paths: _Optional[_Iterable[str]] = ..., files: _Optional[_Mapping[str, bytes]] = ..., repeats: _Optional[int] = ..., report: _Optional[str] = ..., must_pass: _Optional[_Iterable[str]] = ...) -> None: ...
+    grader: str
+    task: bytes
+    grader_files: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, subject_cell_id: _Optional[str] = ..., verifier: _Optional[_Union[_types_pb2.CellSpec, _Mapping]] = ..., argv: _Optional[_Iterable[str]] = ..., timeout: _Optional[_Union[datetime.timedelta, _duration_pb2.Duration, _Mapping]] = ..., workdir: _Optional[str] = ..., protected_paths: _Optional[_Iterable[str]] = ..., files: _Optional[_Mapping[str, bytes]] = ..., repeats: _Optional[int] = ..., report: _Optional[str] = ..., must_pass: _Optional[_Iterable[str]] = ..., grader: _Optional[str] = ..., task: _Optional[bytes] = ..., grader_files: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class VerifyResult(_message.Message):
-    __slots__ = ("passed", "exit_code", "output", "scores", "error", "tampered", "flaky", "runs_passed", "not_passed")
+    __slots__ = ("passed", "exit_code", "output", "scores", "error", "tampered", "flaky", "runs_passed", "not_passed", "reward", "grade_detail", "grade_error")
     class ScoresEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -59,6 +65,9 @@ class VerifyResult(_message.Message):
     FLAKY_FIELD_NUMBER: _ClassVar[int]
     RUNS_PASSED_FIELD_NUMBER: _ClassVar[int]
     NOT_PASSED_FIELD_NUMBER: _ClassVar[int]
+    REWARD_FIELD_NUMBER: _ClassVar[int]
+    GRADE_DETAIL_FIELD_NUMBER: _ClassVar[int]
+    GRADE_ERROR_FIELD_NUMBER: _ClassVar[int]
     passed: bool
     exit_code: int
     output: bytes
@@ -68,4 +77,7 @@ class VerifyResult(_message.Message):
     flaky: bool
     runs_passed: int
     not_passed: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, passed: _Optional[bool] = ..., exit_code: _Optional[int] = ..., output: _Optional[bytes] = ..., scores: _Optional[_Mapping[str, float]] = ..., error: _Optional[_Union[_types_pb2.Error, _Mapping]] = ..., tampered: _Optional[_Iterable[str]] = ..., flaky: _Optional[bool] = ..., runs_passed: _Optional[int] = ..., not_passed: _Optional[_Iterable[str]] = ...) -> None: ...
+    reward: float
+    grade_detail: str
+    grade_error: str
+    def __init__(self, passed: _Optional[bool] = ..., exit_code: _Optional[int] = ..., output: _Optional[bytes] = ..., scores: _Optional[_Mapping[str, float]] = ..., error: _Optional[_Union[_types_pb2.Error, _Mapping]] = ..., tampered: _Optional[_Iterable[str]] = ..., flaky: _Optional[bool] = ..., runs_passed: _Optional[int] = ..., not_passed: _Optional[_Iterable[str]] = ..., reward: _Optional[float] = ..., grade_detail: _Optional[str] = ..., grade_error: _Optional[str] = ...) -> None: ...

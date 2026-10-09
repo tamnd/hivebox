@@ -205,6 +205,9 @@ pub struct Api {
     stop: CancellationToken,
     /// Where to send a signal for each process started with `Exec.Start` that is still running.
     signals: Signals,
+    /// The reward plugins, made the first time a verification names one.
+    #[cfg(target_os = "linux")]
+    graders: Arc<std::sync::OnceLock<Result<Arc<hive_cell_wasm::Graders>, Error>>>,
 }
 
 impl Api {
@@ -212,7 +215,34 @@ impl Api {
     /// when `stop` is cancelled.
     #[must_use]
     pub fn new(comb: Comb, stop: CancellationToken) -> Self {
-        Self { comb, stop, signals: Arc::default() }
+        Self {
+            comb,
+            stop,
+            signals: Arc::default(),
+            #[cfg(target_os = "linux")]
+            graders: Arc::default(),
+        }
+    }
+
+    /// The node's graders, made on first use.
+    #[cfg(target_os = "linux")]
+    fn graders(&self) -> Result<Arc<hive_cell_wasm::Graders>, Error> {
+        let made = self.graders.get_or_init(|| {
+            let cfg = &self.comb.inner.cfg;
+            hive_cell_wasm::Graders::new(hive_cell_wasm::GraderConfig {
+                dir: cfg.graders.clone(),
+                timeout: cfg.grader_timeout,
+                mem_mib: cfg.grader_mem_mib,
+            })
+            .map(Arc::new)
+        });
+        made.clone()
+    }
+
+    /// Graders run on wasmtime, which the comb has only on Linux.
+    #[cfg(not(target_os = "linux"))]
+    fn graders(&self) -> Result<NoGraders, Error> {
+        Err(Error::new(Reason::PolicyDenied, "graders need a Linux node"))
     }
 
     /// The cell `id` if it belongs to `project`. Someone else's cell is not found, the same as
@@ -1516,5 +1546,18 @@ mod tests {
         assert_eq!(millis(d(0, 1)).unwrap(), 1);
         assert_eq!(millis(d(2, 500_000_000)).unwrap(), 2500);
         assert!(millis(d(-1, 0)).is_err());
+    }
+}
+
+/// What stands in for the graders off Linux, where there are none.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+struct NoGraders;
+
+#[cfg(not(target_os = "linux"))]
+impl NoGraders {
+    #[allow(clippy::unused_async)]
+    async fn check(&self, _: &str) -> Result<(), Error> {
+        Ok(())
     }
 }

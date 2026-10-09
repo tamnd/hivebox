@@ -63,6 +63,9 @@ pub struct Report {
     pub scores: BTreeMap<String, f64>,
     /// The end of the last run's output.
     pub output: String,
+    /// What the grader said about its reward, when there was one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub grade_detail: String,
 }
 
 /// Where the time went, in milliseconds.

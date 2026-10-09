@@ -53,3 +53,7 @@ tonic = { workspace = true, features = ["channel"] }
 tar.workspace = true
 tonic-prost.workspace = true
 tower = { workspace = true, features = ["util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The test graders are component text, which the comb reads only in tests.
+wasmtime = { workspace = true, features = ["wat"] }
