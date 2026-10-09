@@ -26,6 +26,7 @@ pub struct Metrics {
     stop_seconds: HistogramVec,
     snapshot_seconds: HistogramVec,
     exec_seconds: HistogramVec,
+    policy_seconds: HistogramVec,
     stall: GaugeVec,
     reclaimed: CounterVec,
     squeezed: CounterVec,
@@ -60,6 +61,11 @@ impl Default for Metrics {
                 "hive_exec_seconds",
                 "Exec calls from the comb's side, from the request to the answer.",
                 &["op"],
+            ),
+            policy_seconds: registry.histogram(
+                "hive_policy_seconds",
+                "How long each policy plugin took over a create, by its verdict.",
+                &["policy", "result"],
             ),
             stall: registry.gauge(
                 "hive_memory_stall_basis_points",
@@ -113,6 +119,10 @@ impl Metrics {
         self.exec_seconds.with(&[op]).observe_duration(took);
     }
 
+    pub(crate) fn policy(&self, policy: &str, result: &str, took: Duration) {
+        self.policy_seconds.with(&[policy, result]).observe_duration(took);
+    }
+
     pub(crate) fn pressure(&self, avg10: f64) {
         self.stall.with(&[]).set((avg10 * 100.0).round() as i64);
     }
@@ -143,6 +153,7 @@ mod tests {
         m.stopped(Backend::Container, "driver", Duration::from_millis(4));
         m.snapshot("read", Duration::from_millis(5));
         m.trimmed(4096);
+        m.policy("rl", "change", Duration::from_micros(80));
         let text = m.registry().render();
         assert!(text.contains(r#"hive_create_seconds_count{backend="container",stage="pool"} 1"#));
         assert!(text.contains(r#"hive_create_total{backend="container",result="ok"} 1"#));
@@ -150,5 +161,6 @@ mod tests {
         assert!(text.contains(r#"hive_stop_seconds_count{backend="container",stage="driver"} 1"#));
         assert!(text.contains(r#"hive_snapshot_seconds_count{stage="read"} 1"#));
         assert!(text.contains("hive_memory_trimmed_bytes_total 4096"));
+        assert!(text.contains(r#"hive_policy_seconds_count{policy="rl",result="change"} 1"#));
     }
 }

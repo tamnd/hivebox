@@ -19,7 +19,7 @@ use crate::run::is_program_name;
 
 #[allow(missing_docs, missing_debug_implementations, unreachable_pub, unused_qualifications)]
 mod bindings {
-    wasmtime::component::bindgen!({ path: "wit", world: "grader" });
+    wasmtime::component::bindgen!({ path: "wit/reward.wit", world: "grader" });
 }
 
 use bindings::exports::hivebox::reward::score as wit;

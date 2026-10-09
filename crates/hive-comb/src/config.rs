@@ -99,6 +99,17 @@ pub struct Config {
     pub grader_timeout: Duration,
     /// The most memory one grade may have, in MiB. `[verify] grader_mem_mib`.
     pub grader_mem_mib: u64,
+    /// The policy plugins every create goes through, in order, each a component named
+    /// `<name>.wasm` in [`Config::policy_dir`]. The first to turn a cell away stops it, and each
+    /// sees the cell as the ones before it changed it. `[policy] plugins`.
+    pub policies: Vec<String>,
+    /// Where the policies are. `[policy] dir`, by default `policies` in the data dir.
+    pub policy_dir: PathBuf,
+    /// The longest one verdict may take. A policy that runs past it turns the cell away.
+    /// `[policy] timeout`.
+    pub policy_timeout: Duration,
+    /// The most memory one verdict may have, in MiB. `[policy] mem_mib`.
+    pub policy_mem_mib: u64,
     /// The container backend.
     pub container: ContainerBackend,
     /// The wasm backend.
@@ -374,6 +385,10 @@ impl Default for Config {
             graders: PathBuf::from("/var/lib/hivebox/graders"),
             grader_timeout: Duration::from_secs(10),
             grader_mem_mib: 256,
+            policies: Vec::new(),
+            policy_dir: PathBuf::from("/var/lib/hivebox/policies"),
+            policy_timeout: Duration::from_millis(100),
+            policy_mem_mib: 64,
             container: ContainerBackend::default(),
             fncall: FncallBackend::default(),
             plugins: Vec::new(),
@@ -421,6 +436,12 @@ impl Config {
     /// graders = "/var/lib/hivebox/graders"
     /// grader_timeout = "10s"
     /// grader_mem_mib = 256
+    ///
+    /// [policy]
+    /// plugins = ["limits", "rl"]
+    /// dir = "/var/lib/hivebox/policies"
+    /// timeout = "100ms"
+    /// mem_mib = 64
     ///
     /// [lifecycle]
     /// create_deadline = "30s"
@@ -570,6 +591,20 @@ impl Config {
                 return Err(format!("verify.grader_mem_mib = {m} must be from 1 to 4096"));
             }
             c.grader_mem_mib = m;
+        }
+        let p = file.policy;
+        c.policies = p.plugins;
+        c.policy_dir = p.dir.unwrap_or_else(|| c.data_dir.join("policies"));
+        if let Some(t) = p.timeout {
+            c.policy_timeout = duration(&t)
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| format!("policy.timeout = {t:?} is not a duration like 100ms"))?;
+        }
+        if let Some(m) = p.mem_mib {
+            if !(1..=4096).contains(&m) {
+                return Err(format!("policy.mem_mib = {m} must be from 1 to 4096"));
+            }
+            c.policy_mem_mib = m;
         }
         let l = file.lifecycle;
         for (field, value, name) in [
@@ -770,6 +805,7 @@ struct File {
     density: DensityFile,
     lifecycle: LifecycleFile,
     verify: VerifyFile,
+    policy: PolicyFile,
     backends: BackendsFile,
     images: ImagesFile,
     network: NetworkFile,
@@ -904,6 +940,15 @@ struct VerifyFile {
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct PolicyFile {
+    plugins: Vec<String>,
+    dir: Option<PathBuf>,
+    timeout: Option<String>,
+    mem_mib: Option<u64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct BackendsFile {
     create_limit: BTreeMap<String, usize>,
     plugins: Vec<PathBuf>,
@@ -977,6 +1022,24 @@ mod tests {
         assert!(Config::from_toml("[verify]\ngrader_mem_mib = 0").is_err());
         assert!(Config::from_toml("[verify]\ngrader_mem_mib = 5000").is_err());
         assert!(Config::from_toml("[backends]\nplugins = [\"qemu.sock\"]").is_err());
+    }
+
+    #[test]
+    fn policies_are_off_until_named_and_follow_the_data_dir() {
+        let c = Config::from_toml("[node]\ndata_dir = \"/srv/hive\"").unwrap();
+        assert!(c.policies.is_empty());
+        assert_eq!(c.policy_dir, PathBuf::from("/srv/hive/policies"));
+        assert_eq!((c.policy_timeout, c.policy_mem_mib), (Duration::from_millis(100), 64));
+        let c = Config::from_toml(
+            "[policy]\nplugins = [\"limits\", \"rl\"]\ndir = \"/p\"\ntimeout = \"20ms\"\nmem_mib = 16",
+        )
+        .unwrap();
+        assert_eq!(c.policies, ["limits", "rl"]);
+        assert_eq!(c.policy_dir, PathBuf::from("/p"));
+        assert_eq!((c.policy_timeout, c.policy_mem_mib), (Duration::from_millis(20), 16));
+        assert!(Config::from_toml("[policy]\ntimeout = \"0ms\"").is_err());
+        assert!(Config::from_toml("[policy]\nmem_mib = 0").is_err());
+        assert!(Config::from_toml("[policy]\nplugin = [\"rl\"]").is_err());
     }
 
     #[test]
