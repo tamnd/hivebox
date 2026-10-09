@@ -13,5 +13,19 @@ categories.workspace = true
 readme.workspace = true
 publish.workspace = true
 
+[dependencies]
+futures.workspace = true
+hive-cell.workspace = true
+hive-proto.workspace = true
+hive-types.workspace = true
+hyper-util = { workspace = true, features = ["tokio"] }
+prost-types.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["channel", "server"] }
+tower = { workspace = true, features = ["util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
 [lints]
 workspace = true

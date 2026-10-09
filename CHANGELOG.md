@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Driver plugins. A backend can run in a process of its own that serves `hivebox.plugin.v1.Driver` on a Unix socket, and the comb uses it in place of its own driver for that backend when the socket is listed in `[backends] plugins`. `hive-cell-plugin` has the client and `serve`, so any `CellDriver` becomes a plugin in a few lines, and `hive-comb --plugin container --socket PATH` serves the built in container driver that way. Plugins of another API version are refused, errors keep their reason, and either side can restart. On server3 a call through the plugin took 159 us at p50 and creating a container cell took 106 to 113 ms at p50 through it, against 105 to 156 ms in process.
+
 ## 0.0.39
 
 Fork container cells from what they wrote.

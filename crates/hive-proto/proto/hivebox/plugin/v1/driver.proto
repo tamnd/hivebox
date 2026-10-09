@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+// The driver plugin API. A node agent runs a backend it was not built with by calling a plugin
+// process that serves Driver on a Unix socket, so a third party backend does not have to be linked
+// into the node agent. Each call is one method of the `CellDriver` trait in
+// `crates/hive-cell/src/driver.rs`, which carries the full contract.
+//
+// The node agent does everything that is the same for every backend: admission, the cell's cgroup
+// and network namespace, the root filesystem and its WAL. A plugin gets those in a Slot and a
+// Rootfs and only turns them into a running sandbox. The Handle it returns is plain data the node
+// agent stores and hands back on every later call, also after either side restarts, so a plugin
+// keeps no state it cannot find again from a Handle.
+//
+// A failed call returns a gRPC status with a google.rpc.ErrorInfo detail in the domain
+// "hivebox.dev" whose reason is a hivebox error reason, such as CELL_NOT_FOUND or POLICY_DENIED.
+// A status without one reads as INTERNAL. A method the backend does not have returns
+// POLICY_DENIED, and Caps says which those are so the node agent never calls them.
+//
+// Version 1 only ever grows: fields and methods are added, never renamed, renumbered or removed.
+package hivebox.plugin.v1;
+
+import "google/protobuf/duration.proto";
+import "hivebox/v1/types.proto";
+
+service Driver {
+  // Says which backend the plugin runs, what it can do and which version of this API it speaks.
+  // The node agent calls it first and uses no plugin that speaks another version.
+  rpc Describe(DescribeRequest) returns (Description);
+  // Checks that this node has what the backend needs. Called once when the node agent starts.
+  rpc Probe(ProbeRequest) returns (NodeFit);
+  // Gets everything ready that does not use CPU yet. The handle has no pid. If this fails,
+  // nothing is left behind.
+  rpc Prepare(PrepareRequest) returns (Handle);
+  // Starts a prepared cell and returns its handle with the pid set. When this returns, the guest
+  // agent is starting or listening at the handle's channel.
+  rpc Start(Handle) returns (Handle);
+  rpc Pause(PauseRequest) returns (hivebox.v1.Empty);
+  rpc Resume(Handle) returns (hivebox.v1.Empty);
+  // Gives back the page cache a running cell has not used lately.
+  rpc Trim(Handle) returns (Trimmed);
+  rpc Resize(ResizeRequest) returns (hivebox.v1.Empty);
+  // Asks the cell to end, waits up to grace, then kills it and removes everything the plugin made
+  // for it. Stopping a cell that is gone, only prepared or already stopped is fine.
+  rpc Stop(StopRequest) returns (Exit);
+  // Finds out whether a cell from before a restart is still there, from its handle alone.
+  rpc Check(Handle) returns (Liveness);
+}
+
+message DescribeRequest {
+  // The newest version of this API the node agent speaks.
+  uint32 api_version = 1;
+}
+
+message Description {
+  // The version the plugin speaks, 1 for this file.
+  uint32 api_version = 1;
+  // The one backend it runs. It replaces a built in driver for the same backend.
+  hivebox.v1.Backend backend = 2;
+  Caps caps = 3;
+  // A name and version for logs, such as "qemu-plugin 0.3.1".
+  string name = 4;
+}
+
+message Caps {
+  enum Snapshot {
+    SNAPSHOT_NONE = 0;
+    SNAPSHOT_DISK = 1;
+    SNAPSHOT_DISK_MEM = 2;
+  }
+  // Pause with FREEZE and resume.
+  bool pause = 1;
+  Snapshot snapshot = 2;
+  // A running cell may be forked. The node agent pauses it and copies its upper.
+  bool fork = 3;
+  bool resize = 4;
+  bool gpu = 5;
+  bool trim = 6;
+}
+
+message ProbeRequest {}
+
+message NodeFit {
+  // False if something the backend needs is missing.
+  bool ready = 1;
+  // What is missing, or what was found.
+  repeated string notes = 2;
+}
+
+// What the node agent's pools hand the plugin for one cell.
+message Slot {
+  // The cell's cgroup directory. Every process of the cell goes in it.
+  string cgroup = 1;
+  // The cell's network namespace file, or empty for the host's network.
+  string netns = 2;
+  // The cell's only resolver, an IPv4 address, or empty when it has no network beyond loopback.
+  string nameserver = 3;
+  // A directory only this cell's plugin writes to, removed when the cell is gone.
+  string dir = 4;
+  // The guest agent's 32 byte secret for the channel handshake.
+  bytes secret = 5;
+}
+
+// The root filesystem the node agent attached.
+message Rootfs {
+  // Read only layers, top first.
+  repeated string lowers = 1;
+  // Where writes go.
+  string upper = 2;
+  // A directory to copy into the upper before the cell sees it, or empty.
+  string seed = 3;
+}
+
+message PrepareRequest {
+  string cell_id = 1;
+  hivebox.v1.CellSpec spec = 2;
+  Rootfs rootfs = 3;
+  Slot slot = 4;
+}
+
+message Vsock {
+  // The host side socket. The node agent sends "CONNECT <port>" first.
+  string uds = 1;
+  uint32 port = 2;
+}
+
+message Handle {
+  string cell_id = 1;
+  hivebox.v1.Backend backend = 2;
+  // The process that holds the sandbox, unset before Start.
+  optional uint32 pid = 3;
+  // Where the guest agent listens.
+  oneof channel {
+    string unix = 4;
+    Vsock vsock = 5;
+  }
+  string cgroup = 6;
+  string netns = 7;
+  // Anything else the plugin needs to find the cell again.
+  map<string, string> extra = 8;
+}
+
+enum PauseMode {
+  PAUSE_MODE_UNSPECIFIED = 0;
+  // Stop it running, memory kept.
+  PAUSE_MODE_FREEZE = 1;
+  // Freeze, then push its memory out to swap.
+  PAUSE_MODE_RECLAIM = 2;
+  // Snapshot it and end the process.
+  PAUSE_MODE_SNAPSHOT_KILL = 3;
+}
+
+message PauseRequest {
+  Handle handle = 1;
+  PauseMode mode = 2;
+}
+
+message Trimmed {
+  // How many bytes the cell's memory went down by.
+  uint64 bytes = 1;
+}
+
+message ResizeRequest {
+  Handle handle = 1;
+  hivebox.v1.Resources resources = 2;
+}
+
+message StopRequest {
+  Handle handle = 1;
+  google.protobuf.Duration grace = 2;
+}
+
+message Exit {
+  optional int32 code = 1;
+  optional int32 signal = 2;
+  bool oom = 3;
+}
+
+message Liveness {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_ALIVE = 1;
+    STATE_PAUSED = 2;
+    STATE_GONE = 3;
+  }
+  State state = 1;
+  // How it ended, when it is gone.
+  Exit exit = 2;
+}

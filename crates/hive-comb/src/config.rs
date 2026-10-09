@@ -103,6 +103,9 @@ pub struct Config {
     pub container: ContainerBackend,
     /// The wasm backend.
     pub fncall: FncallBackend,
+    /// The Unix sockets of driver plugins to run cells through, each serving one backend, which
+    /// takes the place of a built in one for the same backend. `[backends] plugins`.
+    pub plugins: Vec<PathBuf>,
     /// Where images come from.
     pub images: Images,
     /// How cells reach the network.
@@ -373,6 +376,7 @@ impl Default for Config {
             grader_mem_mib: 256,
             container: ContainerBackend::default(),
             fncall: FncallBackend::default(),
+            plugins: Vec::new(),
             images: Images::default(),
             network: Network::default(),
             scout: None,
@@ -431,6 +435,9 @@ impl Config {
     /// [backends.container]
     /// drone = "/usr/lib/hivebox/hive-drone"
     /// workers = 8
+    ///
+    /// [backends]
+    /// plugins = ["/run/hivebox/plugins/qemu.sock"]
     ///
     /// [backends.fncall]
     /// enabled = true
@@ -601,6 +608,15 @@ impl Config {
         }
         if b.uid_count == 0 || b.uid_base.checked_add(b.uid_count).is_none() {
             return Err("backends.container ids run past the last uid".into());
+        }
+        for socket in file.backends.plugins {
+            if !socket.is_absolute() {
+                return Err(format!(
+                    "backends.plugins {} has to be an absolute path",
+                    socket.display()
+                ));
+            }
+            c.plugins.push(socket);
         }
         let k = file.backends.fncall;
         let b = &mut c.fncall;
@@ -890,6 +906,7 @@ struct VerifyFile {
 #[serde(default, deny_unknown_fields)]
 struct BackendsFile {
     create_limit: BTreeMap<String, usize>,
+    plugins: Vec<PathBuf>,
     container: ContainerFile,
     fncall: FncallFile,
 }
@@ -959,6 +976,7 @@ mod tests {
         assert!(Config::from_toml("[verify]\ngrader_timeout = \"0s\"").is_err());
         assert!(Config::from_toml("[verify]\ngrader_mem_mib = 0").is_err());
         assert!(Config::from_toml("[verify]\ngrader_mem_mib = 5000").is_err());
+        assert!(Config::from_toml("[backends]\nplugins = [\"qemu.sock\"]").is_err());
     }
 
     #[test]
@@ -1037,6 +1055,9 @@ mod tests {
             keep_ended = "10m"
             reclaim_after = "30s"
 
+            [backends]
+            plugins = ["/run/hivebox/plugins/qemu.sock"]
+
             [backends.create_limit]
             container = 8
 
@@ -1092,6 +1113,7 @@ mod tests {
         assert!(c.container.disk_quota);
         assert_eq!(c.container.workers, 2);
         assert_eq!(c.container.uid_base, 1_000_000);
+        assert_eq!(c.plugins, [PathBuf::from("/run/hivebox/plugins/qemu.sock")]);
         assert_eq!(c.images.store, Some(PathBuf::from("/srv/store")));
         assert_eq!(c.images.cache_bytes, 1 << 20);
         assert_eq!(c.images.layers_dir, Images::default().layers_dir);

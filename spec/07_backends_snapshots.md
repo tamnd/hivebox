@@ -45,6 +45,16 @@ pub trait CellDriver: Send + Sync + 'static {
 
 Third-party drivers come in two forms. They are either (a) Rust crates compiled in behind a cargo feature, or (b) out-of-process drivers that speak the same trait over a gRPC `DriverService` on a UDS, in the style of a containerd shim. The second form lets people plug in gVisor (`runsc`), Kata, Hyperlight or macOS Virtualization.framework without touching core.
 
+What is in now is the out of process form. A plugin serves `hivebox.plugin.v1.Driver` (`crates/hive-proto/proto/hivebox/plugin/v1/driver.proto`) on a Unix socket, one call for each `CellDriver` method, and `hive-cell-plugin` has both sides: `PluginDriver`, which the comb uses like any built in driver, and `serve`, which turns any `CellDriver` into a plugin. The comb connects to each socket in `[backends] plugins` when it starts, asks which backend the plugin runs and which version of the API it speaks, probes it, and uses it in place of its own driver for that backend. A plugin that speaks another version or names no backend is not used, and the log says why. The comb still does admission, the cgroup and netns pools, the root filesystem and the WAL, and reads metrics from the cell's cgroup, so a plugin only turns a slot and a root filesystem into a running sandbox. A handle is plain data the comb stores, so either side can restart and the cells are found again, and the client reconnects by itself when a plugin comes back on the same socket. Errors keep their reason across the socket. Version 1 only grows. `hive-comb --plugin container --socket PATH` serves the built in container driver as a plugin, which is how the API is tested on real cells: all 7 container tests in `crates/hive-comb/tests/oci.rs` pass with `HIVE_DRIVER_PLUGIN` set, restarts, snapshots and forks included. On server3 at a load of 103 to 120, release builds:
+
+| What | In process | Through the plugin |
+|---|---|---|
+| A `check` call, p50 | 201 ns | 159 us (p99 3.2 ms) |
+| Create one container cell at a time, p50 of 20, three rounds | 105 to 156 ms | 106 to 113 ms |
+| Create 16 at once, p50, three rounds | 573 to 717 ms | 578 to 765 ms |
+
+A call costs about a sixth of a millisecond more, which is lost in the noise of a create. A restarted plugin was reached again 1.2 ms after it bound its socket.
+
 `DriverCaps` drives admission and API validation. For example, `fork` on T1 is rejected unless the driver is CRIU-capable.
 
 ## 3. Driver designs

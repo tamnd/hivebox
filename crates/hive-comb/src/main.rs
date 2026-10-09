@@ -8,6 +8,14 @@
 //! comb and serves the local API on the config's socket. On SIGTERM or SIGINT it stops taking
 //! calls and leaves every cell running, and the next comb to start takes them over.
 //!
+//! ```text
+//! hive-comb --plugin container --socket PATH [--config PATH]
+//! ```
+//!
+//! serves the container backend of the config's `[backends.container]` as a driver plugin on
+//! `PATH`, for a comb that lists it in `[backends] plugins` and runs containers in a process of
+//! their own.
+//!
 //! `hive-comb --oci-worker` is not for people: it is how the container backend starts its workers,
 //! which have to be single threaded processes of their own.
 
@@ -22,15 +30,41 @@ const USAGE: &str = "usage: hive-comb [--config PATH]";
 const DEFAULT_CONFIG: &str = "/etc/hivebox/comb.toml";
 
 #[cfg(target_os = "linux")]
-fn config() -> Result<hive_comb::Config, String> {
+const PLUGIN_USAGE: &str = "usage: hive-comb --plugin container --socket PATH [--config PATH]";
+
+/// What the command line asks for: the comb, or one of its backends served as a plugin.
+#[cfg(target_os = "linux")]
+enum Mode {
+    Comb,
+    Plugin(std::path::PathBuf),
+}
+
+#[cfg(target_os = "linux")]
+fn config() -> Result<(hive_comb::Config, Mode), String> {
     let mut path = None;
+    let (mut plugin, mut socket) = (None, None);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => path = Some(args.next().ok_or("--config needs a value")?),
-            other => return Err(format!("unknown argument {other}\n{USAGE}")),
+            "--plugin" => plugin = Some(args.next().ok_or("--plugin needs a backend")?),
+            "--socket" => socket = Some(args.next().ok_or("--socket needs a value")?),
+            other => return Err(format!("unknown argument {other}\n{USAGE}\n{PLUGIN_USAGE}")),
         }
     }
+    let mode = match (plugin.as_deref(), socket) {
+        (None, None) => Mode::Comb,
+        (Some("container"), Some(socket)) => Mode::Plugin(socket.into()),
+        (Some("container"), None) => {
+            return Err(format!("--plugin needs --socket\n{PLUGIN_USAGE}"));
+        }
+        (Some(other), _) => {
+            return Err(format!(
+                "only the container backend can be served as a plugin, not {other}"
+            ));
+        }
+        (None, Some(_)) => return Err(format!("--socket is for --plugin\n{PLUGIN_USAGE}")),
+    };
     let text = match path {
         Some(p) => std::fs::read_to_string(&p).map_err(|e| format!("reading {p}: {e}"))?,
         None => match std::fs::read_to_string(DEFAULT_CONFIG) {
@@ -39,7 +73,7 @@ fn config() -> Result<hive_comb::Config, String> {
             Err(e) => return Err(format!("reading {DEFAULT_CONFIG}: {e}")),
         },
     };
-    hive_comb::Config::from_toml(&text)
+    Ok((hive_comb::Config::from_toml(&text)?, mode))
 }
 
 #[cfg(target_os = "linux")]
@@ -53,8 +87,8 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     raise_open_files();
-    let cfg = match config() {
-        Ok(cfg) => cfg,
+    let (cfg, mode) = match config() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("hive-comb: {e}");
             return ExitCode::from(2);
@@ -67,7 +101,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match rt.block_on(run(cfg)) {
+    let served = match mode {
+        Mode::Comb => rt.block_on(run(cfg)),
+        Mode::Plugin(socket) => rt.block_on(plugin(cfg, socket)),
+    };
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hive-comb: {e}");
@@ -230,30 +268,10 @@ async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
     use hive_cell::CellDriver;
 
     let mut drivers = hive_cell::DriverRegistry::new();
-    let c = &cfg.container;
-    if c.enabled {
-        // The cells' uppers go under it, so its filesystem is the one with the quotas.
-        if c.disk_quota {
-            let _ = std::fs::create_dir_all(&cfg.data_dir);
-        }
-        let oci = hive_cell_oci::Config {
-            drone: c.drone.clone(),
-            shell: c.shell.clone(),
-            disk_quota: c.disk_quota.then(|| cfg.data_dir.clone()),
-            state_dir: c.state_dir.clone(),
-            workers: c.workers,
-            uid_base: c.uid_base,
-            uid_count: c.uid_count,
-            ..hive_cell_oci::Config::default()
-        };
-        match hive_cell_oci::OciDriver::new(oci) {
-            Ok(d) => match d.probe().await {
-                Ok(fit) if fit.ready => drivers.add(std::sync::Arc::new(d)),
-                Ok(fit) => eprintln!("hive-comb: no container cells: {}", fit.notes.join(", ")),
-                Err(e) => eprintln!("hive-comb: no container cells: {e}"),
-            },
-            Err(e) => eprintln!("hive-comb: no container cells: {e}"),
-        }
+    if cfg.container.enabled
+        && let Some(d) = container(cfg).await
+    {
+        drivers.add(std::sync::Arc::new(d));
     }
     let f = &cfg.fncall;
     if f.enabled {
@@ -288,7 +306,109 @@ async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
             Err(e) => eprintln!("hive-comb: no wasm cells: {e}"),
         }
     }
+    for socket in &cfg.plugins {
+        let Some(d) = connect(socket).await else { continue };
+        let backend = d.backend();
+        match d.probe().await {
+            Ok(fit) if fit.ready => {
+                let instead =
+                    if drivers.get(backend).is_some() { ", instead of its own" } else { "" };
+                eprintln!(
+                    "hive-comb: {} cells through {} at {}{instead}",
+                    backend.as_str(),
+                    d.name(),
+                    socket.display()
+                );
+                drivers.add(std::sync::Arc::new(d));
+            }
+            Ok(fit) => eprintln!(
+                "hive-comb: the plugin at {} cannot run {} cells here: {}",
+                socket.display(),
+                backend.as_str(),
+                fit.notes.join(", ")
+            ),
+            Err(e) => eprintln!("hive-comb: the plugin at {}: {e}", socket.display()),
+        }
+    }
     drivers
+}
+
+/// Connects to the driver plugin at `socket`, waiting up to 30 seconds for one started next to
+/// the comb to come up.
+#[cfg(target_os = "linux")]
+async fn connect(socket: &std::path::Path) -> Option<hive_cell_plugin::PluginDriver> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match hive_cell_plugin::PluginDriver::connect(socket).await {
+            Ok(d) => return Some(d),
+            Err(e)
+                if e.reason == hive_types::Reason::Internal
+                    && std::time::Instant::now() < until =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                eprintln!("hive-comb: no plugin: {e}");
+                return None;
+            }
+        }
+    }
+}
+
+/// The container driver of `cfg`, if this node can run it. If not, the log says why.
+#[cfg(target_os = "linux")]
+async fn container(cfg: &hive_comb::Config) -> Option<hive_cell_oci::OciDriver> {
+    use hive_cell::CellDriver;
+
+    let c = &cfg.container;
+    // The cells' uppers go under it, so its filesystem is the one with the quotas.
+    if c.disk_quota {
+        let _ = std::fs::create_dir_all(&cfg.data_dir);
+    }
+    let oci = hive_cell_oci::Config {
+        drone: c.drone.clone(),
+        shell: c.shell.clone(),
+        disk_quota: c.disk_quota.then(|| cfg.data_dir.clone()),
+        state_dir: c.state_dir.clone(),
+        workers: c.workers,
+        uid_base: c.uid_base,
+        uid_count: c.uid_count,
+        ..hive_cell_oci::Config::default()
+    };
+    match hive_cell_oci::OciDriver::new(oci) {
+        Ok(d) => match d.probe().await {
+            Ok(fit) if fit.ready => return Some(d),
+            Ok(fit) => eprintln!("hive-comb: no container cells: {}", fit.notes.join(", ")),
+            Err(e) => eprintln!("hive-comb: no container cells: {e}"),
+        },
+        Err(e) => eprintln!("hive-comb: no container cells: {e}"),
+    }
+    None
+}
+
+/// Serves the container backend as a driver plugin on `socket` until SIGTERM or SIGINT. Cells keep
+/// running when it goes, and the next plugin on the socket finds them from their handles.
+#[cfg(target_os = "linux")]
+async fn plugin(cfg: hive_comb::Config, socket: std::path::PathBuf) -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let Some(d) = container(&cfg).await else {
+        return Err(std::io::Error::other("the container backend cannot run here"));
+    };
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let listener = hive_cell_plugin::bind(&socket)?;
+    let name = format!("hive-comb {} container", env!("CARGO_PKG_VERSION"));
+    eprintln!("hive-comb: serving the container backend on {}", socket.display());
+    let stop = async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    };
+    let served = hive_cell_plugin::serve(std::sync::Arc::new(d), name, listener, stop).await;
+    let _ = std::fs::remove_file(&socket);
+    served
 }
 
 #[cfg(not(target_os = "linux"))]
