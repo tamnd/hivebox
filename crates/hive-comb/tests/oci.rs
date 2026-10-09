@@ -4,7 +4,8 @@
 //! `hive-oci import` in `HIVE_OCI_IMAGE`, or a `hive-nectar` store in `HIVE_NECTAR_STORE` and the id
 //! of an image in it in `HIVE_NECTAR_IMAGE`. Passes without doing anything when one is missing.
 //! The snapshot test also needs the store, and builds its layers with `HIVE_MKFS_EROFS` when that is
-//! set.
+//! set. With `HIVE_DRIVER_PLUGIN` set, the comb reaches the OCI driver through a driver plugin,
+//! `hive-comb --plugin container` in a process of its own, instead of in process.
 
 #![cfg(target_os = "linux")]
 
@@ -26,8 +27,9 @@ use serde_json::{Value, json};
 struct Node {
     cfg: Config,
     drone: PathBuf,
-    // Dropped in this order: the comb before its cgroups, its pins and its directory.
+    // Dropped in this order: the comb before its plugin, its cgroups, its pins and its directory.
     comb: Comb,
+    plugin: Option<Plugin>,
     guard: Option<Guarded>,
     tree: Tree,
     _scratch: Scratch,
@@ -64,6 +66,49 @@ impl Drop for Guarded {
             let _ = std::process::Command::new("ip").args(["link", "del", "hive0"]).output();
         }
         let _ = std::fs::remove_dir_all(&self.pins);
+    }
+}
+
+/// The container backend served by `hive-comb --plugin container`, stopped on drop.
+struct Plugin {
+    child: std::process::Child,
+    socket: PathBuf,
+}
+
+impl Plugin {
+    async fn start(cfg: &Config, drone: &Path) -> Self {
+        let dir = cfg.data_dir.join("plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("container.sock");
+        let toml = dir.join("plugin.toml");
+        let text = format!(
+            "[node]\ndata_dir = {:?}\n\n[backends.container]\ndrone = {:?}\nstate_dir = {:?}\n",
+            cfg.data_dir,
+            drone,
+            cfg.data_dir.join("oci")
+        );
+        std::fs::write(&toml, text).unwrap();
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_hive-comb"))
+            .args(["--plugin", "container", "--socket"])
+            .arg(&socket)
+            .arg("--config")
+            .arg(&toml)
+            .spawn()
+            .unwrap();
+        let t = Instant::now();
+        while !socket.exists() {
+            assert!(t.elapsed() < Duration::from_secs(30), "the plugin never bound its socket");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Self { child, socket }
+    }
+}
+
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        let pid = self.child.id().to_string();
+        let _ = std::process::Command::new("kill").args(["-TERM", &pid]).output();
+        let _ = self.child.wait();
     }
 }
 
@@ -142,14 +187,18 @@ impl Node {
             ..config(&scratch.0)
         };
         let drone = PathBuf::from(drone);
-        let comb = open_oci(&cfg, &drone).await;
-        Some(Self { cfg, drone, comb, guard, tree, _scratch: scratch, _one: one })
+        let plugin = match std::env::var_os("HIVE_DRIVER_PLUGIN") {
+            Some(_) => Some(Plugin::start(&cfg, &drone).await),
+            None => None,
+        };
+        let comb = open_oci(&cfg, &drone, plugin.as_ref()).await;
+        Some(Self { cfg, drone, comb, plugin, guard, tree, _scratch: scratch, _one: one })
     }
 
     /// Shuts the comb down, which leaves its cells running, and opens a new one on the same data.
     async fn restart(&mut self) {
         self.comb.shutdown().await;
-        self.comb = open_oci(&self.cfg, &self.drone).await;
+        self.comb = open_oci(&self.cfg, &self.drone, self.plugin.as_ref()).await;
     }
 }
 
@@ -225,14 +274,18 @@ async fn rcode(comb: &Comb, id: CellId, name: &str, kind: u16) -> u8 {
     sh(comb, id, &script).await.trim().parse().unwrap()
 }
 
-async fn open_oci(cfg: &Config, drone: &Path) -> Comb {
+async fn open_oci(cfg: &Config, drone: &Path, plugin: Option<&Plugin>) -> Comb {
+    let mut drivers = DriverRegistry::new();
+    if let Some(p) = plugin {
+        drivers.add(Arc::new(hive_cell_plugin::PluginDriver::connect(&p.socket).await.unwrap()));
+        return Comb::open(cfg.clone(), drivers).await.unwrap();
+    }
     let oci = hive_cell_oci::Config {
         worker: vec![env!("CARGO_BIN_EXE_hive-comb").into(), "--oci-worker".into()],
         drone: drone.to_path_buf(),
         state_dir: cfg.data_dir.join("oci"),
         ..hive_cell_oci::Config::default()
     };
-    let mut drivers = DriverRegistry::new();
     drivers.add(Arc::new(hive_cell_oci::OciDriver::new(oci).unwrap()));
     Comb::open(cfg.clone(), drivers).await.unwrap()
 }
@@ -610,13 +663,14 @@ async fn a_fork_starts_cells_from_what_the_cell_wrote() {
     let copied = t.elapsed();
     let disk = (used() - before) / (1 << 20);
     assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Running);
-    let made: Vec<CellId> = futures::future::join_all((0..4).map(|_| {
-        node.comb.create_from(request(forked.spec.clone()), Some(forked.seed.clone()))
-    }))
-    .await
-    .into_iter()
-    .map(|r| r.unwrap().id)
-    .collect();
+    let made: Vec<CellId> =
+        futures::future::join_all((0..4).map(|_| {
+            node.comb.create_from(request(forked.spec.clone()), Some(forked.seed.clone()))
+        }))
+        .await
+        .into_iter()
+        .map(|r| r.unwrap().id)
+        .collect();
     let took = t.elapsed();
     drop(forked);
     let text = node.comb.metrics().registry().render();
@@ -1027,7 +1081,8 @@ async fn oci_through_the_comb() {
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    println!("guard {guard}: pools of {cells} full in {:?}", t.elapsed());
+    let plugin = node.plugin.is_some();
+    println!("guard {guard}, plugin {plugin}: pools of {cells} full in {:?}", t.elapsed());
 
     let mut one = Vec::new();
     for _ in 0..20 {

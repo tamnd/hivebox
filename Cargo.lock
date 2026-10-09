@@ -1577,6 +1577,17 @@ dependencies = [
 [[package]]
 name = "hive-cell-plugin"
 version = "0.0.39"
+dependencies = [
+ "futures",
+ "hive-cell",
+ "hive-proto",
+ "hive-types",
+ "hyper-util",
+ "prost-types 0.14.4",
+ "tokio",
+ "tonic",
+ "tower",
+]
 
 [[package]]
 name = "hive-cell-proc"
@@ -1611,6 +1622,7 @@ dependencies = [
  "futures",
  "hive-cell",
  "hive-cell-oci",
+ "hive-cell-plugin",
  "hive-cell-wasm",
  "hive-drone",
  "hive-guard",

@@ -130,6 +130,6 @@ Config is TOML, and a subset of it is hot-reloadable.
 [node]      unit = "u1"; reserved_cores = "0-3"; data_dir = "/var/lib/hivebox"
 [pools]     netns_depth = 400; cgroup_depth = 256; refill_rate = 200
 [density]   overcommit = { latency = 1.0, standard = 1.5, best_effort = 3.0 }; psi_stop_admit = 0.20
-[backends]  enabled = ["container", "microvm", "fncall"]; microvm.vmm = "firecracker"
+[backends]  enabled = ["container", "microvm", "fncall"]; microvm.vmm = "firecracker"; plugins = ["/run/hivebox/plugins/qemu.sock"]
 [cache]     l1_path = "/nvme/hive/l1"; l1_max = "6TiB"; pin = ["base:*"]
 ```
