@@ -8,7 +8,9 @@
 use crate::admit::Reservation;
 use crate::comb::Inner;
 use crate::record::{Handle, Record, now_ms, time};
-use hive_cell::{CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, Slot, cgroup};
+use hive_cell::{
+    CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, RootfsPlan, Slot, cgroup,
+};
 use hive_drone::Client;
 use hive_guard::wire::Veth;
 use hive_nectar::oci::Staged;
@@ -416,7 +418,12 @@ impl Actor {
         };
         let slot = self.slot(secret).await?;
         lap("pool");
-        let (rootfs, image) = self.inner.rootfs(&self.cell.spec, &self.cell.project, &slot).await?;
+        // A wasm cell's image names its program, which its driver finds, and it has no rootfs.
+        let (rootfs, image) = if backend == Backend::Fncall {
+            (RootfsPlan::default(), None)
+        } else {
+            self.inner.rootfs(&self.cell.spec, &self.cell.project, &slot).await?
+        };
         self.record.image = image.map(|i| i.as_bytes().to_vec()).unwrap_or_default();
         lap("rootfs");
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
@@ -454,7 +461,10 @@ impl Actor {
         let dir = self.inner.cell_dir(self.cell.id);
         std::fs::create_dir_all(&dir).map_err(|e| io_error("making the cell directory", &e))?;
         let mut cgroup = PathBuf::new();
-        if let Some(pool) = self.inner.cgroups.clone() {
+        // A wasm cell runs in the comb's own threads, so it has no cgroup or namespace of its
+        // own, and its driver holds it to its memory.
+        let own = self.cell.spec.backend != Backend::Fncall;
+        if let Some(pool) = self.inner.cgroups.clone().filter(|_| own) {
             let (qos, mut r) = (self.cell.spec.qos, self.cell.spec.resources);
             let asked = r.vcpu_milli;
             r.vcpu_milli = pool.quota(qos, asked);
@@ -472,7 +482,7 @@ impl Actor {
             self.cgroup = Some(cgroup.clone());
         }
         let mut nameserver = None;
-        if let Some(pool) = self.inner.netns.clone() {
+        if let Some(pool) = self.inner.netns.clone().filter(|_| own) {
             let profile = self.inner.profile(&self.cell.spec.network_profile)?;
             let taken = tokio::task::spawn_blocking(move || pool.take())
                 .await

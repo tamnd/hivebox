@@ -92,12 +92,23 @@ impl Drone {
 
     async fn dispatch(&self, call: Incoming) {
         let Incoming { open, mut stream } = call;
-        let result = match open.method.as_str() {
+        let method = open.method.as_str();
+        if self.cfg.runner.is_some()
+            && (method == api::PROCESS_START || method.starts_with("session."))
+        {
+            let e = Error::new(Reason::PolicyDenied, "this cell only runs commands to completion");
+            return stream.reset(Status::from(e)).await;
+        }
+        let result = match method {
             api::PROCESS_RUN => {
                 let _busy = Busy::new(&self.processes);
                 match RunRequest::decode(open.request) {
                     Ok(req) => match read_stdin(req, &mut stream).await {
-                        Ok(req) => process::run(&self.cfg, req).await.map(|r| r.encode_to_vec()),
+                        Ok(req) => match &self.cfg.runner {
+                            Some(runner) => runner.run(req).await,
+                            None => process::run(&self.cfg, req).await,
+                        }
+                        .map(|r| r.encode_to_vec()),
                         Err(e) => Err(e),
                     },
                     Err(e) => Err(bad_request(e)),

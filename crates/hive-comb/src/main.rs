@@ -255,6 +255,39 @@ async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
             Err(e) => eprintln!("hive-comb: no container cells: {e}"),
         }
     }
+    let f = &cfg.fncall;
+    if f.enabled {
+        let wasm = hive_cell_wasm::Config {
+            modules: f.modules.clone(),
+            mounts: f.mounts.clone(),
+            instances: f.instances,
+            max_mem_mib: f.max_mem_mib,
+        };
+        match hive_cell_wasm::WasmDriver::new(wasm) {
+            Ok(d) => match d.probe().await {
+                Ok(fit) if fit.ready => {
+                    let d = std::sync::Arc::new(d);
+                    drivers.add(d.clone());
+                    // Compiled in the background, so the comb serves at once and a create that
+                    // comes first waits only for its own program.
+                    tokio::spawn(async move {
+                        for (name, r) in d.warm_all().await {
+                            match r {
+                                Ok(took) => eprintln!(
+                                    "hive-comb: wasm program {name} compiled in {} ms",
+                                    took.as_millis()
+                                ),
+                                Err(e) => eprintln!("hive-comb: wasm program {name}: {e}"),
+                            }
+                        }
+                    });
+                }
+                Ok(fit) => eprintln!("hive-comb: no wasm cells: {}", fit.notes.join(", ")),
+                Err(e) => eprintln!("hive-comb: no wasm cells: {e}"),
+            },
+            Err(e) => eprintln!("hive-comb: no wasm cells: {e}"),
+        }
+    }
     drivers
 }
 

@@ -13,5 +13,21 @@ categories.workspace = true
 readme.workspace = true
 publish.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+bytes.workspace = true
+futures.workspace = true
+hive-cell.workspace = true
+hive-drone.workspace = true
+hive-proto.workspace = true
+hive-types.workspace = true
+rustix = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt", "sync", "time"] }
+wasmtime = { workspace = true, features = ["async", "cranelift", "parallel-compilation", "pooling-allocator", "runtime", "std"] }
+wasmtime-wasi = { workspace = true, features = ["preview1"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wasmtime = { workspace = true, features = ["wat"] }
+
 [lints]
 workspace = true

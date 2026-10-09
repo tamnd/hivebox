@@ -44,6 +44,7 @@ tonic = { workspace = true, features = ["channel", "server"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hive-cell-oci.workspace = true
+hive-cell-wasm.workspace = true
 rustix = { workspace = true, features = ["process", "thread"] }
 
 [dev-dependencies]
