@@ -11,8 +11,11 @@ use crate::record::{Handle, Record, now_ms, time};
 use hive_cell::{
     CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, RootfsPlan, Slot, cgroup,
 };
+#[cfg(target_os = "linux")]
+use hive_cell::tree::Precopy;
 use hive_drone::Client;
 use hive_guard::wire::Veth;
+use hive_nectar::BlobId;
 use hive_nectar::oci::Staged;
 use hive_nectar::upper::Scrub;
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason};
@@ -97,6 +100,12 @@ pub(crate) enum Cmd {
     Snapshot {
         scrub: Option<Scrub>,
         done: oneshot::Sender<Result<Staged, Error>>,
+    },
+    /// Copies what the cell wrote into a new directory for a fork, answered with the cell's spec
+    /// and the id of its image when that is in the store.
+    Fork {
+        into: PathBuf,
+        done: oneshot::Sender<Result<(CellSpec, Option<BlobId>), Error>>,
     },
 }
 
@@ -221,7 +230,12 @@ impl Cell {
 /// How an actor starts.
 pub(crate) enum Start {
     /// A new cell. The answer goes to `done` once it is running or has failed.
-    Create { secret: [u8; 32], done: oneshot::Sender<Result<(), Error>> },
+    /// With a seed, the cell's writable layer starts with what that directory holds.
+    Create {
+        secret: [u8; 32],
+        seed: Option<PathBuf>,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
     /// A cell from before a restart, found with this record. `done` is told once the cell is
     /// running again, or has been cleaned up.
     Recover { record: Box<Record>, done: oneshot::Sender<()> },
@@ -293,8 +307,8 @@ impl Actor {
 
     async fn life(&mut self, start: Start) {
         match start {
-            Start::Create { secret, done } => {
-                let result = self.create(secret).await;
+            Start::Create { secret, seed, done } => {
+                let result = self.create(secret, seed).await;
                 let failed = result.is_err();
                 let _ = done.send(result);
                 if failed {
@@ -354,7 +368,7 @@ impl Actor {
         self.inner.changed(&self.cell);
     }
 
-    async fn create(&mut self, secret: [u8; 32]) -> Result<(), Error> {
+    async fn create(&mut self, secret: [u8; 32], seed: Option<PathBuf>) -> Result<(), Error> {
         let deadline = self.inner.cfg.create_deadline;
         let started = Instant::now();
         let permit = match tokio::time::timeout(
@@ -386,7 +400,7 @@ impl Actor {
         // Not written down: a restart that finds no record for a cell cleans up its directory, which
         // is all a preparing cell has. The first record is the one with the driver's handle in it.
         self.show(CellState::Preparing, None, "");
-        let result = match tokio::time::timeout(deadline, self.bring_up(secret)).await {
+        let result = match tokio::time::timeout(deadline, self.bring_up(secret, seed)).await {
             Ok(r) => r,
             Err(_) => Err(Error::new(
                 Reason::DroneUnreachable,
@@ -408,7 +422,7 @@ impl Actor {
         }
     }
 
-    async fn bring_up(&mut self, secret: [u8; 32]) -> Result<(), Error> {
+    async fn bring_up(&mut self, secret: [u8; 32], seed: Option<PathBuf>) -> Result<(), Error> {
         let inner = self.inner.clone();
         let backend = self.cell.spec.backend;
         let mut t = Instant::now();
@@ -419,11 +433,12 @@ impl Actor {
         let slot = self.slot(secret).await?;
         lap("pool");
         // A wasm cell's image names its program, which its driver finds, and it has no rootfs.
-        let (rootfs, image) = if backend == Backend::Fncall {
+        let (mut rootfs, image) = if backend == Backend::Fncall {
             (RootfsPlan::default(), None)
         } else {
             self.inner.rootfs(&self.cell.spec, &self.cell.project, &slot).await?
         };
+        rootfs.seed = seed;
         self.record.image = image.map(|i| i.as_bytes().to_vec()).unwrap_or_default();
         lap("rootfs");
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
@@ -665,6 +680,9 @@ impl Actor {
                     }
                     Some(Cmd::Snapshot { scrub, done }) => {
                         let _ = done.send(self.snapshot(scrub).await);
+                    }
+                    Some(Cmd::Fork { into, done }) => {
+                        let _ = done.send(self.fork(into).await);
                     }
                     None => return,
                 },
@@ -1063,6 +1081,44 @@ impl Actor {
         staged
     }
 
+    /// Copies what the cell wrote into `into`, for a fork's children to start from. A running cell
+    /// is frozen for the copy without telling anyone, the same as for a snapshot.
+    async fn fork(&mut self, into: PathBuf) -> Result<(CellSpec, Option<BlobId>), Error> {
+        let running = match self.cell.state() {
+            CellState::Running => true,
+            CellState::Paused => false,
+            s => return Err(not_running(s)),
+        };
+        if self.cell.spec.backend != Backend::Container {
+            return Err(Error::new(Reason::PolicyDenied, "only container cells fork yet"));
+        }
+        let handle = self.handle.clone().expect("a live cell has a handle");
+        let upper = self.inner.cell_dir(self.cell.id).join("upper");
+        let started = Instant::now();
+        if !running {
+            copy_once(upper, into).await?;
+            self.inner.metrics.snapshot("fork_copy", started.elapsed());
+            self.cell.touch();
+            return Ok((self.cell.spec.clone(), self.record.image()));
+        }
+        // Most of the copy is made while the cell runs, and it is frozen only to bring the copy
+        // up to date, which redoes what changed in the meantime.
+        let pre = precopy(upper, into).await?;
+        let frozen = Instant::now();
+        self.driver.pause(&handle, PauseMode::Freeze).await?;
+        let copied = finish(pre).await;
+        if let Err(e) = self.driver.resume(&handle).await {
+            // Still frozen, so it shows as paused, the only way there being through pausing.
+            let _ = self.commit(CellState::Pausing, None, "").await;
+            let _ = self.commit(CellState::Paused, None, &e.to_string()).await;
+        }
+        self.inner.metrics.snapshot("fork_frozen", frozen.elapsed());
+        self.inner.metrics.snapshot("fork_copy", started.elapsed());
+        self.cell.touch();
+        copied?;
+        Ok((self.cell.spec.clone(), self.record.image()))
+    }
+
     /// Stops the cell and records how it ended. Never fails: whatever goes wrong, the cell ends
     /// up in a terminal state.
     async fn stop(&mut self, cause: Cause, grace: Duration) {
@@ -1164,6 +1220,9 @@ impl Actor {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     Some(Cmd::Snapshot { done, .. }) => {
+                        let _ = done.send(Err(not_running(self.cell.state())));
+                    }
+                    Some(Cmd::Fork { done, .. }) => {
                         let _ = done.send(Err(not_running(self.cell.state())));
                     }
                     Some(Cmd::Quarantine { done }) => {
@@ -1283,6 +1342,61 @@ fn backoff(wait: Duration, base: Duration, given: u64, refaulted: u64) -> Durati
     } else {
         (wait / 2).max(base)
     }
+}
+
+/// Copies the writable layer `upper` of a cell that is not running into the new directory `into`.
+#[cfg(target_os = "linux")]
+async fn copy_once(upper: PathBuf, into: PathBuf) -> Result<(), Error> {
+    blocking(move || {
+        std::fs::create_dir_all(&into)?;
+        hive_cell::tree::copy(&upper, &into).map(drop)
+    })
+    .await
+}
+
+/// Copies the writable layer `upper` of a running cell into the new directory `into`, for
+/// [`finish`] to bring up to date once the cell is frozen.
+#[cfg(target_os = "linux")]
+async fn precopy(upper: PathBuf, into: PathBuf) -> Result<Precopy, Error> {
+    blocking(move || {
+        std::fs::create_dir_all(&into)?;
+        Precopy::start(&upper, &into)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn finish(pre: Precopy) -> Result<(), Error> {
+    blocking(move || pre.finish().map(drop)).await
+}
+
+#[cfg(target_os = "linux")]
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Result<T, Error> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| Error::new(Reason::Internal, "the copy panicked"))?
+        .map_err(|e| Error::new(Reason::Internal, format!("copying what the cell wrote: {e}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+struct Precopy;
+
+#[cfg(not(target_os = "linux"))]
+async fn copy_once(_upper: PathBuf, _into: PathBuf) -> Result<(), Error> {
+    Err(Error::new(Reason::PolicyDenied, "forks need a Linux node"))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn precopy(_upper: PathBuf, _into: PathBuf) -> Result<Precopy, Error> {
+    Err(Error::new(Reason::PolicyDenied, "forks need a Linux node"))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn finish(_pre: Precopy) -> Result<(), Error> {
+    Err(Error::new(Reason::PolicyDenied, "forks need a Linux node"))
 }
 
 #[cfg(test)]

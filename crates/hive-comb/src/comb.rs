@@ -30,7 +30,7 @@ use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, oneshot, watch};
@@ -57,6 +57,33 @@ pub struct CreateRequest {
     /// Make the cell if there is room even when this node turned the key away lately. A gate
     /// sets it when every node in the key's order turned the cell away.
     pub anyway: bool,
+}
+
+/// What a fork's children start from: a copy of what their parent wrote, taken while it held
+/// still. The copy is removed once the last child that needs it has been made.
+#[derive(Debug)]
+pub struct Seed {
+    dir: PathBuf,
+}
+
+impl Drop for Seed {
+    fn drop(&mut self) {
+        let dir = std::mem::take(&mut self.dir);
+        // Off the async threads, since a big copy takes a while to remove.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(move || std::fs::remove_dir_all(dir))),
+            Err(_) => drop(std::fs::remove_dir_all(dir)),
+        }
+    }
+}
+
+/// Where a fork's children start, from [`Comb::fork`].
+#[derive(Debug)]
+pub struct Forked {
+    /// The parent's spec, with its exact image as the source when that is in the store.
+    pub spec: CellSpec,
+    /// What the parent wrote, for [`Comb::create_from`].
+    pub seed: Arc<Seed>,
 }
 
 /// What the WAL has done since the comb opened. Writes over syncs is how many transitions each disk flush carried.
@@ -295,6 +322,8 @@ impl Comb {
             events: broadcast::channel(4096).0,
         });
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
+        // Copies for forks that were under way when the comb last ended.
+        let _ = std::fs::remove_dir_all(inner.cfg.data_dir.join("forks"));
         let comb = Self { inner };
         let (claimed, claimed_netns) = comb.recover(records).await;
         comb.fence().await;
@@ -471,6 +500,16 @@ impl Comb {
 
     /// Makes a cell and returns once it is running, or once it has failed.
     pub async fn create(&self, req: CreateRequest) -> Result<CellInfo, Error> {
+        self.create_from(req, None).await
+    }
+
+    /// Makes a cell the same as [`Comb::create`], whose writable layer starts with what `seed`
+    /// holds, for a fork's children.
+    pub async fn create_from(
+        &self,
+        req: CreateRequest,
+        seed: Option<Arc<Seed>>,
+    ) -> Result<CellInfo, Error> {
         let inner = &self.inner;
         req.spec.validate().map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
         if req.spec.backend == Backend::Auto {
@@ -552,7 +591,8 @@ impl Comb {
         inner.insert(&cell);
         let actor = Actor::new(inner.clone(), cell.clone(), driver, rx, Some(reservation), record);
         let (done, started) = oneshot::channel();
-        tokio::spawn(actor.run(Start::Create { secret, done }));
+        let seed_dir = seed.as_ref().map(|s| s.dir.clone());
+        tokio::spawn(actor.run(Start::Create { secret, seed: seed_dir, done }));
         match started.await {
             Ok(Ok(())) => Ok(cell.info()),
             Ok(Err(e)) => Err(e),
@@ -663,6 +703,35 @@ impl Comb {
         self.inner.metrics.snapshot("build", built.elapsed());
         self.inner.metrics.snapshot("total", started.elapsed());
         Ok(snap)
+    }
+
+    /// Copies what a live container cell wrote, for children made from it with
+    /// [`Comb::create_from`]. A running cell is frozen for the copy, the same as for a snapshot.
+    /// Only the files come along: the children start processes of their own.
+    pub async fn fork(&self, id: CellId) -> Result<Forked, Error> {
+        static FORKS: AtomicU64 = AtomicU64::new(0);
+        let cell = self.inner.find(id)?;
+        let n = FORKS.fetch_add(1, Ordering::Relaxed);
+        let dir = self.inner.cfg.data_dir.join("forks").join(format!("{id}.{n}"));
+        let seed = Arc::new(Seed { dir: dir.clone() });
+        let (done, wait) = oneshot::channel();
+        if !cell.send(Cmd::Fork { into: dir, done }).await {
+            return Err(Error::new(Reason::Internal, "the node is shutting down"));
+        }
+        let (mut spec, image) = wait
+            .await
+            .map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
+        if let Some(image) = image {
+            // The image the parent has, even if its name has moved to another since.
+            spec.source = Source::Snapshot(image.to_string());
+        }
+        Ok(Forked { spec, seed })
+    }
+
+    /// Whether `project` has a live cell made with the idempotency key `key`.
+    pub fn made(&self, project: &str, key: &str) -> bool {
+        let id = self.inner.lock_idem().get(&(project.to_string(), key.to_string())).copied();
+        id.and_then(|id| self.inner.cell(id)).is_some()
     }
 
     /// Quarantines a live cell: freezes it for good, cuts it off the network and takes a disk
@@ -930,7 +999,7 @@ impl Inner {
                     || Error::new(Reason::ImageUnavailable, format!("no image named {name}"));
                 match std::fs::metadata(&path) {
                     Ok(m) if m.is_dir() => {
-                        return Ok((RootfsPlan { lowers: vec![path], upper }, None));
+                        return Ok((RootfsPlan { lowers: vec![path], upper, seed: None }, None));
                     }
                     Ok(m) if m.is_file() => {}
                     _ => return Err(missing()),
@@ -961,7 +1030,7 @@ impl Inner {
             .mount(&nectar.store, &manifest)
             .await
             .map_err(|e| unavailable(e.to_string()))?;
-        Ok((RootfsPlan { lowers, upper }, Some(id)))
+        Ok((RootfsPlan { lowers, upper, seed: None }, Some(id)))
     }
 
     /// Where `project` keeps the ids of the images it committed, one file for each name.

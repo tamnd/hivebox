@@ -1,7 +1,9 @@
 //! The `Snapshots` service for container cells. A snapshot is the cell's image with one more layer
 //! holding what the cell wrote, stored in the node's image store, and its id is that image's id.
 //! A restore is a create with the snapshot as the source, and a commit gives a scrubbed snapshot a
-//! name in the caller's project.
+//! name in the caller's project. A fork copies what a cell wrote on its own node while the cell
+//! runs, freezes it only to bring the copy up to date, and starts children on the cell's image with
+//! the copy as their upper.
 //!
 //! A snapshot can squash git repositories first, for a testbed made from an upstream clone: the
 //! repository is rebuilt with one commit holding what `HEAD` holds, so the fix a task asks for
@@ -51,6 +53,9 @@ git read-tree HEAD
 git update-index -q --refresh > /dev/null || true
 [ "$(git rev-list --all | wc -l)" -eq 1 ] && [ "$(git rev-parse 'HEAD^{tree}')" = "$tree" ]
 echo "$top $commit""#;
+
+/// The most children one fork makes.
+const MAX_FORK: u32 = 16;
 
 fn snapshot_name(r: Option<&v1::SnapshotRef>) -> String {
     r.map(|r| r.id.clone()).unwrap_or_default()
@@ -144,9 +149,33 @@ impl Snapshots for Api {
         req: Request<v1::ForkRequest>,
     ) -> Result<Response<Self::ForkStream>, Status> {
         let call = Call::new(self, &req, "snapshot.fork")?;
-        let r = req.get_ref();
-        let args = Args::default().num(r.count.into()).map(&r.labels).str(&r.idempotency_key);
-        call.check(&r.cell_id, &args, Err(Status::unimplemented("fork is not in yet")))
+        let r = req.into_inner();
+        let count = r.count.max(1);
+        let args = Args::default().num(count.into()).map(&r.labels).str(&r.idempotency_key);
+        let keys: Vec<_> = (0..count)
+            .map(|i| {
+                (!r.idempotency_key.is_empty()).then(|| format!("{}/fork/{i}", r.idempotency_key))
+            })
+            .collect();
+        let forked = async {
+            if count > MAX_FORK {
+                return Err(invalid(format!(
+                    "count is {count}, and one fork makes at most {MAX_FORK}"
+                )));
+            }
+            let id = parse_id(&r.cell_id)?;
+            let parent = self.owned(&call.project, id).map_err(status)?;
+            // A retry that finds every child made gets them back without the parent frozen again.
+            if keys.iter().all(|k| k.as_ref().is_some_and(|k| self.comb.made(&call.project, k))) {
+                return Ok((parent.spec, None));
+            }
+            let forked = self.comb.fork(id).await.map_err(status)?;
+            Ok((forked.spec, Some(forked.seed)))
+        }
+        .await;
+        let (mut spec, seed) = call.check(&r.cell_id, &args, forked)?;
+        spec.labels.extend(r.labels);
+        Ok(Response::new(self.creates(&call, &args, &spec, keys, false, seed)))
     }
 
     async fn commit(

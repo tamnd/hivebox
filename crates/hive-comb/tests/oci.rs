@@ -582,6 +582,92 @@ async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
     node.comb.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_starts_cells_from_what_the_cell_wrote() {
+    let Some(node) = Node::new(4).await else { return };
+    let id = node.comb.create(request(spec("python"))).await.unwrap().id;
+    // A whiteout, an opaque directory, a hard link, a set-id file with owners of its own, a
+    // symlink, many small files and one big one.
+    let work = "echo one > /root/note && ln /root/note /root/hard && rm /etc/issue \
+                && rm -rf /etc/apt && mkdir /etc/apt && echo new > /etc/apt/only \
+                && mkdir /srv/many && for i in $(seq 2000); do echo $i > /srv/many/$i; done \
+                && chown 1234:5678 /srv/many/7 && chmod 4710 /srv/many/7 \
+                && ln -s /root/note /srv/link && head -c 32M /dev/urandom > /srv/blob \
+                && sha256sum /srv/blob | cut -c1-16";
+    let sum = sh(&node.comb, id, work).await;
+    sh(&node.comb, id, "sleep 3600 >/dev/null 2>&1 &").await;
+
+    // Disk used on the node's filesystem, to see whether the data was shared or copied.
+    let used = || {
+        let mut df = std::process::Command::new("df");
+        let out = df.args(["-B1", "--output=used"]).arg(&node.cfg.data_dir).output().unwrap();
+        let out = out.stdout;
+        String::from_utf8(out).unwrap().lines().last().unwrap().trim().parse::<i64>().unwrap()
+    };
+    let before = used();
+    let t = Instant::now();
+    let forked = node.comb.fork(id).await.unwrap();
+    let copied = t.elapsed();
+    let disk = (used() - before) / (1 << 20);
+    assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Running);
+    let made: Vec<CellId> = futures::future::join_all((0..4).map(|_| {
+        node.comb.create_from(request(forked.spec.clone()), Some(forked.seed.clone()))
+    }))
+    .await
+    .into_iter()
+    .map(|r| r.unwrap().id)
+    .collect();
+    let took = t.elapsed();
+    drop(forked);
+    let text = node.comb.metrics().registry().render();
+    let line = "hive_snapshot_seconds_sum{stage=\"fork_frozen\"} ";
+    let frozen = text.lines().find_map(|l| l.strip_prefix(line)).unwrap();
+    println!(
+        "fork of a cell with 2000 small files and 32 MiB: copied in {copied:.2?}, frozen \
+         {:.2?} of that, {disk} MiB more disk used, and 4 children running {took:.2?} after the \
+         fork began",
+        Duration::from_secs_f64(frozen.parse().unwrap())
+    );
+
+    let seen = "cat /root/note; stat -c %h /root/hard; test -e /etc/issue || echo gone; \
+                ls /etc/apt; ls /srv/many | wc -l; stat -c '%u %g %a' /srv/many/7; \
+                readlink /srv/link; sha256sum /srv/blob | cut -c1-16; \
+                cat /proc/[0-9]*/comm | grep -c '^sleep$' || true";
+    let want = format!("one\n2\ngone\nonly\n2000\n1234 5678 4710\n/root/note\n{sum}0\n");
+    for &c in &made {
+        assert_eq!(sh(&node.comb, c, seen).await, want);
+    }
+    // The parent goes on as it was, and each copy is its own.
+    assert_eq!(sh(&node.comb, id, "cat /proc/[0-9]*/comm | grep -c ^sleep$").await, "1\n");
+    sh(&node.comb, made[0], "echo two > /root/note").await;
+    assert_eq!(sh(&node.comb, made[0], "cat /root/hard").await, "two\n");
+    assert_eq!(sh(&node.comb, made[1], "cat /root/note").await, "one\n");
+    assert_eq!(sh(&node.comb, id, "cat /root/note").await, "one\n");
+    // The copy the children started from is gone once they are all made.
+    let forks = node.cfg.data_dir.join("forks");
+    let until = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&forks).unwrap().next().is_some() {
+        assert!(Instant::now() < until, "the fork's copy was left");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A paused cell stays paused.
+    node.comb.pause(id).await.unwrap();
+    let again = node.comb.fork(id).await.unwrap();
+    assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Paused);
+    let late = node.comb.create_from(request(again.spec.clone()), Some(again.seed.clone()));
+    let late = late.await.unwrap().id;
+    drop(again);
+    assert_eq!(sh(&node.comb, late, "cat /root/note").await, "one\n");
+
+    for c in made.into_iter().chain([id, late]) {
+        node.comb.stop(c, None).await.unwrap();
+    }
+    let e = node.comb.fork(id).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CellNotRunning, "{e}");
+    node.comb.shutdown().await;
+}
+
 /// Whether a TCP connect from the cell got an answer from `ip`, refused or not, within a second.
 async fn reaches(comb: &Comb, id: CellId, ip: &str, port: u16) -> bool {
     let script = format!(

@@ -125,6 +125,20 @@ Fork children get a fresh identity (VMGenID, hostname, cell id, network addresse
 
 The scheduler (04) co-locates children with the parent unless `spread=true`, because fork locality means page sharing.
 
+What is in now is a files only fork for container cells, which the `proc` row above narrows to what our hosts can do. CRIU needs a kernel and packages our nodes lack, so no process state comes along and each child starts processes of its own. `Snapshots.Fork` copies the cell's writable layer on its node in two passes. The first pass copies the tree while the cell runs, on up to 4 threads, and remembers each entry's device, inode, type and ctime. Then the cell is frozen and a second pass copies again only what changed since, plus anything whose ctime is within a second of the first pass's start, and removes what the cell deleted. The cell is thawed and the children start on its image with the copy as their upper. On XFS with reflink the copy and the children's uppers share blocks through `FICLONE`. The comb reports the whole copy as `hive_snapshot_seconds{stage="fork_copy"}` and the frozen part as `{stage="fork_frozen"}`.
+
+Measured on server3 (8 cores, load 100 to 110) through the Python SDK, with a parent that wrote 76 MiB in 5296 paths (a venv, 4000 small files and a 64 MiB blob), three rounds each:
+
+| | ext4, copy all frozen | ext4, two passes | XFS loop image, copy all frozen | XFS loop image, two passes |
+|---|---|---|---|---|
+| parent frozen | 1.1 to 11.0 s | 120 to 182 ms | 1.2 to 4.5 s | 115 to 183 ms (one 630 ms) |
+| whole copy | same as frozen | 1.1 to 5.3 s | same as frozen | 2.0 to 6.5 s |
+| 1 child running | 2.5 to 3.2 s | 2.7 to 5.7 s | 5.1 to 7.2 s | 5.0 to 7.8 s |
+| 16 children running | 36 to 45 s | 20 to 27 s | 33 to 37 s | 43 to 83 s |
+| disk while 16 children live | +1.7 GiB | +1.7 GiB | +68 MiB | +68 MiB |
+
+The freeze is what the parent's own processes see, and it went from seconds to under 200 ms in all but one round. A ticker in the parent still saw stalls of up to 1.6 s on ext4 and 4.3 s on XFS during the forks of 16, longer than the freeze, since 16 child starts and the copy share 8 cores with a load of 100. The time to 16 running children is dominated by the child creates on this host and varied more between runs than between the two builds. The DeltaBox and microVM targets in the table above are for process state and stay open.
+
 ## 6. Memory density (T2 focus)
 
 | Mechanism | Use | Expected effect (DSec) |

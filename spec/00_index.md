@@ -93,6 +93,6 @@ It adds what DSec leaves open:
 
 1. Should the default untrusted container tier be a shield VM, or just microVMs (drop T1-untrusted)? The deciding factors are density versus operational simplicity. Decide after the M2 density benchmarks.
 2. How far can fanotify pre-content lazy fill replace ublk for containers across the kernel fleet?
-3. Is `proc`-mode fork (DeltaBox-style) worth productizing, or should we ship VM fork only?
+3. Is `proc`-mode fork (DeltaBox-style) worth productizing, or should we ship VM fork only? A files only fork of container cells is in (07 section 5) and freezes the parent for under 200 ms on a loaded host, but carrying process state needs CRIU or VM snapshots.
 4. Keeper: is openraft+redb enough at 5 voters for multi-unit, or should there be a FoundationDB option?
 5. Should the LLM gateway be part of hivebox or remain an external dependency with a stable contract?

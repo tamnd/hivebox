@@ -388,6 +388,31 @@ class AsyncHive:
                                             squash_git=list(squash_git))
         return (await self._call(self._snapshots.Snapshot, req)).id
 
+    async def fork(self, cell: Cell | str, count: int = 1, *, labels: Mapping[str, str] | None = None,
+                   idempotency_key: str = "") -> list[Cell]:
+        """Makes `count` cells, at most 16, from what a running or paused container cell wrote.
+        Its files are copied while it runs, and it is frozen only while the copy is brought up
+        to date. The children get its spec plus `labels`
+        and start processes of their own, since only the files come along. If a child fails, the
+        others are stopped and the first failure raises."""
+        cell_id = cell.id if isinstance(cell, Cell) else cell
+        req = snapshots_pb2.ForkRequest(cell_id=cell_id, count=count, labels=dict(labels or {}),
+                                        idempotency_key=idempotency_key)
+        out: list[Cell | _errors.HiveError] = [_errors.Internal("the fork ended without this cell")] * max(count, 1)
+        try:
+            async for e in self._snapshots.Fork(req, metadata=self._metadata):
+                if e.HasField("cell"):
+                    out[e.index] = Cell(self, e.cell)
+                else:
+                    out[e.index] = _errors.make(e.error.reason, e.error.message, is_infra_error=e.error.is_infra_error)
+        except grpc.aio.AioRpcError as e:
+            raise _errors.from_rpc(e) from None
+        failed = [r for r in out if isinstance(r, Exception)]
+        if failed:
+            await asyncio.gather(*(c.stop() for c in out if isinstance(c, Cell)), return_exceptions=True)
+            raise failed[0]
+        return out
+
     async def commit(self, snapshot: str, name: str) -> None:
         """Names a scrubbed snapshot as the image `name` in the project, so Spec(image=name)
         makes cells from it. Committing a name again moves it."""
@@ -628,6 +653,10 @@ class Cell:
     async def snapshot(self, *, scrub: bool = False, allow: Iterable[str] = (), squash_git: Iterable[str] = ()) -> str:
         """Takes a disk snapshot of the cell, as AsyncHive.snapshot does."""
         return await self._hive.snapshot(self, scrub=scrub, allow=allow, squash_git=squash_git)
+
+    async def fork(self, count: int = 1, *, labels: Mapping[str, str] | None = None, idempotency_key: str = "") -> list[Cell]:
+        """Makes cells from what this cell wrote, as AsyncHive.fork does."""
+        return await self._hive.fork(self, count, labels=labels, idempotency_key=idempotency_key)
 
     async def run(self, cmd: str | Sequence[str], *, timeout: float | str | None = None, stdin: bytes = b"",
                   env: Mapping[str, str] | None = None, cwd: str = "", user: str = "", max_output_bytes: int = 0) -> RunResult:

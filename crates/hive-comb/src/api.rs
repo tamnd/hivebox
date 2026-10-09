@@ -9,7 +9,7 @@
 //! every call sees and touches only that project's cells.
 
 use crate::cell::{CellInfo, Status as CellStatus};
-use crate::comb::{Comb, CreateRequest};
+use crate::comb::{Comb, CreateRequest, Seed};
 use futures::stream::{self, BoxStream, FuturesUnordered, StreamExt, TryStreamExt};
 use hive_drone::Output;
 use hive_proto::convert;
@@ -21,7 +21,7 @@ use hive_proto::v1::files_server::{Files, FilesServer};
 use hive_proto::v1::llm_server::LlmServer;
 use hive_proto::v1::snapshots_server::SnapshotsServer;
 use hive_proto::v1::verify_server::VerifyServer;
-use hive_types::{CellId, CellState, Error, Reason, is_name};
+use hive_types::{CellId, CellSpec, CellState, Error, Reason, is_name};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io;
@@ -657,25 +657,41 @@ impl Api {
         )?;
         // The spec as the comb reads it, whose maps are in key order.
         let args = args.str(&format!("{spec:?}"));
-        let project = call.project.clone();
-        let creates: FuturesUnordered<_> = (0..count)
-            .map(|index| {
-                let idem_key = match (req.idempotency_key.as_str(), count) {
-                    ("", _) => None,
-                    (key, 1) => Some(key.to_string()),
-                    (key, _) => Some(format!("{key}/{index}")),
-                };
+        let keys = (0..count)
+            .map(|index| match (req.idempotency_key.as_str(), count) {
+                ("", _) => None,
+                (key, 1) => Some(key.to_string()),
+                (key, _) => Some(format!("{key}/{index}")),
+            })
+            .collect();
+        Ok(Response::new(self.creates(&call, &args, &spec, keys, anyway, None)))
+    }
+
+    /// Makes one cell of `spec` for each key, each recorded with `args`, and streams how each
+    /// went in the order they finish. With a seed, each starts with what it holds.
+    fn creates(
+        &self,
+        call: &Call,
+        args: &Args,
+        spec: &CellSpec,
+        keys: Vec<Option<String>>,
+        anyway: bool,
+        seed: Option<Arc<Seed>>,
+    ) -> BoxStream<'static, Result<v1::CreateEvent, Status>> {
+        let creates: FuturesUnordered<_> = (0u32..)
+            .zip(keys)
+            .map(|(index, idem_key)| {
                 let req = CreateRequest {
                     spec: spec.clone(),
-                    project: project.clone(),
+                    project: call.project.clone(),
                     idem_key,
                     anyway,
                 };
                 // On its own task, so the cell is still made if the caller goes away, and a
                 // retry with the same key finds it.
                 let task = tokio::spawn({
-                    let comb = self.comb.clone();
-                    async move { comb.create(req).await }
+                    let (comb, seed) = (self.comb.clone(), seed.clone());
+                    async move { comb.create_from(req, seed).await }
                 });
                 let (call, args) = (call.clone(), args.clone());
                 async move {
@@ -696,7 +712,7 @@ impl Api {
                 }
             })
             .collect();
-        Ok(Response::new(creates.boxed()))
+        creates.boxed()
     }
 
     /// One page of the cells of `project` that `req` picks.
