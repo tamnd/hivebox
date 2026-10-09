@@ -240,4 +240,4 @@ sizes = { md = { vcpu_milli = 2000, mem_mib = 4096 } }
 - Harbor: a `BaseEnvironment` provider (`start`, `exec`, `upload`, `stop`). This lets Terminal-Bench and SWE-bench datasets run unchanged.
 - OpenEnv: a `reset/step/state` HTTP server template.
 - SandboxFusion: `/run_code` (fncall tier, per-language runners).
-- MCP: a server exposing `create_cell`, `run`, `read_file`, `write_file` and `diff`. It is for agent-driven environment building, in the DSec style where agents use the API.
+- MCP: `python -m hivebox.mcp`, a server exposing `create_cell`, `list_cells`, `run_command`, `read_file`, `write_file`, `list_files`, `fork_cell` and `stop_cell`, limited to the cells it made. It is for agent-driven environment building, in the DSec style where agents use the API. A `diff` tool waits for `Files.Diff` in the comb.

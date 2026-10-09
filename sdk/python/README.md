@@ -155,6 +155,16 @@ app = create_hivebox_app(image="swe-requests", mem_mib=2048, workdir="/testbed",
 
 Serve it with `uvicorn module:app` and connect with `GenericEnvClient`. With `check`, a command run in the episode's cell decides the reward. With `verify`, an argv run by `Verify.Run` on the episode's changes in a fresh cell with no network decides it, and when hivebox could not do the check the reward is None and the verdict has `infra_error` set, so a trainer can mask the sample. The verdict is in the last observation. A cell is stopped when its episode ends, when the next reset starts, or when the client closes its session, and every WebSocket session gets its own environment, up to `max_concurrent_envs`. Install it with `pip install hivebox[openenv]`.
 
+## MCP
+
+`python -m hivebox.mcp` is an MCP server that gives an agent cells to work in. Its tools make a cell, run commands in a shell that keeps its directory and variables, read, write and list files, fork a cell into copies that start from its files, and stop it. With Claude Code, for example:
+
+```
+claude mcp add hivebox -- python -m hivebox.mcp --image python --image node --max-cells 4
+```
+
+The agent only reaches cells this server made, at most `--max-cells` at once, and only from the images named with `--image` when any are. Cells get the `none` network profile unless the agent asks for one allowed with `--network`. When the server exits it stops every cell it made, unless `--keep` is given. It talks over stdio, or over streamable HTTP at /mcp with `--http HOST:PORT`. Install it with `pip install hivebox[mcp]`.
+
 ## LLM route
 
 Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.
