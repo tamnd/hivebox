@@ -16,6 +16,7 @@ pub const ALLOWED_LABELS: &[&str] = &[
     "node",
     "op",
     "path",
+    "policy",
     "pool",
     "project",
     "qos",

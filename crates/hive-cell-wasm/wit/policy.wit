@@ -1,0 +1,59 @@
+package hivebox:policy@0.1.0;
+
+/// Decides whether a node makes a cell, and can change a few things about it first. A policy
+/// imports nothing, so the same request always gets the same verdict.
+interface admit {
+    /// What the cell starts from.
+    variant source {
+        template(string),
+        image(string),
+        snapshot(string),
+    }
+
+    /// A cell someone asked for, after earlier policies changed it.
+    record request {
+        /// The project that owns it.
+        project: string,
+        source: source,
+        /// "fncall", "container", "microvm" or "fullvm".
+        backend: string,
+        vcpu-milli: u32,
+        mem-mib: u32,
+        disk-gib: u32,
+        /// "latency", "standard" or "best_effort".
+        qos: string,
+        network-profile: string,
+        /// The longest it may live, in seconds, or none for no limit.
+        hard-ttl-s: option<u64>,
+        trusted-image: bool,
+        labels: list<tuple<string, string>>,
+        /// The names in its environment. The values are left out, since they may be secrets.
+        env: list<string>,
+    }
+
+    /// What a policy changes before the cell is made.
+    record change {
+        /// Its network profile instead, which the node has to know.
+        network-profile: option<string>,
+        /// Its longest life instead, in seconds.
+        hard-ttl-s: option<u64>,
+        /// Labels to set on it, over any it has with the same key.
+        labels: list<tuple<string, string>>,
+    }
+
+    variant verdict {
+        /// Make it as it is.
+        allow,
+        /// Make it with these changes.
+        change(change),
+        /// Do not make it, and tell the caller why.
+        deny(string),
+    }
+
+    check: func(request: request) -> verdict;
+}
+
+/// A policy plugin.
+world policy {
+    export admit;
+}

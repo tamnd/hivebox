@@ -16,7 +16,8 @@
 //! are refused, since there is no process to stream and no shell to keep.
 //!
 //! [`Graders`] run reward plugins, components of the world in `wit/reward.wit` that turn what a
-//! verification saw into a reward.
+//! verification saw into a reward, and [`Policies`] run policy plugins, components of the world
+//! in `wit/policy.wit` that a node asks before it makes a cell.
 
 // The drone this leans on only builds for Linux.
 #![cfg(target_os = "linux")]
@@ -24,8 +25,10 @@
 
 mod driver;
 mod grader;
+mod policy;
 mod run;
 mod words;
 
 pub use driver::{Config, TICK, WasmDriver};
 pub use grader::{Grade, GraderConfig, Graders, Input, Run};
+pub use policy::{Change, Policies, PolicyConfig, Verdict};

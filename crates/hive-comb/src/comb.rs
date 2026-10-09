@@ -13,6 +13,7 @@ use crate::pressure::Brake;
 use crate::record::{Record, SEQ_KEY, Seq, time};
 use crate::wal::Wal;
 use hive_cell::{DriverRegistry, RootfsPlan, Slot};
+use hive_cell_wasm::Verdict;
 use hive_drone::Client;
 use hive_guard::Profile;
 use hive_nectar::cas::Cuts;
@@ -132,6 +133,8 @@ pub(crate) struct Inner {
     pub(crate) wal: Wal,
     pub(crate) drivers: DriverRegistry,
     pub(crate) admission: Arc<Admission>,
+    /// The policy plugins, when the config names any.
+    policies: Option<hive_cell_wasm::Policies>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) cgroups: Option<Arc<Cgroups>>,
     /// The core scheduling cookies, when the host takes them and the cells have cgroups.
@@ -152,6 +155,23 @@ pub(crate) struct Inner {
     turned: Mutex<Turned>,
     seq: tokio::sync::Mutex<SeqBlock>,
     events: broadcast::Sender<CellEvent>,
+}
+
+/// The policies `cfg` names, each compiled, so a node does not start with one it cannot run.
+async fn policies(cfg: &Config) -> io::Result<Option<hive_cell_wasm::Policies>> {
+    if cfg.policies.is_empty() {
+        return Ok(None);
+    }
+    let policies = hive_cell_wasm::Policies::new(hive_cell_wasm::PolicyConfig {
+        dir: cfg.policy_dir.clone(),
+        timeout: cfg.policy_timeout,
+        mem_mib: cfg.policy_mem_mib,
+    })
+    .map_err(|e| io::Error::other(e.message))?;
+    for name in &cfg.policies {
+        policies.check(name).await.map_err(|e| io::Error::other(e.message))?;
+    }
+    Ok(Some(policies))
 }
 
 fn at(what: &str, path: &Path) -> impl FnOnce(io::Error) -> io::Error {
@@ -282,6 +302,7 @@ impl Comb {
             None => None,
         };
         let images = Nectar::open(&cfg)?;
+        let policies = policies(&cfg).await?;
         // The keeper's name for the node stays the same when its index does not.
         let node =
             cfg.keeper.as_ref().map_or_else(|| format!("node-{}", cfg.node), |k| k.name.clone());
@@ -303,6 +324,7 @@ impl Comb {
             wal,
             drivers,
             admission,
+            policies,
             shutdown: CancellationToken::new(),
             cgroups,
             core,
@@ -507,11 +529,12 @@ impl Comb {
     /// holds, for a fork's children.
     pub async fn create_from(
         &self,
-        req: CreateRequest,
+        mut req: CreateRequest,
         seed: Option<Arc<Seed>>,
     ) -> Result<CellInfo, Error> {
         let inner = &self.inner;
         req.spec.validate().map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+        inner.police(&req.project, &mut req.spec).await?;
         if req.spec.backend == Backend::Auto {
             return Err(Error::new(
                 Reason::InvalidArgument,
@@ -897,6 +920,40 @@ impl Inner {
 
     /// The guard's profile for a spec's `network_profile`, or `None` when cells have loopback only,
     /// which serves `none` and nothing else.
+    /// Asks every policy about a cell, in order, and makes the changes they ask for. A policy
+    /// that cannot give a verdict turns the cell away, the same as one that says no.
+    async fn police(&self, project: &str, spec: &mut CellSpec) -> Result<(), Error> {
+        let Some(policies) = &self.policies else { return Ok(()) };
+        let denied = |name: &str, why: String| {
+            Error::new(Reason::PolicyDenied, format!("policy {name} turned the cell away: {why}"))
+        };
+        for name in &self.cfg.policies {
+            let t = Instant::now();
+            let verdict = match policies.decide(name, project, spec).await {
+                Ok(v) => v,
+                Err(e) => Err(e.message),
+            };
+            let took = t.elapsed();
+            match verdict {
+                Ok(Verdict::Allow) => self.metrics.policy(name, "allow", took),
+                Ok(Verdict::Change(c)) => {
+                    self.metrics.policy(name, "change", took);
+                    c.apply(spec);
+                    spec.validate().map_err(|e| denied(name, format!("its change left {e}")))?;
+                }
+                Ok(Verdict::Deny(why)) => {
+                    self.metrics.policy(name, "deny", took);
+                    return Err(denied(name, why));
+                }
+                Err(e) => {
+                    self.metrics.policy(name, "failed", took);
+                    return Err(denied(name, format!("it gave no verdict, as {e}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn profile(&self, name: &str) -> Result<Option<Profile>, Error> {
         let net = self.netns.as_ref().and_then(|p| p.net());
         match (net, net.and_then(|n| n.profile(name))) {

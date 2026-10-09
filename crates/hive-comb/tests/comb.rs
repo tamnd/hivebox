@@ -5,6 +5,8 @@
 #![cfg(target_os = "linux")]
 
 mod common;
+#[path = "../../hive-cell-wasm/tests/support/policies.rs"]
+mod policies;
 
 use common::*;
 
@@ -888,4 +890,60 @@ async fn cells_get_a_network_namespace_of_their_own() {
     killed(&fake, b).await;
     gone(&kept[0]).await;
     comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policies_change_or_turn_away_a_cell_before_it_is_made() {
+    let s = Scratch::new();
+    let dir = s.0.join("policies");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["small", "rl", "nowhere", "trap"] {
+        std::fs::write(dir.join(format!("{name}.wasm")), policies::component(name)).unwrap();
+    }
+    let fake = Arc::new(Fake::default());
+    let with = |names: &[&str]| Config {
+        policies: names.iter().map(|n| n.to_string()).collect(),
+        policy_dir: dir.clone(),
+        ..config(&s.0)
+    };
+    let as_project =
+        |project: &str, spec: CellSpec| CreateRequest { project: project.into(), ..request(spec) };
+    let comb = open(with(&["small", "rl"]), &fake).await;
+
+    // A cell of an rl project loses its network and gets at most an hour, so it fits a node that
+    // has no open network.
+    let mut open_net = spec("python");
+    open_net.network_profile = "mirrors".into();
+    let cell = comb.create(as_project("rl-train", open_net.clone())).await.unwrap();
+    assert_eq!(cell.spec.network_profile, "none");
+    assert_eq!(cell.spec.hard_ttl, Some(Duration::from_secs(3600)));
+    assert_eq!(cell.spec.labels["policy"], "rl");
+    assert_eq!(comb.get(cell.id).unwrap().spec.labels["policy"], "rl");
+    let e = comb.create(as_project("web", open_net)).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+
+    // The node has 4 GiB, but the policy says no first.
+    let mut big = spec("python");
+    big.resources.mem_mib = 8192;
+    let e = comb.create(request(big)).await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied);
+    assert!(e.message.contains("policy small turned the cell away: more than 4 GiB"), "{e}");
+    comb.shutdown().await;
+
+    // A changed cell is checked again, and a policy that traps turns the cell away.
+    let comb = open(with(&["nowhere"]), &fake).await;
+    let e = comb.create(request(spec("python"))).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+    comb.shutdown().await;
+    let comb = open(with(&["trap"]), &fake).await;
+    let e = comb.create(request(spec("python"))).await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied);
+    assert!(e.message.contains("gave no verdict"), "{e}");
+    comb.shutdown().await;
+
+    // A node does not start with a policy it does not have.
+    let mut drivers = DriverRegistry::new();
+    drivers.add(fake.clone());
+    let Err(e) = Comb::open(with(&["small", "gone"]), drivers).await else { panic!() };
+    assert!(e.to_string().contains("no policy named \"gone\""), "{e}");
 }
