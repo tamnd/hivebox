@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.39
+
+Fork container cells from what they wrote.
+
 - Fork. `Snapshots.Fork` makes up to 16 cells from what a running or paused container cell wrote, with its spec plus the labels given, and a retry with the same idempotency key gets the same children back. The writable layer is copied while the cell runs, then the cell is frozen only while a second pass copies what changed, and on XFS the copy shares blocks with reflink. Only files come along, not processes. With a parent that wrote 76 MiB in 5296 paths on server3 at a load of 100 to 110, the parent was frozen for 115 to 183 ms in all but one of 18 forks, against 1.1 to 11 s when the whole copy ran frozen, and 16 children on XFS took 68 MiB more disk. `hivectl fork`, the Rust SDK and the Python SDK (`cell.fork(n)`) take it.
 
 ## 0.0.38
