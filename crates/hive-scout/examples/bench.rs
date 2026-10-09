@@ -48,6 +48,7 @@ fn main() {
                     seq: round,
                     addr: Arc::from("10.0.0.1:7400"),
                     healthy: true,
+                    cloud: false,
                     backends: BackendSet::of(&[Backend::Container, Backend::Microvm]),
                     cpu_milli: 96_000,
                     cpu_committed_milli: 40_000,

@@ -172,6 +172,7 @@ mod tests {
             seq,
             addr: Arc::from(format!("10.0.0.{node}:7400")),
             healthy: true,
+            cloud: false,
             backends: BackendSet::of(&[Backend::Container]),
             cpu_milli: 64_000,
             cpu_committed_milli: 0,

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use hive_types::{Backend, Resources};
-use hive_waggle::{BackendSet, ClusterView, NodeView, PlaceReq, Placement, Placer};
+use hive_waggle::{
+    BackendSet, ClusterView, LayerBloom, NodeView, PlaceReq, Placement, Placer, image_digest,
+};
 
 fn res(vcpu_milli: u32, mem_mib: u32) -> Resources {
     Resources { vcpu_milli, mem_mib, ..Resources::default() }
@@ -16,6 +18,7 @@ fn req(n: u32, r: Resources) -> PlaceReq<'static> {
         resources: r,
         n,
         layers: &[],
+        image: Some("python"),
         project: 1,
         affinity: None,
         exclude: &[],
@@ -261,4 +264,87 @@ fn a_key_goes_to_the_same_node_from_any_placer_and_moves_only_with_its_node() {
             assert_eq!(now, was, "{key}");
         }
     }
+}
+
+/// Four on-prem nodes of 10 GiB with `used` MiB each given out, and two empty cloud nodes, 10
+/// and 11, that run containers only and have the python image staged.
+fn hybrid(used: u64) -> ClusterView {
+    let mut staged = LayerBloom::default();
+    staged.insert(&image_digest("python"));
+    let mut nodes: Vec<NodeView> = (0..4)
+        .map(|i| NodeView { mem_committed_mib: used, ..NodeView::empty(i, 16_000, 10_240) })
+        .collect();
+    for i in [10, 11] {
+        nodes.push(NodeView {
+            cloud: true,
+            layers: staged.clone(),
+            backends: BackendSet::of(&[Backend::Container]),
+            ..NodeView::empty(i, 16_000, 10_240)
+        });
+    }
+    ClusterView { nodes }
+}
+
+fn on_cloud(p: &Placement) -> u32 {
+    p.nodes.iter().filter(|(n, _)| *n >= 10).map(|(_, c)| c).sum()
+}
+
+#[test]
+fn cloud_nodes_take_cells_of_staged_images_only_past_the_threshold() {
+    let r = res(500, 100);
+    // At half full, nothing goes to the cloud, and the share leaves the cloud nodes out.
+    let view = hybrid(5_120);
+    assert!((view.utilization() - 0.5).abs() < 1e-9);
+    let p = Placer::new(1).place(&view, &req(40, r), T0);
+    assert_eq!((total(&p), on_cloud(&p)), (40, 0), "{p:?}");
+
+    // Past 80%, cells of the staged image go mostly to the empty cloud nodes.
+    let view = hybrid(8_704);
+    let p = Placer::new(1).place(&view, &req(40, r), T0);
+    assert_eq!(total(&p), 40);
+    assert!(on_cloud(&p) > 20, "{p:?}");
+    // But not cells of an image they do not have, or of a snapshot.
+    for image in [Some("rust"), None] {
+        let p = Placer::new(1).place(&view, &PlaceReq { image, ..req(40, r) }, T0);
+        assert_eq!((total(&p), on_cloud(&p)), (40, 0), "{image:?} {p:?}");
+    }
+    // A cloud node that is excluded or lacks the backend is left out too.
+    let exclude = [10, 11];
+    let p = Placer::new(1).place(&view, &PlaceReq { exclude: &exclude, ..req(40, r) }, T0);
+    assert_eq!(on_cloud(&p), 0);
+    let p = Placer::new(1).place(&view, &PlaceReq { backend: Backend::Microvm, ..req(40, r) }, T0);
+    assert_eq!((total(&p), on_cloud(&p)), (40, 0));
+
+    // The threshold can be moved, and past 1 the cloud is never used, even when on-prem is full.
+    let full = hybrid(10_240);
+    let p = Placer::new(1).with_burst_above(1.5).place(&full, &req(40, r), T0);
+    assert_eq!((total(&p), p.unplaced), (0, 40));
+    let p = Placer::new(1).place(&full, &req(40, r), T0);
+    assert_eq!((on_cloud(&p), p.unplaced), (40, 0));
+    let p = Placer::new(1).with_burst_above(0.0).place(&hybrid(0), &req(40, r), T0);
+    assert!(on_cloud(&p) > 0, "{p:?}");
+}
+
+#[test]
+fn cells_just_sent_count_toward_the_threshold() {
+    // At 70%, a batch fills the on-prem nodes to 85% before any report shows it, and the next
+    // batch already bursts.
+    let view = hybrid(7_168);
+    let mut placer = Placer::new(3);
+    let first = placer.place(&view, &req(60, res(500, 100)), T0);
+    assert_eq!((total(&first), on_cloud(&first)), (60, 0), "{first:?}");
+    let next = placer.place(&view, &req(10, res(500, 100)), T0);
+    assert!(on_cloud(&next) > 0, "{next:?}");
+}
+
+#[test]
+fn a_keyed_cell_never_goes_to_the_cloud() {
+    let view = hybrid(10_240);
+    let mut placer = Placer::new(1);
+    for k in 0..200u32 {
+        let node = placer.home(&view, &req(1, res(500, 100)), &k.to_le_bytes(), T0).unwrap();
+        assert!(node < 10);
+    }
+    let order = Placer::key_order(&view, Backend::Container, b"k");
+    assert_eq!(order.len(), 4);
 }

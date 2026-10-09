@@ -24,6 +24,10 @@ pub struct Config {
     pub reserved_mem_mib: u64,
     /// Most cells alive at once, whatever their size.
     pub max_cells: usize,
+    /// The node is a cloud VM. It tells scout so, with the names in `data_dir/images` in its
+    /// layer filter, and placement sends it cells only of those images and only once the on-prem
+    /// nodes are nearly full.
+    pub cloud: bool,
     /// Most creates in flight per backend. More wait their turn.
     pub create_limit: BTreeMap<Backend, usize>,
     /// Longest a create may wait for its turn, and then longest it may take from its turn to the
@@ -296,6 +300,7 @@ impl Default for Config {
             mem_mib: None,
             reserved_mem_mib: 4096,
             max_cells: 3200,
+            cloud: false,
             create_limit: BTreeMap::from([
                 (Backend::Fncall, 256),
                 (Backend::Container, 128),
@@ -447,6 +452,7 @@ impl Config {
         }
         set(&mut c.reserved_mem_mib, n.reserved_mem_mib);
         set(&mut c.max_cells, n.max_cells);
+        set(&mut c.cloud, n.cloud);
         c.audit_dir = match file.audit.dir {
             Some(dir) => (!dir.as_os_str().is_empty()).then_some(dir),
             None => Some(c.data_dir.join("audit")),
@@ -753,6 +759,7 @@ struct NodeFile {
     mem_mib: Option<u64>,
     reserved_mem_mib: Option<u64>,
     max_cells: Option<usize>,
+    cloud: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]

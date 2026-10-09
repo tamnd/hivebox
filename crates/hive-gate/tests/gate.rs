@@ -572,6 +572,7 @@ fn report(node: u16, addr: SocketAddr, seq: u64) -> NodeReport {
         seq,
         addr: Arc::from(format!("http://{addr}")),
         healthy: true,
+        cloud: false,
         backends: BackendSet::of(&[Backend::Container]),
         cpu_milli: 64_000,
         cpu_committed_milli: 0,

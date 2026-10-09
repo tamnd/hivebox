@@ -15,7 +15,7 @@ use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::cells_server::Cells;
 use hive_scout::project_id;
 use hive_telemetry::{CounterVec, HistogramVec};
-use hive_types::{CellId, CellSpec, Error, Reason};
+use hive_types::{CellId, CellSpec, Error, Reason, Source};
 use hive_waggle::{PlaceReq, Placement, Placer};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -86,6 +86,13 @@ impl Api {
                 ),
             }),
         }
+    }
+
+    /// Sends cells to cloud nodes past `share` of on-prem memory in use.
+    pub(crate) fn burst_above(&self, share: f64) {
+        let mut placer = self.inner.placer.lock().unwrap_or_else(PoisonError::into_inner);
+        let old = std::mem::replace(&mut *placer, Placer::new(0));
+        *placer = old.with_burst_above(share);
     }
 
     fn client(&self, channel: Channel) -> CellsClient<Channel> {
@@ -228,6 +235,7 @@ impl Api {
             resources: spec.resources,
             n: 1,
             layers: &[],
+            image: image(spec),
             project: project_id(project),
             affinity: None,
             exclude,
@@ -587,6 +595,7 @@ impl Batch {
                     resources: this.spec.resources,
                     n: u32::try_from(left.len()).unwrap_or(u32::MAX),
                     layers: &[],
+                    image: image(&this.spec),
                     project: project_id(&this.project),
                     affinity: this.affinity,
                     exclude: &exclude,
@@ -936,6 +945,15 @@ pub(crate) fn node_error(node: u16, s: &Status) -> Error {
 }
 
 /// `s` from the gate of `unit` as an error for the caller, saying which unit.
+/// The name of the image a spec starts from, which is what a cloud node stages, or `None` for a
+/// snapshot.
+fn image(spec: &CellSpec) -> Option<&str> {
+    match &spec.source {
+        Source::Image(name) | Source::Template(name) => Some(name),
+        Source::Snapshot(_) => None,
+    }
+}
+
 fn unit_error(unit: u8, s: &Status) -> Error {
     relayed(&format!("unit {unit}"), s)
 }

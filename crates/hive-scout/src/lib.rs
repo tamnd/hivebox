@@ -62,6 +62,8 @@ pub struct NodeReport {
     pub addr: Arc<str>,
     /// Whether the comb is taking creates.
     pub healthy: bool,
+    /// Whether the node is a cloud VM, which takes cells only past the burst threshold.
+    pub cloud: bool,
     /// The backends it can run now.
     pub backends: BackendSet,
     /// CPU on the node, in thousandths of a core.
@@ -245,6 +247,7 @@ impl Scout {
                 layers = e.view.layers.clone();
                 urgent = !e.live
                     || e.view.healthy != report.healthy
+                    || e.view.cloud != report.cloud
                     || moved(
                         e.view.mem_committed_mib,
                         report.mem_committed_mib,
@@ -263,6 +266,7 @@ impl Scout {
             epoch: report.epoch,
             report: self.taken,
             healthy: report.healthy,
+            cloud: report.cloud,
             backends: report.backends,
             cpu_milli: report.cpu_milli,
             cpu_committed_milli: report.cpu_committed_milli,

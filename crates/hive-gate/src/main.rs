@@ -126,7 +126,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             .map_err(std::io::Error::other)?;
         Some(q)
     };
-    let mut gate = Gate::new(keys, nodes, quotas.clone(), &registry);
+    let mut gate =
+        Gate::new(keys, nodes, quotas.clone(), &registry).with_burst_above(cfg.burst_above);
     if !cfg.keeper.is_empty() {
         let api = hive_gate::tokens::Api::new(&cfg.keeper).map_err(std::io::Error::other)?;
         gate = gate.with_tokens(api);

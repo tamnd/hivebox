@@ -13,12 +13,14 @@ pub struct ClusterView {
 }
 
 impl ClusterView {
-    /// How much of the cluster's admittable memory is committed, from 0 to 1. Below
-    /// [`crate::PACK_BELOW`] placement packs cells for image locality, above it spreads them.
+    /// How much of the admittable memory of the healthy on-prem nodes is committed, from 0 to 1.
+    /// Below [`crate::PACK_BELOW`] placement packs cells for image locality, above it spreads
+    /// them. Cloud nodes are left out, since they are mostly empty and would hide how full the
+    /// rest is.
     #[must_use]
     pub fn utilization(&self) -> f64 {
         let (mut used, mut total) = (0u64, 0u64);
-        for n in self.nodes.iter().filter(|n| n.healthy) {
+        for n in self.nodes.iter().filter(|n| n.healthy && !n.cloud) {
             used += n.mem_committed_mib;
             total += n.mem_admit_mib;
         }
@@ -39,6 +41,9 @@ pub struct NodeView {
     pub report: u64,
     /// Whether the comb is taking creates.
     pub healthy: bool,
+    /// Whether the node is a cloud VM that takes cells only past [`crate::BURST_ABOVE`], and
+    /// only of the images it has staged.
+    pub cloud: bool,
     /// The backends it can run.
     pub backends: BackendSet,
     /// CPU on the node, in thousandths of a core.
@@ -60,7 +65,7 @@ pub struct NodeView {
     /// Most creates the comb takes at once, its `create_concurrency`, so one big batch spreads
     /// over many nodes.
     pub burst_cap: u32,
-    /// The image layers in the node's local cache.
+    /// The image layers in the node's local cache, and on a cloud node the images it has staged.
     pub layers: LayerBloom,
     /// Cells of the projects with the most cells on the node, as (project, cells).
     pub top_projects: Vec<(u64, u32)>,
@@ -75,6 +80,7 @@ impl NodeView {
             epoch: 0,
             report: 0,
             healthy: true,
+            cloud: false,
             backends: BackendSet::of(&[Backend::Container, Backend::Microvm]),
             cpu_milli,
             cpu_committed_milli: 0,
@@ -182,6 +188,12 @@ impl LayerBloom {
         Self::bits(digest).iter().all(|&bit| self.0[(bit / 64) as usize] & (1 << (bit % 64)) != 0)
     }
 
+    /// Whether the node probably has the image named `name` staged.
+    #[must_use]
+    pub fn has_image(&self, name: &str) -> bool {
+        self.contains(&image_digest(name))
+    }
+
     /// The filter as the 4096 bytes a node report carries.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -207,6 +219,16 @@ impl LayerBloom {
             |i: usize| u32::from_le_bytes([digest[i], digest[i + 1], digest[i + 2], digest[i + 3]]);
         [at(0) % BITS, at(4) % BITS, at(8) % BITS]
     }
+}
+
+/// What a node puts in its layer filter for an image named `name` it has staged, so it never
+/// looks like the digest of a layer.
+#[must_use]
+pub fn image_digest(name: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"hivebox image name\0");
+    h.update(name.as_bytes());
+    *h.finalize().as_bytes()
 }
 
 #[cfg(test)]
