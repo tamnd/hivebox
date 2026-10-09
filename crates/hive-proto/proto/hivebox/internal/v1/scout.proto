@@ -53,6 +53,10 @@ message NodeReport {
   // The node is a cloud VM. It takes cells only once the on-prem nodes are past the gate's
   // burst_above share, and only of the images it has staged, which go in its layer filter.
   bool cloud = 18;
+  // Of its cells, the ones paused or unused for 5 minutes, and the memory they were given in
+  // MiB. The rebalancer moves these off a hot node.
+  uint32 idle_cells = 19;
+  uint64 idle_mem_mib = 20;
 }
 
 message ProjectCells {
@@ -104,4 +108,6 @@ message NodeState {
   // The comb's registration epoch. The gate answers CELL_LOST for a cell id from an older one.
   uint32 epoch = 17;
   bool cloud = 18;
+  uint32 idle_cells = 19;
+  uint64 idle_mem_mib = 20;
 }

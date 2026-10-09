@@ -202,6 +202,11 @@ impl Cell {
         self.last_active_ms.fetch_max(now_ms(), Ordering::Relaxed);
     }
 
+    /// How long since anything used the cell.
+    pub(crate) fn quiet_for(&self) -> Duration {
+        Duration::from_millis(now_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed)))
+    }
+
     fn set_drone(&self, c: Option<Client>) {
         *self.drone.write().unwrap_or_else(PoisonError::into_inner) = c;
     }

@@ -135,6 +135,8 @@ fn report(node: u16, seq: u64, layers: Option<LayerBloom>) -> NodeReport {
         addr: Arc::from(format!("10.0.{}.{}:7400", node >> 8, node & 0xff)),
         healthy: true,
         cloud: false,
+        idle_cells: 0,
+        idle_mem_mib: 0,
         backends: BackendSet::of(&[Backend::Container, Backend::Microvm]),
         cpu_milli: 96_000,
         cpu_committed_milli: 40_000,

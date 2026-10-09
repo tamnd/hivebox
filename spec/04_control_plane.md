@@ -103,6 +103,14 @@ score(x) = w1*mem_headroom_ratio + w2*cpu_headroom + w3*layer_locality(bloom, sp
 
 Every 60 s the rebalancer runs an MCMF/ILP plan over the snapshot. It recommends pause+restore migrations of idle cells away from hot nodes, and cloud-burst offload when utilization stays above 80% for cloud-eligible templates. DSec reports that a 30 TB image subset covers 70% of tasks.
 
+What is in now:
+
+- Scout runs it, since scout is the one place that sees every node, every `--rebalance` seconds (60 by default, 0 turns it off). Each comb report counts the node's idle cells, the paused ones and the running ones nothing used for 5 minutes, and the memory they were given.
+- An on-prem node with over 90% of its admittable memory given out is hot. A hot node gives idle cells until it is down to the share of the whole on-prem cluster, and a node below that share takes them until it is up to it, so a move never makes a node hot. Cells move whole, each taken as the average idle cell on its node. There is one kind of thing to move and every on-prem node can take it, so the min cost flow comes down to matching the node with the most to give against the node with the most room, using a heap, in O(n log n). Cloud and down nodes take nothing.
+- When the on-prem share is at or past `--burst-above` (0.8 by default, the gates' `burst_above`) for 5 rounds in a row, the plan says how much memory is over the line, how much the idle on-prem cells hold, and how much the healthy cloud nodes have free. One round below the line starts the count again.
+- The plan goes in scout's metrics (`hive_scout_hot_nodes`, `hive_scout_rebalance_cells`, `hive_scout_rebalance_mib`, `hive_scout_burst_over_mib`, `hive_scout_burst_cloud_room_mib`, and the time each round takes) and on its stderr when it has a move or a burst in it.
+- Not in yet: carrying out the moves. That needs the gate to route snapshot and restore, which it does not do yet.
+
 ## 6. comb admission (final authority)
 
 ```

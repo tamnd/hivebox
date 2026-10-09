@@ -41,6 +41,8 @@ impl TryFrom<pb::NodeReport> for NodeReport {
             addr: Arc::from(r.addr),
             healthy: r.healthy,
             cloud: r.cloud,
+            idle_cells: r.idle_cells,
+            idle_mem_mib: r.idle_mem_mib,
             backends: BackendSet::from_bits(u8::try_from(r.backends & 0xff).unwrap_or(0)),
             cpu_milli: r.cpu_milli,
             cpu_committed_milli: r.cpu_committed_milli,
@@ -77,6 +79,8 @@ impl From<&NodeReport> for pb::NodeReport {
             burst_cap: r.burst_cap,
             layers: r.layers.as_ref().map(LayerBloom::to_bytes).unwrap_or_default(),
             cloud: r.cloud,
+            idle_cells: r.idle_cells,
+            idle_mem_mib: r.idle_mem_mib,
             top_projects: r
                 .top_projects
                 .iter()
@@ -132,6 +136,8 @@ fn node_state(v: &NodeView, addr: &str, layers: bool) -> pb::NodeState {
         burst_cap: v.burst_cap,
         layers: if layers { v.layers.to_bytes() } else { Vec::new() },
         cloud: v.cloud,
+        idle_cells: v.idle_cells,
+        idle_mem_mib: v.idle_mem_mib,
         top_projects: v
             .top_projects
             .iter()
@@ -161,6 +167,8 @@ pub(crate) fn from_node_state(
         report: s.report,
         healthy: s.healthy,
         cloud: s.cloud,
+        idle_cells: s.idle_cells,
+        idle_mem_mib: s.idle_mem_mib,
         backends: BackendSet::from_bits(u8::try_from(s.backends & 0xff).unwrap_or(0)),
         cpu_milli: s.cpu_milli,
         cpu_committed_milli: s.cpu_committed_milli,

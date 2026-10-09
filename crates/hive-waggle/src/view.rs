@@ -56,6 +56,11 @@ pub struct NodeView {
     pub mem_committed_mib: u64,
     /// Cells on the node now.
     pub cells: u32,
+    /// Of those, the ones paused or with nothing using them lately, which the rebalancer may
+    /// move.
+    pub idle_cells: u32,
+    /// Memory the idle cells were given, in MiB.
+    pub idle_mem_mib: u64,
     /// Most cells the node takes.
     pub max_cells: u32,
     /// Cgroups and network namespaces ready in the comb's pools.
@@ -87,6 +92,8 @@ impl NodeView {
             mem_admit_mib: mem_mib,
             mem_committed_mib: 0,
             cells: 0,
+            idle_cells: 0,
+            idle_mem_mib: 0,
             max_cells: 4096,
             pool_depth: 64,
             create_rate: 0.0,

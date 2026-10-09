@@ -19,13 +19,19 @@
 //! staged, which the node says by putting [`image_digest`] of each staged image in its layer
 //! filter. Keyed cells never go to the cloud, so a create sent again finds the same node.
 //!
+//! Placement only places new cells. The [`Rebalancer`] runs every minute over the whole cluster
+//! and plans what to move: idle cells off nodes past [`HOT_ABOVE`] onto the emptiest ones, and an
+//! offload to the cloud once the on-prem nodes stay past the burst line.
+//!
 //! The comb's admission has the final word. What it refuses goes back through
 //! [`Placer::refused`] and is placed again with that node excluded.
 
 #![forbid(unsafe_code)]
 
 mod place;
+mod rebalance;
 mod view;
 
 pub use place::{BURST_ABOVE, INFLIGHT_TTL, PACK_BELOW, PlaceReq, Placement, Placer};
+pub use rebalance::{BURST_ROUNDS, Burst, HOT_ABOVE, Move, Plan, REBALANCE_EVERY, Rebalancer};
 pub use view::{BackendSet, ClusterView, LayerBloom, NodeView, image_digest};

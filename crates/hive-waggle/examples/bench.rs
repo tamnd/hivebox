@@ -1,6 +1,7 @@
 //! How long a placement takes on clusters of a few sizes, half full with some layers cached.
 //! Wall time counts the moments the host takes the thread away, so the thread's CPU time is shown
-//! next to it.
+//! next to it. Then how long one rebalance round takes on clusters with every share from empty
+//! to full.
 //!
 //! ```text
 //! cargo run --release -p hive-waggle --example bench
@@ -9,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use hive_types::{Backend, Resources};
-use hive_waggle::{ClusterView, NodeView, PlaceReq, Placer};
+use hive_waggle::{ClusterView, NodeView, PlaceReq, Placer, Rebalancer};
 use rustix::time::{ClockId, clock_gettime};
 
 fn cpu() -> Duration {
@@ -81,5 +82,47 @@ fn main() {
                 per
             );
         }
+    }
+    rebalance();
+}
+
+fn rebalance() {
+    println!();
+    println!("| nodes | hot | moves | cells moved | cpu p50 us | cpu max us |");
+    println!("|---|---|---|---|---|---|");
+    for nodes in [1000u16, 10_000, 50_000] {
+        // Node i is (37 i mod 100)% full, so some are hot and some empty, with up to 31 idle cells.
+        let view = ClusterView {
+            nodes: (0..nodes)
+                .map(|i| {
+                    let admit = 64_000;
+                    let used = admit * (u64::from(i) * 37 % 100) / 100;
+                    let idle = u32::from(i % 32);
+                    NodeView {
+                        mem_committed_mib: used,
+                        idle_cells: idle,
+                        idle_mem_mib: (u64::from(idle) * 512).min(used),
+                        ..NodeView::empty(i, 64_000, admit)
+                    }
+                })
+                .collect(),
+        };
+        let mut r = Rebalancer::new();
+        let mut used = Vec::new();
+        let mut plan = r.plan(&view);
+        for _ in 0..50 {
+            let c = cpu();
+            plan = r.plan(&view);
+            used.push(cpu() - c);
+        }
+        used.sort_unstable();
+        println!(
+            "| {nodes} | {} | {} | {} | {:.1} | {:.1} |",
+            plan.hot,
+            plan.moves.len(),
+            plan.cells(),
+            used[used.len() / 2].as_secs_f64() * 1e6,
+            used[used.len() - 1].as_secs_f64() * 1e6
+        );
     }
 }
