@@ -19,6 +19,8 @@ fn report(node: u16, seq: u64) -> NodeReport {
         addr: Arc::from("unix:/run/hivebox/comb.sock"),
         healthy: true,
         cloud: false,
+        idle_cells: 0,
+        idle_mem_mib: 0,
         backends: BackendSet::of(&[Backend::Container]),
         cpu_milli: 8_000,
         cpu_committed_milli: 2_000,
@@ -227,5 +229,43 @@ async fn a_follower_takes_a_cluster_past_4_mib() {
         assert_eq!(node.node, n);
         assert!(node.layers.contains(blake3::hash(&n.to_le_bytes()).as_bytes()));
     }
+    stop.cancel();
+}
+
+#[tokio::test]
+async fn the_rebalancer_plans_over_the_published_snapshot() {
+    let (service, _addr, stop) = serve().await;
+    assert!(service.plan().is_none());
+    // Node 1 is 95% full with 16 idle cells of 256 MiB, node 2 is a quarter full.
+    let hot = NodeReport {
+        mem_committed_mib: 15_565,
+        idle_cells: 16,
+        idle_mem_mib: 4_096,
+        ..report(1, 1)
+    };
+    service.apply(hot);
+    service.apply(report(2, 1));
+    tokio::spawn(service.clone().rebalance(
+        hive_waggle::Rebalancer::new(),
+        Duration::from_millis(50),
+        stop.clone(),
+    ));
+    let mut plan = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        plan = service.plan().filter(|p| !p.moves.is_empty());
+        if plan.is_some() {
+            break;
+        }
+    }
+    let plan = plan.expect("a plan with moves");
+    // 19661 of 32768 is 60%, a level of 9830 MiB each: node 1 is 5735 over it, which takes 16
+    // cells and node 2 has room for 22.
+    assert_eq!(plan.hot, 1);
+    assert_eq!(plan.moves, [hive_waggle::Move { from: 1, to: 2, cells: 16, mem_mib: 4096 }]);
+    let text = service.registry().render();
+    assert!(text.contains("hive_scout_hot_nodes 1"), "{text}");
+    assert!(text.contains("hive_scout_rebalance_cells 16"), "{text}");
+    assert!(text.contains("hive_scout_rebalance_mib 4096"), "{text}");
     stop.cancel();
 }

@@ -5,6 +5,9 @@
 //! longer each time up to [`MAX_BACKOFF`]. The first report on a stream carries the layer filter,
 //! and later ones only when the mounted layers changed. On a cloud node the filter also holds the
 //! names of the images staged in `data_dir/images`, looked at again every [`STAGED_EVERY`].
+//!
+//! Each report also counts the idle cells, the paused ones and the running ones nothing used for
+//! [`IDLE_AFTER`], and the memory they hold, which is what the rebalancer may move off a hot node.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,7 +19,7 @@ use hive_proto::internal as pb;
 use hive_proto::internal::scout_client::ScoutClient;
 use hive_scout::NodeReport;
 pub use hive_scout::project_id;
-use hive_types::{Backend, Qos};
+use hive_types::{Backend, CellState, Qos};
 use hive_waggle::{BackendSet, LayerBloom, image_digest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +41,9 @@ const URGENT_SHARE: f64 = 0.05;
 
 /// Projects with the most cells on the node that a report names.
 const TOP_PROJECTS: usize = 8;
+
+/// A running cell nothing used for this long counts as idle in the report.
+const IDLE_AFTER: Duration = Duration::from_secs(300);
 
 /// How often a cloud node looks again at the images it has staged.
 const STAGED_EVERY: Duration = Duration::from_secs(10);
@@ -211,6 +217,7 @@ impl Reporter {
         });
         self.layers = layers;
         let held = inner.admission.held();
+        let census = census(comb);
         self.last = Some(Sent { at: now, healthy, held, cells, mem_mib: mem_committed_mib });
         // While the brake holds admits the node has no room, whatever its ceiling says, so the
         // placer looks elsewhere and not at a node that would turn the create away.
@@ -234,7 +241,9 @@ impl Reporter {
             create_rate: self.rate.update(usage.admitted, now),
             burst_cap: self.burst_cap,
             layers: bloom,
-            top_projects: top_projects(comb),
+            idle_cells: census.idle_cells,
+            idle_mem_mib: census.idle_mem_mib,
+            top_projects: census.top_projects,
         }
     }
 
@@ -252,9 +261,17 @@ impl Reporter {
     }
 }
 
-/// The projects with the most live cells on the node.
-fn top_projects(comb: &Comb) -> Vec<(u64, u32)> {
+/// What a report says about the node's cells.
+struct Census {
+    top_projects: Vec<(u64, u32)>,
+    idle_cells: u32,
+    idle_mem_mib: u64,
+}
+
+/// The projects with the most live cells on the node, and the idle cells and their memory.
+fn census(comb: &Comb) -> Census {
     let mut by: HashMap<&str, u32> = HashMap::new();
+    let (mut idle_cells, mut idle_mem_mib) = (0u32, 0u64);
     let shards: Vec<_> = comb
         .inner
         .shards
@@ -262,14 +279,25 @@ fn top_projects(comb: &Comb) -> Vec<(u64, u32)> {
         .map(|s| s.read().unwrap_or_else(PoisonError::into_inner))
         .collect();
     for cell in shards.iter().flat_map(|s| s.values()) {
-        if !cell.state().is_terminal() {
-            *by.entry(cell.project.as_str()).or_default() += 1;
+        let state = cell.state();
+        if state.is_terminal() {
+            continue;
+        }
+        *by.entry(cell.project.as_str()).or_default() += 1;
+        let idle = match state {
+            CellState::Paused => true,
+            CellState::Running => cell.quiet_for() >= IDLE_AFTER,
+            _ => false,
+        };
+        if idle {
+            idle_cells += 1;
+            idle_mem_mib += u64::from(cell.spec.resources.mem_mib);
         }
     }
     let mut top: Vec<(u64, u32)> = by.into_iter().map(|(p, n)| (project_id(p), n)).collect();
     top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     top.truncate(TOP_PROJECTS);
-    top
+    Census { top_projects: top, idle_cells, idle_mem_mib }
 }
 
 /// Creates a second, as a moving average over about the last 5 seconds.

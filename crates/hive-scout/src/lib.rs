@@ -76,6 +76,10 @@ pub struct NodeReport {
     pub mem_committed_mib: u64,
     /// Cells on the node now.
     pub cells: u32,
+    /// Of those, the ones paused or unused for a while, which the rebalancer may move.
+    pub idle_cells: u32,
+    /// Memory the idle cells were given, in MiB.
+    pub idle_mem_mib: u64,
     /// Most cells it takes.
     pub max_cells: u32,
     /// Cgroups and network namespaces ready in its pools.
@@ -273,6 +277,8 @@ impl Scout {
             mem_admit_mib: report.mem_admit_mib,
             mem_committed_mib: report.mem_committed_mib,
             cells: report.cells,
+            idle_cells: report.idle_cells,
+            idle_mem_mib: report.idle_mem_mib,
             max_cells: report.max_cells,
             pool_depth: report.pool_depth,
             create_rate: report.create_rate,

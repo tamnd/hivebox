@@ -15,6 +15,8 @@ fn report(node: u16, seq: u64) -> NodeReport {
         addr: Arc::from(format!("10.0.0.{node}:7400")),
         healthy: true,
         cloud: false,
+        idle_cells: 0,
+        idle_mem_mib: 0,
         backends: BackendSet::of(&[Backend::Container]),
         cpu_milli: 64_000,
         cpu_committed_milli: 0,
