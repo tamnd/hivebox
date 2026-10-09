@@ -114,6 +114,23 @@ slime.install(swe, slime.Grader(mem_mib=2048, cpu_milli=2000, repeats=1))
 
 `install` swaps `swe.run_evaluation`, which `generate.py` calls, and keeps slime's grader for swepro and SWE-bench tasks. The client comes from `$HIVE_ENDPOINT` and `$HIVE_TOKEN`. When hivebox cannot do the check, `run_evaluation` raises `HiveError`, and `generate` aborts the sample so it is left out of training. The result is still `(reward, applied_cleanly)`, with the verdict in `.verdict` for the test counts and timings. One difference: slime runs the tests as its `agent` user, and the verifier runs them as the cell's default user.
 
+## SWE-ReX
+
+SWE-agent and other harnesses built on SWE-ReX can run their sandboxes as cells. `HiveboxDeployment` makes a cell when it starts and stops it when it stops, and its runtime maps sessions, commands and files onto the cell, so the image needs bash but not the swerex server. `HiveboxDeploymentConfig` is the same deployment as a config model, next to SWE-ReX's own.
+
+```python
+from hivebox.swerex import HiveboxDeployment
+from swerex.runtime.abstract import BashAction, CreateBashSessionRequest
+
+deployment = HiveboxDeployment(image="swe-requests", mem_mib=2048)
+await deployment.start()
+await deployment.runtime.create_session(CreateBashSessionRequest())
+obs = await deployment.runtime.run_in_session(BashAction(command="cd /testbed && git status"))
+await deployment.stop()
+```
+
+Output, exit codes and errors match SWE-ReX's own local runtime, with two differences: interactive commands are not supported, and a command that times out takes its shell with it, so the next command in that session starts in a fresh shell. Install it with `pip install hivebox[swerex]`.
+
 ## LLM route
 
 Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.

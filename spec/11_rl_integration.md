@@ -52,6 +52,7 @@ The verifier is most of each sample's time, and it slows down as more run at onc
 | SkyRL | `SkyRL-gym` env backed by hivebox | |
 | OpenRLHF / NeMo-RL | generic Gym/OpenEnv adapter | |
 | Harbor / Terminal-Bench | `hivebox` environment provider | reuse datasets unchanged |
+| SWE-agent / SWE-ReX | `hivebox.swerex.HiveboxDeployment`, a SWE-ReX deployment whose runtime is a cell | no swerex server in the image |
 | rLLM / DeepSWE (R2E-Gym) | R2E env backed by hivebox | |
 
 ## 4. Trainer control flow hooks

@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- SWE-ReX deployment. `hivebox.swerex.HiveboxDeployment` and `HiveboxDeploymentConfig` let SWE-agent and other SWE-ReX harnesses run on cells. Sessions, `execute`, files and uploads go through the hivebox API, so the image needs no swerex server. The same commands give the same output and exit codes as SWE-ReX's local runtime, and on server3 at a load of about 90 an action in a session took 9.05 ms at p50 and 73.3 ms at p99, against 135.6 ms and 199.4 ms for the local runtime on the same host.
+
 ## 0.0.40
 
 Driver plugins over a Unix socket and WIT policy plugins.
