@@ -131,6 +131,17 @@ await deployment.stop()
 
 Output, exit codes and errors match SWE-ReX's own local runtime, with two differences: interactive commands are not supported, and a command that times out takes its shell with it, so the next command in that session starts in a fresh shell. Install it with `pip install hivebox[swerex]`.
 
+## Harbor
+
+Harbor jobs, Terminal-Bench among them, can run their trials in cells with `hivebox.harbor:HiveboxEnvironment` as the environment. Each trial gets a cell, the agent and the tests run in it, and the logs come back as they do from Docker.
+
+```
+HIVE_ENDPOINT=unix:/run/hivebox/comb.sock harbor run -p tasks/ -a oracle \
+    -e hivebox.harbor:HiveboxEnvironment --ek image=python --ek mem_mib=2048
+```
+
+The cell is made from the `image` kwarg, or else the task's `docker_image`, and the node must already have that image. hivebox does not build Dockerfiles, so a task with only a Dockerfile needs its image imported first and named with `image`. A task with `network_mode = "no-network"` gets the `none` network profile, and any other gets the `network_profile` kwarg (`open` unless set). Allowlists are not supported, and Harbor turns those tasks away before they start. The task's CPUs, memory and storage become the cell's limits, unless `cpu_milli` or `mem_mib` are given. Install it with `pip install hivebox[harbor]`.
+
 ## LLM route
 
 Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.
