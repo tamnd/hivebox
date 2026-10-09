@@ -1,13 +1,15 @@
 //! `Verify.Run` across the cluster. A verify with a subject goes to the comb that owns the
 //! subject, which makes the verifier cell on the same node and hands it the subject's changes
 //! there. One without a subject, such as a check of a gold patch, goes where waggle would put
-//! the verifier cell, and to another node when that one has no room.
+//! the verifier cell, and to another node when that one has no room. A subject of another unit
+//! takes the verify to that unit's gate, which sends it on to the subject's comb.
 
 use hive_proto::convert;
 use hive_proto::v1;
 use hive_proto::v1::verify_client::VerifyClient;
 use hive_proto::v1::verify_server::Verify;
 use hive_types::{CellSpec, Error, Reason};
+use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
 use crate::cells::{self, Api};
@@ -31,15 +33,16 @@ impl Verify for Api {
         // The verifier cell is a cell like any other as far as the quota goes.
         self.charge(&project).await?;
         if !subject.is_empty() {
-            let node = cells::parse_id(&subject)?.node();
-            return self.send(node, &project, msg).await.map(Response::new);
+            let id = cells::parse_id(&subject)?;
+            let channel = self.route(id, &project)?;
+            return self.send(channel, id.node(), &project, msg).await.map(Response::new);
         }
         let wire = msg.verifier.clone().unwrap_or_default();
         let spec = convert::spec_from_v1(wire).map_err(|e| convert::error_to_status(&e))?;
         let mut exclude = Vec::new();
         for _ in 0..=RETRIES {
             let Some(node) = self.place_one(&project, &spec, &exclude) else { break };
-            let result = self.send(node, &project, msg.clone()).await?;
+            let result = self.send(self.channel(node)?, node, &project, msg.clone()).await?;
             if !turned_away(&result) {
                 return Ok(Response::new(result));
             }
@@ -51,14 +54,14 @@ impl Verify for Api {
 }
 
 impl Api {
-    /// Sends the verify to `node` and returns its answer.
+    /// Sends the verify for `node` down `channel` and returns its answer.
     async fn send(
         &self,
+        channel: Channel,
         node: u16,
         project: &cells::Caller,
         msg: v1::VerifyRequest,
     ) -> Result<v1::VerifyResult, Status> {
-        let channel = self.channel(node)?;
         let mut client = VerifyClient::new(channel)
             .max_decoding_message_size(MAX_MESSAGE)
             .max_encoding_message_size(MAX_MESSAGE);

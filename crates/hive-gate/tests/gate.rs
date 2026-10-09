@@ -32,6 +32,7 @@ const KEY: &str = "hb_test_key";
 /// A comb that keeps its cells in a list and makes up exec output.
 #[derive(Clone, Default)]
 struct FakeComb {
+    unit: u8,
     node: u16,
     /// Cells each create call may still make before it says there is no room.
     room: Arc<Mutex<u32>>,
@@ -150,7 +151,7 @@ impl Cells for FakeComb {
                 *room -= 1;
                 let mut seq = self.seq.lock().unwrap();
                 *seq += 1;
-                let id = CellId::new(1, self.node, 1, *seq, 5).unwrap();
+                let id = CellId::new(self.unit, self.node, 1, *seq, 5).unwrap();
                 let cell = v1::Cell {
                     id: id.to_string(),
                     project: project.clone(),
@@ -614,6 +615,22 @@ impl Cluster {
         e2b: Option<hive_gate::config::E2b>,
         siem: Option<Arc<hive_telemetry::siem::Siem>>,
     ) -> Self {
+        Self::build(room, e2b, siem, None).await
+    }
+
+    /// Unit `unit`, whose gate serves the gates of other units on `peer` and sends calls about
+    /// their cells to the gates in `units`.
+    async fn unit(unit: u8, units: BTreeMap<u8, String>, peer: TcpListener) -> Self {
+        Self::build(100, None, None, Some((unit, units, peer))).await
+    }
+
+    async fn build(
+        room: u32,
+        e2b: Option<hive_gate::config::E2b>,
+        siem: Option<Arc<hive_telemetry::siem::Siem>>,
+        units: Option<(u8, BTreeMap<u8, String>, TcpListener)>,
+    ) -> Self {
+        let unit = units.as_ref().map_or(1, |u| u.0);
         let stop = CancellationToken::new();
         let scout = hive_scout::Service::new();
         tokio::spawn(scout.clone().run(stop.clone()));
@@ -625,7 +642,8 @@ impl Cluster {
         );
         let (mut combs, mut comb_addrs) = (Vec::new(), Vec::new());
         for node in 1..=2u16 {
-            let comb = FakeComb { node, room: Arc::new(Mutex::new(room)), ..Default::default() };
+            let room = Arc::new(Mutex::new(room));
+            let comb = FakeComb { unit, node, room, ..Default::default() };
             let (l, addr) = listen().await;
             tokio::spawn(
                 tonic::transport::Server::builder()
@@ -650,7 +668,10 @@ impl Cluster {
             combs.push(comb);
             comb_addrs.push(addr);
         }
-        let nodes = Nodes::new(hive_scout::follow(format!("http://{saddr}"), stop.clone()));
+        let mut nodes = Nodes::new(hive_scout::follow(format!("http://{saddr}"), stop.clone()));
+        if let Some((unit, units, _)) = &units {
+            nodes = nodes.with_units(*unit, units).unwrap();
+        }
         for _ in 0..100 {
             if nodes.all().len() == 2 {
                 break;
@@ -665,6 +686,9 @@ impl Cluster {
         }
         if let Some(siem) = siem {
             gate = gate.with_siem(siem);
+        }
+        if let Some((_, _, peer)) = units {
+            tokio::spawn(hive_gate::serve(gate.for_peers(), peer, stop.clone()));
         }
         let (gl, gaddr) = listen().await;
         tokio::spawn(hive_gate::serve(gate, gl, stop.clone()));
@@ -876,6 +900,77 @@ async fn cells_a_full_node_turns_away_go_to_the_other() {
         let Some(v1::create_event::Result::Error(err)) = &e.result else { panic!("{e:?}") };
         assert_eq!(err.reason, "CAPACITY_UNAVAILABLE");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_about_a_cell_of_another_unit_goes_through_its_gate() {
+    let ((pa, aaddr), (pb, baddr)) = (listen().await, listen().await);
+    let a = Cluster::unit(1, [(2, format!("http://{baddr}"))].into(), pa).await;
+    let b = Cluster::unit(2, [(1, format!("http://{aaddr}"))].into(), pb).await;
+    let mine = cell(&create(&a, 1, "a").await[0]).unwrap().id.clone();
+    let theirs = cell(&create(&b, 1, "b").await[0]).unwrap().id.clone();
+    assert_eq!(mine.parse::<CellId>().unwrap().unit(), 1);
+    let id: CellId = theirs.parse().unwrap();
+    assert_eq!(id.unit(), 2);
+
+    // Gate A sends calls about B's cell on to gate B, and the comb there sees the same caller
+    // the first gate let in, which the fake comb checks.
+    let got = a.cells().get(authed(v1::GetCellRequest { id: theirs.clone() })).await.unwrap();
+    assert_eq!(got.get_ref().id, theirs);
+    assert_eq!(got.get_ref().project, "swe");
+    let run = v1::RunRequest {
+        cell_id: theirs.clone(),
+        stdin: vec![1; 70_000].into(),
+        ..Default::default()
+    };
+    let out = a.exec().run(authed(run)).await.unwrap().into_inner();
+    let want = format!("node {} cell {theirs} stdin 70000", id.node());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    let checked = verify(&a, &theirs).await.unwrap();
+    assert!(checked.passed);
+    assert_eq!(checked.scores["node"], f64::from(id.node()));
+    // And the other way.
+    let got = b.cells().get(authed(v1::GetCellRequest { id: mine.clone() })).await.unwrap();
+    assert_eq!(got.get_ref().id, mine);
+    let stop = v1::StopRequest {
+        selector: Some(v1::CellSelector { by: Some(v1::cell_selector::By::Id(theirs.clone())) }),
+        ..Default::default()
+    };
+    a.cells().stop(authed(stop)).await.unwrap();
+
+    // A unit no gate knows has no cells, and the key is still checked first.
+    let nowhere = CellId::new(3, 1, 1, 1, 5).unwrap().to_string();
+    let e = a.cells().get(authed(v1::GetCellRequest { id: nowhere })).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::NotFound, "{e:?}");
+    let e =
+        a.cells().get(Request::new(v1::GetCellRequest { id: theirs.clone() })).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unauthenticated);
+
+    // The peer listener takes the project as stamped, but sends nothing on, so two gates
+    // pointed at each other never pass a call back and forth.
+    let peer = |addr: SocketAddr| async move {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+        CellsClient::new(ch.connect().await.unwrap())
+    };
+    let stamped = |id: &str| {
+        let mut r = Request::new(v1::GetCellRequest { id: id.to_owned() });
+        r.metadata_mut().insert("x-hive-project", "swe".parse().unwrap());
+        let hash = blake3::hash(KEY.as_bytes());
+        let hex: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+        r.metadata_mut().insert(hive_gate::PRINCIPAL_HEADER, format!("key:{hex}").parse().unwrap());
+        r
+    };
+    let got = peer(baddr).await.get(stamped(&theirs)).await.unwrap();
+    assert_eq!(got.get_ref().id, theirs);
+    let e = peer(baddr).await.get(stamped(&mine)).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::NotFound, "{e:?}");
+    let mut unnamed = stamped(&theirs);
+    unnamed.metadata_mut().remove(hive_gate::PRINCIPAL_HEADER);
+    let e = peer(baddr).await.get(unnamed).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unauthenticated);
+    let e =
+        peer(baddr).await.get(Request::new(v1::GetCellRequest { id: theirs })).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unauthenticated);
 }
 
 async fn verify(c: &Cluster, subject: &str) -> Result<v1::VerifyResult, Status> {

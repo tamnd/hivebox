@@ -3,8 +3,11 @@
 //! With a keeper, the gate also reads every node's lease from it once a second. Scout shows a
 //! node that stopped reporting as down within seconds, but only the keeper knows when its lease
 //! ran out, which is when its comb has stopped its cells and they are lost.
+//!
+//! A gate that knows which unit it serves sends a call about another unit's cell to that unit's
+//! gate, which it knows from its config, and the unit is in the cell id like the node is.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -36,13 +39,57 @@ pub struct Nodes {
     snap: watch::Receiver<Arc<Snapshot>>,
     channels: Arc<Mutex<Channels>>,
     leases: Arc<RwLock<Arc<HashMap<u16, Lease>>>>,
+    units: Arc<Units>,
+}
+
+/// The unit the gate serves and the gates of the others.
+#[derive(Debug, Default)]
+struct Units {
+    /// `None` serves cells of every unit as this unit's, which is all a gate in front of a
+    /// single unit needs.
+    home: Option<u8>,
+    /// A channel to the gate of each other unit, with its address.
+    peers: HashMap<u8, (Arc<str>, Channel)>,
+}
+
+/// Where a call came from, which decides whether a cell of another unit may be sent on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// A caller the gate checked the key of. Its calls about other units' cells go to their gates.
+    Caller,
+    /// The gate of another unit, which only sends calls about this unit's cells. Nothing it sends
+    /// is passed on, so a config that points two gates at each other cannot make a loop.
+    Peer,
 }
 
 impl Nodes {
     /// Nodes as `snap` holds them, always the latest.
     #[must_use]
     pub fn new(snap: watch::Receiver<Arc<Snapshot>>) -> Self {
-        Self { snap, channels: Arc::default(), leases: Arc::default() }
+        Self { snap, channels: Arc::default(), leases: Arc::default(), units: Arc::default() }
+    }
+
+    /// The same nodes, as unit `home`, with the gate of each other unit at its address in
+    /// `peers`, like `http://10.0.1.5:7402`.
+    ///
+    /// # Errors
+    ///
+    /// An address is not one the gate can dial.
+    pub fn with_units(mut self, home: u8, peers: &BTreeMap<u8, String>) -> Result<Self, String> {
+        let mut dialed = HashMap::new();
+        for (&unit, addr) in peers {
+            let channel =
+                dial(addr).map_err(|e| format!("the gate of unit {unit} at {addr}: {e}"))?;
+            dialed.insert(unit, (Arc::from(addr.as_str()), channel));
+        }
+        self.units = Arc::new(Units { home: Some(home), peers: dialed });
+        Ok(self)
+    }
+
+    /// The unit the gate serves, if it was told.
+    #[must_use]
+    pub fn unit(&self) -> Option<u8> {
+        self.units.home
     }
 
     /// Swaps in the leases the keeper holds, by node.
@@ -85,9 +132,22 @@ impl Nodes {
     ///
     /// # Errors
     ///
+    /// A cell of another unit goes to that unit's gate when the call came from a caller, and is
+    /// not found when the gate knows no gate for the unit or the call came from one.
+    ///
+    /// # Errors
+    ///
     /// As [`Nodes::channel`], with `CELL_LOST` for a stale epoch or a lost lease, and the node
-    /// unknown reported as the cell not found.
-    pub fn owner(&self, id: CellId) -> Result<Channel, Error> {
+    /// or the unit unknown reported as the cell not found.
+    pub fn owner(&self, id: CellId, origin: Origin) -> Result<Channel, Error> {
+        if let Some(home) = self.units.home
+            && id.unit() != home
+        {
+            return match self.units.peers.get(&id.unit()) {
+                Some((_, c)) if origin == Origin::Caller => Ok(c.clone()),
+                _ => Err(Error::new(Reason::CellNotFound, format!("cell {id} not found"))),
+            };
+        }
         let (node, epoch) = (id.node(), id.epoch());
         let lease = self.lease(node);
         let newest = self.snapshot().epoch(node).max(lease.map(|l| l.epoch));
@@ -229,7 +289,28 @@ mod tests {
 
     fn reason(nodes: &Nodes, node: u16, epoch: u16) -> Reason {
         let id = CellId::new(1, node, epoch, 7, 9).unwrap();
-        nodes.owner(id).unwrap_err().reason
+        nodes.owner(id, Origin::Caller).unwrap_err().reason
+    }
+
+    #[tokio::test]
+    async fn a_cell_of_another_unit_goes_to_its_gate_only_from_a_caller() {
+        let peers = BTreeMap::from([(2, "http://127.0.0.1:1".to_owned())]);
+        let unit = nodes().with_units(1, &peers).unwrap();
+        assert_eq!(unit.unit(), Some(1));
+        let there = CellId::new(2, 1, 1, 7, 9).unwrap();
+        assert!(unit.owner(there, Origin::Caller).is_ok());
+        let e = unit.owner(there, Origin::Peer).unwrap_err();
+        assert_eq!(e.reason, Reason::CellNotFound);
+        let nowhere = CellId::new(3, 1, 1, 7, 9).unwrap();
+        assert_eq!(unit.owner(nowhere, Origin::Caller).unwrap_err().reason, Reason::CellNotFound);
+        // A cell of this unit is looked for among its nodes, which scout has not sent yet.
+        let here = CellId::new(1, 1, 1, 7, 9).unwrap();
+        assert_eq!(unit.owner(here, Origin::Peer).unwrap_err().reason, Reason::CellNotFound);
+        // Without a unit, the unit in the id is not looked at.
+        assert!(nodes().unit().is_none());
+        let id = CellId::new(2, 1, 1, 7, 9).unwrap();
+        assert_eq!(nodes().owner(id, Origin::Peer).unwrap_err().reason, Reason::CellNotFound);
+        assert!(nodes().with_units(1, &BTreeMap::from([(2, "not a url".to_owned())])).is_err());
     }
 
     #[test]

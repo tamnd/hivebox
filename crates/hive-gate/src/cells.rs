@@ -21,9 +21,9 @@ use tokio::task::JoinSet;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
-use crate::nodes::Nodes;
+use crate::nodes::{Nodes, Origin};
 use crate::quota::Quotas;
-use crate::{ANYWAY_HEADER, Grant, PRINCIPAL_HEADER, PROJECT_HEADER};
+use crate::{ANYWAY_HEADER, Grant, PRINCIPAL_HEADER, PROJECT_HEADER, Peer};
 
 /// The most cells one create call may ask for.
 pub const MAX_COUNT: u32 = 32_768;
@@ -91,9 +91,14 @@ impl Api {
         CellsClient::new(channel).max_decoding_message_size(MAX_ANSWER)
     }
 
-    fn owner(&self, id: &str) -> Result<CellsClient<Channel>, Status> {
-        let id = parse_id(id)?;
-        Ok(self.client(self.inner.nodes.owner(id).map_err(|e| convert::error_to_status(&e))?))
+    fn owner(&self, id: &str, caller: &Caller) -> Result<CellsClient<Channel>, Status> {
+        Ok(self.client(self.route(parse_id(id)?, caller)?))
+    }
+
+    /// The channel to the comb that owns `id`, or to the gate of its unit when that is another.
+    pub(crate) fn route(&self, id: CellId, caller: &Caller) -> Result<Channel, Status> {
+        let origin = if caller.peer { Origin::Peer } else { Origin::Caller };
+        self.inner.nodes.owner(id, origin).map_err(|e| convert::error_to_status(&e))
     }
 
     fn node(&self, node: u16) -> Result<CellsClient<Channel>, Status> {
@@ -110,11 +115,14 @@ impl Api {
         self.inner.nodes.channel(node).map_err(|e| convert::error_to_status(&e))
     }
 
-    /// Takes one cell out of `project`'s quota, when the gate holds projects to one.
-    pub(crate) async fn charge(&self, project: &str) -> Result<(), Status> {
+    /// Takes one cell out of the caller's quota, when the gate holds projects to one. A call
+    /// from a peer gate was charged by that gate.
+    pub(crate) async fn charge(&self, caller: &Caller) -> Result<(), Status> {
         match &self.inner.quotas {
-            Some(q) => q.charge(project, 1).await.map_err(|e| convert::error_to_status(&e)),
-            None => Ok(()),
+            Some(q) if !caller.peer => {
+                q.charge(caller, 1).await.map_err(|e| convert::error_to_status(&e))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -224,7 +232,9 @@ impl Cells for Api {
                 "count is {count}, and one call makes at most {MAX_COUNT}"
             )));
         }
-        if let Some(q) = &self.inner.quotas {
+        if let Some(q) = &self.inner.quotas
+            && !project.peer
+        {
             q.charge(&project, count).await.map_err(|e| convert::error_to_status(&e))?;
         }
         let wire = req.spec.unwrap_or_default();
@@ -258,7 +268,7 @@ impl Cells for Api {
     async fn get(&self, req: Request<v1::GetCellRequest>) -> Result<Response<v1::Cell>, Status> {
         let project = allowed(&req, "get", Some(&req.get_ref().id))?;
         let req = req.into_inner();
-        self.owner(&req.id)?.get(out(&project, req)).await
+        self.owner(&req.id, &project)?.get(out(&project, req)).await
     }
 
     async fn list(
@@ -339,7 +349,8 @@ impl Cells for Api {
         let labels = match req.selector.as_ref().and_then(|s| s.by.as_ref()) {
             Some(v1::cell_selector::By::Id(id)) => {
                 let id = id.clone();
-                let stream = self.owner(&id)?.watch(out(&project, req)).await?.into_inner();
+                let stream =
+                    self.owner(&id, &project)?.watch(out(&project, req)).await?.into_inner();
                 return Ok(Response::new(stream.boxed()));
             }
             Some(v1::cell_selector::By::Labels(l)) => l.clone(),
@@ -359,7 +370,7 @@ impl Cells for Api {
         let project = allowed(&req, "pause", selected(Some(req.get_ref())))?;
         let sel = req.into_inner();
         if let Some(v1::cell_selector::By::Id(id)) = &sel.by {
-            return self.owner(id)?.pause(out(&project, sel)).await;
+            return self.owner(id, &project)?.pause(out(&project, sel)).await;
         }
         let r = self.everywhere(&project, sel, |mut c, r| async move { c.pause(r).await }).await;
         Ok(Response::new(r))
@@ -372,7 +383,7 @@ impl Cells for Api {
         let project = allowed(&req, "resume", selected(Some(req.get_ref())))?;
         let sel = req.into_inner();
         if let Some(v1::cell_selector::By::Id(id)) = &sel.by {
-            return self.owner(id)?.resume(out(&project, sel)).await;
+            return self.owner(id, &project)?.resume(out(&project, sel)).await;
         }
         let r = self.everywhere(&project, sel, |mut c, r| async move { c.resume(r).await }).await;
         Ok(Response::new(r))
@@ -387,7 +398,7 @@ impl Cells for Api {
         if let Some(v1::cell_selector::By::Id(id)) =
             req.selector.as_ref().and_then(|s| s.by.as_ref())
         {
-            return self.owner(id)?.stop(out(&project, req)).await;
+            return self.owner(id, &project)?.stop(out(&project, req)).await;
         }
         let r = self.everywhere(&project, req, |mut c, r| async move { c.stop(r).await }).await;
         Ok(Response::new(r))
@@ -402,7 +413,7 @@ impl Cells for Api {
         if let Some(v1::cell_selector::By::Id(id)) =
             req.selector.as_ref().and_then(|s| s.by.as_ref())
         {
-            return self.owner(id)?.quarantine(out(&project, req)).await;
+            return self.owner(id, &project)?.quarantine(out(&project, req)).await;
         }
         let r =
             self.everywhere(&project, req, |mut c, r| async move { c.quarantine(r).await }).await;
@@ -415,7 +426,7 @@ impl Cells for Api {
     ) -> Result<Response<v1::Cell>, Status> {
         let project = allowed(&req, "extend_ttl", Some(&req.get_ref().id))?;
         let req = req.into_inner();
-        self.owner(&req.id)?.extend_ttl(out(&project, req)).await
+        self.owner(&req.id, &project)?.extend_ttl(out(&project, req)).await
     }
 
     async fn update_policy(
@@ -424,7 +435,7 @@ impl Cells for Api {
     ) -> Result<Response<v1::Cell>, Status> {
         let project = allowed(&req, "update_policy", Some(&req.get_ref().id))?;
         let req = req.into_inner();
-        self.owner(&req.id)?.update_policy(out(&project, req)).await
+        self.owner(&req.id, &project)?.update_policy(out(&project, req)).await
     }
 
     async fn expose_port(
@@ -433,7 +444,7 @@ impl Cells for Api {
     ) -> Result<Response<v1::PortEndpoint>, Status> {
         let project = allowed(&req, "expose_port", Some(&req.get_ref().id))?;
         let req = req.into_inner();
-        self.owner(&req.id)?.expose_port(out(&project, req)).await
+        self.owner(&req.id, &project)?.expose_port(out(&project, req)).await
     }
 }
 
@@ -739,11 +750,14 @@ fn selected(sel: Option<&v1::CellSelector>) -> Option<&str> {
 }
 
 /// Who a call came from: the project the gate stamped on it when it checked the key, and the
-/// principal, which goes on to the comb's audit log. It reads as the project.
+/// principal, which goes on to the comb's audit log, or the gate of another unit stamped. It reads
+/// as the project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Caller {
     pub(crate) project: String,
     pub(crate) principal: String,
+    /// The call came from the gate of another unit.
+    pub(crate) peer: bool,
 }
 
 impl std::ops::Deref for Caller {
@@ -757,7 +771,8 @@ impl std::ops::Deref for Caller {
 fn project<T>(req: &Request<T>) -> Result<Caller, Status> {
     let header = |name| req.metadata().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let project = header(PROJECT_HEADER).ok_or_else(|| Status::unauthenticated("no project"))?;
-    Ok(Caller { project, principal: header(PRINCIPAL_HEADER).unwrap_or_default() })
+    let principal = header(PRINCIPAL_HEADER).unwrap_or_default();
+    Ok(Caller { project, principal, peer: req.extensions().get::<Peer>().is_some() })
 }
 
 /// `msg` as a call from `caller`.

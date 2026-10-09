@@ -30,6 +30,7 @@ use tonic::body::Body;
 use tonic::codegen::http;
 use tonic::transport::Channel;
 
+use crate::nodes::Origin;
 use crate::{Credential, Gate, Grant, PRINCIPAL_HEADER, PROJECT_HEADER, config, connect};
 
 /// The header that names the sandbox of an envd call.
@@ -155,7 +156,12 @@ impl Caller {
     fn comb(&self, id: &str, op: &str) -> Result<(CellId, Channel), Status> {
         let cell: CellId = id.parse().map_err(|_| Status::not_found(format!("no sandbox {id}")))?;
         Grant::check(self.grant.as_ref(), op, Some(&cell.to_string()))?;
-        let channel = self.gate.nodes.owner(cell).map_err(|e| convert::error_to_status(&e))?;
+        // A sandbox of another unit is reached through that unit's gate, like any call.
+        let channel = self
+            .gate
+            .nodes
+            .owner(cell, Origin::Caller)
+            .map_err(|e| convert::error_to_status(&e))?;
         Ok((cell, channel))
     }
 }
