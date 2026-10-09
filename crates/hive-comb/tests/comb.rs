@@ -230,6 +230,17 @@ async fn a_dropped_channel_reconnects_and_a_dead_cell_is_stopped() {
     fake.kill(b);
     let ended = reaches(&comb, b, CellState::Stopped).await;
     assert_eq!(ended.status.cause, Some(Cause::Exited));
+
+    // Killed for its memory: the drone goes with it, and the cell ends for that, not as lost.
+    let c = comb.create(request(spec("python"))).await.unwrap().id;
+    fake.oom(c);
+    // It looks alive, so the comb tries to reconnect for a while before it gives up.
+    let until = Instant::now() + Duration::from_secs(30);
+    while comb.get(c).unwrap().status.state != CellState::Stopped {
+        assert!(Instant::now() < until, "{c} never stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(comb.get(c).unwrap().status.cause, Some(Cause::Oom));
     assert_eq!(comb.committed().0, 1);
 
     // Every reconnect wrote its new secret down, so a restarted comb still gets in, and so does

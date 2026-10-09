@@ -239,5 +239,5 @@ sizes = { md = { vcpu_milli = 2000, mem_mib = 4096 } }
 - SWE-ReX: `AbstractRuntime` (`create_session`, `run_in_session`, `execute`, `read_file`, `write_file`, `upload`) maps to Exec and Files.
 - Harbor: a `BaseEnvironment` provider (`start`, `exec`, `upload`, `stop`). This lets Terminal-Bench and SWE-bench datasets run unchanged.
 - OpenEnv: a `reset/step/state` HTTP server template.
-- SandboxFusion: `/run_code` (fncall tier, per-language runners).
+- SandboxFusion: `python -m hivebox.sandboxfusion` serves `/run_code` and `/v1/ping` with SandboxFusion's request and answer, running each call in a fresh cell with per-language compile and run commands, an optional pool of ready cells per language, and `memory_limit_MB` as the cell's memory.
 - MCP: `python -m hivebox.mcp`, a server exposing `create_cell`, `list_cells`, `run_command`, `read_file`, `write_file`, `list_files`, `fork_cell` and `stop_cell`, limited to the cells it made. It is for agent-driven environment building, in the DSec style where agents use the API. A `diff` tool waits for `Files.Diff` in the comb.

@@ -165,6 +165,16 @@ claude mcp add hivebox -- python -m hivebox.mcp --image python --image node --ma
 
 The agent only reaches cells this server made, at most `--max-cells` at once, and only from the images named with `--image` when any are. Cells get the `none` network profile unless the agent asks for one allowed with `--network`. When the server exits it stops every cell it made, unless `--keep` is given. It talks over stdio, or over streamable HTTP at /mcp with `--http HOST:PORT`. Install it with `pip install hivebox[mcp]`.
 
+## SandboxFusion
+
+`python -m hivebox.sandboxfusion` serves SandboxFusion's `/run_code` API, so verl's code reward, the `sandbox-fusion` client and anything else that calls SandboxFusion can use cells instead. Each call runs in a fresh cell with no network, and the answer has SandboxFusion's fields and statuses.
+
+```
+python -m hivebox.sandboxfusion --lang python=python --lang cpp=gcc --pool 4 --port 8080
+```
+
+A language is served when `--lang` gives it an image. Python, bash, C++, Go, Java, Node.js and Rust have their commands built in, and `create_app` takes others. `--pool N` keeps N cells ready for each language so a call does not wait for one to start, and a call with `memory_limit_MB` gets a cell with that limit, capped by `--max-mem-mib`. There is no auth, as in SandboxFusion, so it listens on 127.0.0.1 unless `--host` says otherwise. Install it with `pip install hivebox[sandboxfusion]`.
+
 ## LLM route
 
 Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.

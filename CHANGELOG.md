@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- SandboxFusion server. `python -m hivebox.sandboxfusion` serves SandboxFusion's `/run_code` and `/v1/ping`, so verl and the `sandbox-fusion` client can run code in cells. Each call gets a fresh cell with no network, its files go in /sandbox, and the answer has SandboxFusion's fields and statuses. Python, bash, C++, Go, Java, Node.js and Rust have built in commands, `--pool N` keeps cells ready per language, and `memory_limit_MB` sets the cell's memory. Called with SandboxFusion's own client against a real comb on server3 at a load of 104 to 116, a call took p50 264 and 289 ms with no pool and 126 ms with a pool of 8, one at a time, over two runs.
+
+- A container cell killed for its memory now stops with cause `OOM`. The OOM kill takes the drone with it, so before this the comb gave up reconnecting after 5 s and marked the cell failed with `DRONE_LOST`.
+
 ## 0.0.41
 
 Adapters for SWE-ReX, Harbor, OpenEnv and MCP.

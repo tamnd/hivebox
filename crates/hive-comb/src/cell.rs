@@ -1140,7 +1140,11 @@ impl Actor {
         let mut message = String::new();
         if let Some(h) = &self.handle {
             match self.driver.stop(h, grace).await {
-                Ok(exit) if exit.oom && cause == Cause::Exited => cause = Cause::Oom,
+                // The OOM killer takes the drone with the rest of the cell, so a cell lost that
+                // way ran out of memory.
+                Ok(exit) if exit.oom && matches!(cause, Cause::Exited | Cause::DroneLost) => {
+                    cause = Cause::Oom;
+                }
                 Ok(_) => {}
                 Err(e) => message = format!("stopping it failed: {e}"),
             }
