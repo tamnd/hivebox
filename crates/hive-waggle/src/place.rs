@@ -13,6 +13,10 @@ use crate::view::{ClusterView, NodeView};
 /// their image layers, which keeps caches warm and fewer nodes busy. Above it, it spreads them.
 pub const PACK_BELOW: f64 = 0.6;
 
+/// Past this share of the on-prem nodes' memory in use, counting what was just placed, cells of
+/// an image a cloud node has staged may go there. DSec bursts at 80%.
+pub const BURST_ABOVE: f64 = 0.8;
+
 /// How long an in-flight entry lasts when no newer report from its node comes in.
 pub const INFLIGHT_TTL: Duration = Duration::from_secs(3);
 
@@ -30,6 +34,9 @@ pub struct PlaceReq<'a> {
     pub n: u32,
     /// The digests of the image's layers, for locality.
     pub layers: &'a [[u8; 32]],
+    /// The name of the image the cells start from, when they start from a named image and not
+    /// a snapshot. Only these can go to a cloud node, and only one with the image staged.
+    pub image: Option<&'a str>,
     /// The project the cells are for, so one project does not pile onto one node.
     pub project: u64,
     /// A node to prefer, such as the one a fork's parent or a snapshot is on.
@@ -88,6 +95,8 @@ pub struct Placer {
     inflight: Vec<Vec<Inflight>>,
     /// Placements since the last sweep of nodes that left the view.
     since_sweep: u32,
+    /// The share of on-prem memory in use past which cloud nodes take cells.
+    burst_above: f64,
 }
 
 impl Placer {
@@ -95,7 +104,15 @@ impl Placer {
     /// do not herd onto the same nodes.
     #[must_use]
     pub fn new(seed: u64) -> Self {
-        Self { rng: Rng(seed), inflight: Vec::new(), since_sweep: 0 }
+        Self { rng: Rng(seed), inflight: Vec::new(), since_sweep: 0, burst_above: BURST_ABOVE }
+    }
+
+    /// The same placer, sending cells to cloud nodes past `share` of on-prem memory in use
+    /// rather than [`BURST_ABOVE`]. 0 bursts always and anything over 1 never.
+    #[must_use]
+    pub fn with_burst_above(mut self, share: f64) -> Self {
+        self.burst_above = share;
+        self
     }
 
     /// Picks nodes for `req.n` cells at time `now`, and counts them in the overlay until the
@@ -105,17 +122,47 @@ impl Placer {
         if req.n == 0 {
             return out;
         }
-        let weights = if view.utilization() < PACK_BELOW { PACK } else { SPREAD };
         let mut feasible: Vec<(&NodeView, Load)> = Vec::new();
+        let mut clouds: Vec<&NodeView> = Vec::new();
+        // On-prem memory in use and in all, with what this placer just sent counted.
+        let (mut used, mut total) = (0u64, 0u64);
         for node in &view.nodes {
-            if !node.healthy || !node.backends.has(req.backend) || req.exclude.contains(&node.node)
-            {
+            if !node.healthy {
+                continue;
+            }
+            if node.cloud {
+                if req.image.is_some_and(|i| node.layers.has_image(i))
+                    && node.backends.has(req.backend)
+                    && !req.exclude.contains(&node.node)
+                {
+                    clouds.push(node);
+                }
+                continue;
+            }
+            total += node.mem_admit_mib;
+            if !node.backends.has(req.backend) || req.exclude.contains(&node.node) {
+                used += node.mem_committed_mib;
                 continue;
             }
             let mut load = self.load(node, now);
+            used += load.mem_mib;
             (load.room, load.cap) = load.limits(node, &req.resources);
             if load.room > 0 {
                 feasible.push((node, load));
+            }
+        }
+        // The same share as `ClusterView::utilization`, with the overlay counted.
+        let share = if total == 0 { 1.0 } else { (used as f64 / total as f64).min(1.0) };
+        let weights = if share < PACK_BELOW { PACK } else { SPREAD };
+        // Past the threshold the cloud nodes with the image join in, scored like any other, so
+        // the emptiest take the most.
+        if !clouds.is_empty() && share >= self.burst_above {
+            for node in clouds {
+                let mut load = self.load(node, now);
+                (load.room, load.cap) = load.limits(node, &req.resources);
+                if load.room > 0 {
+                    feasible.push((node, load));
+                }
             }
         }
         let k = (2 * req.n as usize).clamp(MIN_SAMPLE, feasible.len().max(MIN_SAMPLE));
@@ -154,8 +201,8 @@ impl Placer {
         out
     }
 
-    /// Picks the node for one cell with an idempotency key: of the healthy nodes that run the
-    /// backend and are not excluded, the one whose hash with `key` is highest, with room or
+    /// Picks the node for one cell with an idempotency key: of the healthy on-prem nodes that run
+    /// the backend and are not excluded, the one whose hash with `key` is highest, with room or
     /// without. Every placer picks the same node from the same view, so a create that is tried
     /// again reaches the comb that has its key and gets the same cell back, and a node leaving
     /// moves only the keys it had. A comb checks the key before its room, so a full one still
@@ -171,19 +218,24 @@ impl Placer {
         let node = view
             .nodes
             .iter()
-            .filter(|n| n.healthy && n.backends.has(req.backend) && !req.exclude.contains(&n.node))
+            .filter(|n| {
+                n.healthy
+                    && !n.cloud
+                    && n.backends.has(req.backend)
+                    && !req.exclude.contains(&n.node)
+            })
             .max_by_key(|n| rendezvous(key, n.node))?;
         self.count(node, 1, &req.resources, now);
         Some(node.node)
     }
 
-    /// The healthy nodes that run `backend`, in the order `home` tries them for `key`.
+    /// The healthy on-prem nodes that run `backend`, in the order `home` tries them for `key`.
     #[must_use]
     pub fn key_order(view: &ClusterView, backend: Backend, key: &[u8]) -> Vec<u16> {
         let mut nodes: Vec<(u64, u16)> = view
             .nodes
             .iter()
-            .filter(|n| n.healthy && n.backends.has(backend))
+            .filter(|n| n.healthy && !n.cloud && n.backends.has(backend))
             .map(|n| (rendezvous(key, n.node), n.node))
             .collect();
         nodes.sort_unstable_by(|a, b| b.cmp(a));

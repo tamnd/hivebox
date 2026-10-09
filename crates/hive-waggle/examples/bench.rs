@@ -41,6 +41,7 @@ fn main() {
                 resources: Resources { vcpu_milli: 1000, mem_mib: 512, ..Resources::default() },
                 n,
                 layers: &layers,
+                image: None,
                 project: 1,
                 affinity: None,
                 exclude: &[],

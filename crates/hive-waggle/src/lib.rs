@@ -14,6 +14,11 @@
 //!   for and its burst cap. Cells past every cap then go where there is room, and the combs queue
 //!   them.
 //!
+//! Cloud nodes are left out until the on-prem nodes have [`BURST_ABOVE`] of their memory in use,
+//! counting what was just sent. Past that, a cell may go to a cloud node that has its image
+//! staged, which the node says by putting [`image_digest`] of each staged image in its layer
+//! filter. Keyed cells never go to the cloud, so a create sent again finds the same node.
+//!
 //! The comb's admission has the final word. What it refuses goes back through
 //! [`Placer::refused`] and is placed again with that node excluded.
 
@@ -22,5 +27,5 @@
 mod place;
 mod view;
 
-pub use place::{INFLIGHT_TTL, PACK_BELOW, PlaceReq, Placement, Placer};
-pub use view::{BackendSet, ClusterView, LayerBloom, NodeView};
+pub use place::{BURST_ABOVE, INFLIGHT_TTL, PACK_BELOW, PlaceReq, Placement, Placer};
+pub use view::{BackendSet, ClusterView, LayerBloom, NodeView, image_digest};

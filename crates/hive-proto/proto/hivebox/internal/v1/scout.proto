@@ -50,6 +50,9 @@ message NodeReport {
   bytes layers = 16;
   // The projects with the most cells on it.
   repeated ProjectCells top_projects = 17;
+  // The node is a cloud VM. It takes cells only once the on-prem nodes are past the gate's
+  // burst_above share, and only of the images it has staged, which go in its layer filter.
+  bool cloud = 18;
 }
 
 message ProjectCells {
@@ -100,4 +103,5 @@ message NodeState {
   repeated ProjectCells top_projects = 16;
   // The comb's registration epoch. The gate answers CELL_LOST for a cell id from an older one.
   uint32 epoch = 17;
+  bool cloud = 18;
 }

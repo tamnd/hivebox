@@ -137,6 +137,14 @@ impl Gate {
         }
     }
 
+    /// The gate sending cells to cloud nodes past `share` of on-prem memory in use, rather than
+    /// [`hive_waggle::BURST_ABOVE`].
+    #[must_use]
+    pub fn with_burst_above(self, share: f64) -> Self {
+        self.api.burst_above(share);
+        self
+    }
+
     /// The gate with the Tokens service, which asks the keeper to sign tokens.
     #[must_use]
     pub fn with_tokens(mut self, api: tokens::Api) -> Self {

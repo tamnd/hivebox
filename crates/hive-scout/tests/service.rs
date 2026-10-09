@@ -18,6 +18,7 @@ fn report(node: u16, seq: u64) -> NodeReport {
         seq,
         addr: Arc::from("unix:/run/hivebox/comb.sock"),
         healthy: true,
+        cloud: false,
         backends: BackendSet::of(&[Backend::Container]),
         cpu_milli: 8_000,
         cpu_committed_milli: 2_000,

@@ -258,6 +258,7 @@ impl World {
             resources: RES,
             n: 1,
             layers: &[],
+            image: None,
             project: project_id(&job.project),
             affinity: None,
             exclude: &job.exclude,

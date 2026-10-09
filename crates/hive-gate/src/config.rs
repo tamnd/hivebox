@@ -36,6 +36,9 @@ pub struct Config {
     /// Where the gates of other units reach this one, if they do. It takes the project those
     /// gates stamped without a key, so it belongs on the network only the gates reach.
     pub peer_listen: Option<SocketAddr>,
+    /// The share of on-prem memory in use past which cells of an image a cloud node has staged
+    /// may go there, 0.8 unless `burst_above` in `[gate]` says otherwise.
+    pub burst_above: f64,
 }
 
 /// How E2B sandboxes become cells.
@@ -125,7 +128,8 @@ impl Config {
     /// gate serves the E2B REST API and the parts of envd that run commands and move files, so
     /// the E2B SDK works with `E2B_API_URL` and `E2B_SANDBOX_URL` both set to the gate.
     /// With `unit` in `[gate]`, a call about a cell of another unit goes to the gate `[units]`
-    /// names for it, at that gate's `peer_listen`.
+    /// names for it, at that gate's `peer_listen`. `burst_above = 0.8` in `[gate]` is the share
+    /// of on-prem memory in use past which cells may go to cloud nodes, and over 1 never.
     ///
     /// # Errors
     ///
@@ -228,6 +232,10 @@ impl Config {
             }
             units.insert(unit, url);
         }
+        let burst_above = g.burst_above.unwrap_or(hive_waggle::BURST_ABOVE);
+        if !burst_above.is_finite() || burst_above < 0.0 {
+            return Err(format!("gate.burst_above = {burst_above} is not a share, 0 or more"));
+        }
         Ok(Self {
             listen,
             metrics,
@@ -240,6 +248,7 @@ impl Config {
             unit,
             units,
             peer_listen,
+            burst_above,
         })
     }
 }
@@ -320,6 +329,7 @@ struct Gate {
     name: Option<String>,
     unit: Option<i64>,
     peer_listen: Option<String>,
+    burst_above: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +398,7 @@ mod tests {
         let one = Config::from_toml("[gate]\nscout = \"http://s:7410\"\nkeeper = [\"k:7430\"]\n")
             .unwrap();
         assert!(one.unit.is_none() && one.units.is_empty() && one.peer_listen.is_none());
+        assert!((one.burst_above - 0.8).abs() < 1e-9);
     }
 
     #[test]
@@ -417,6 +428,8 @@ mod tests {
             (format!("{scout}unit = 1\n{key}[units]\n1 = \"http://g:7402\"\n"), "own unit"),
             (format!("{scout}unit = 1\n{key}[units]\n2 = \"g:7402\"\n"), "units.2"),
             (format!("{scout}unit = 300\n{key}"), "0 to 255"),
+            (format!("{scout}burst_above = -0.5\n{key}"), "not a share"),
+            (format!("{scout}burst_above = nan\n{key}"), "not a share"),
         ];
         for (text, want) in cases {
             let e = Config::from_toml(&text).unwrap_err();

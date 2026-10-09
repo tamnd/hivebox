@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Cloud bursting. A comb with `cloud = true` in `[node]` takes cells only once the on-prem nodes have 80% of their memory given out, and only of the images staged in its `data_dir/images`. `burst_above` in `[gate]` moves the line. Keyed creates and snapshots stay on-prem.
 ## 0.0.36
 
 Units: one gate fronts a whole fleet, and verify keeps test config out of the subject's diff.

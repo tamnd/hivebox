@@ -3,9 +3,11 @@
 //!
 //! The comb keeps one stream open to scout and opens a new one when it breaks, waiting a little
 //! longer each time up to [`MAX_BACKOFF`]. The first report on a stream carries the layer filter,
-//! and later ones only when the mounted layers changed.
+//! and later ones only when the mounted layers changed. On a cloud node the filter also holds the
+//! names of the images staged in `data_dir/images`, looked at again every [`STAGED_EVERY`].
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::PoisonError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,10 +17,11 @@ use hive_proto::internal::scout_client::ScoutClient;
 use hive_scout::NodeReport;
 pub use hive_scout::project_id;
 use hive_types::{Backend, Qos};
-use hive_waggle::{BackendSet, LayerBloom};
+use hive_waggle::{BackendSet, LayerBloom, image_digest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::comb::image_name;
 use crate::{Comb, config::ScoutLink};
 
 /// How often a report goes out when nothing much changes.
@@ -35,6 +38,12 @@ const URGENT_SHARE: f64 = 0.05;
 
 /// Projects with the most cells on the node that a report names.
 const TOP_PROJECTS: usize = 8;
+
+/// How often a cloud node looks again at the images it has staged.
+const STAGED_EVERY: Duration = Duration::from_secs(10);
+
+/// How deep a cloud node looks under `data_dir/images` for names like `swe/django/123`.
+const STAGED_DEPTH: usize = 4;
 
 /// Pool depth a node without pools reports, which placement reads as a full pool.
 const NO_POOL: u32 = 64;
@@ -77,6 +86,8 @@ struct Reporter {
     rate: Rate,
     last: Option<Sent>,
     layers: Vec<[u8; 32]>,
+    /// On a cloud node, the digests of the staged image names and when they were read.
+    staged: Option<(Instant, Vec<[u8; 32]>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +118,7 @@ impl Reporter {
             rate: Rate::default(),
             last: None,
             layers: Vec::new(),
+            staged: None,
         }
     }
 
@@ -181,6 +193,13 @@ impl Reporter {
         let cells = u32::try_from(usage.cells).unwrap_or(u32::MAX);
         let mem_committed_mib = usage.mem >> 20;
         let mut layers: Vec<[u8; 32]> = inner.mounted_layers();
+        if inner.cfg.cloud {
+            if self.staged.as_ref().is_none_or(|(at, _)| at.elapsed() >= STAGED_EVERY) {
+                let names = staged(&inner.cfg.data_dir.join("images"));
+                self.staged = Some((now, names.iter().map(|n| image_digest(n)).collect()));
+            }
+            layers.extend(self.staged.iter().flat_map(|(_, d)| d));
+        }
         layers.sort_unstable();
         let changed = layers != self.layers;
         let bloom = (whole || changed).then(|| {
@@ -203,6 +222,7 @@ impl Reporter {
             seq: self.seq,
             addr: self.addr.clone(),
             healthy,
+            cloud: inner.cfg.cloud,
             backends: self.backends,
             cpu_milli: self.cpu_milli,
             cpu_committed_milli: usage.cpu_milli,
@@ -276,9 +296,60 @@ impl Rate {
     }
 }
 
+/// The names of the images under `dir`, the way a create names them: a file holding the id of an
+/// image in the store, at any depth down to [`STAGED_DEPTH`], or a directory that is an unpacked
+/// root filesystem, which has `etc` or `usr` in it and is not looked into. Names a create could
+/// not use, and ones that start with a dot, are left out.
+fn staged(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut todo = vec![(dir.to_path_buf(), String::new(), 0)];
+    while let Some((at, prefix, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else { continue };
+        for e in entries.flatten() {
+            let Ok(file) = e.file_name().into_string() else { continue };
+            if file.starts_with('.') {
+                continue;
+            }
+            let name = if prefix.is_empty() { file } else { format!("{prefix}/{file}") };
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_file() || (kind.is_dir() && rootfs(&e.path())) {
+                if image_name(&name).is_ok() {
+                    names.push(name);
+                }
+            } else if kind.is_dir() && depth + 1 < STAGED_DEPTH {
+                todo.push((e.path(), name, depth + 1));
+            }
+        }
+    }
+    names.sort_unstable();
+    names
+}
+
+fn rootfs(dir: &Path) -> bool {
+    dir.join("etc").is_dir() || dir.join("usr").is_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cloud_node_names_the_images_it_has_staged() {
+        let dir = std::env::temp_dir().join(format!("hb-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for f in ["python", "swe/django/123", ".python.tmp", "a/b/c/d/e"] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "id").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("alpine/etc")).unwrap();
+        std::fs::create_dir_all(dir.join("alpine/usr/lib")).unwrap();
+        std::fs::write(dir.join("alpine/usr/lib/libc.so"), "").unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        assert_eq!(staged(&dir), ["alpine", "python", "swe/django/123"]);
+        assert!(staged(&dir.join("none")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn project_ids_are_stable_and_differ() {
