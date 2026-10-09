@@ -93,6 +93,10 @@ pub struct RootfsPlan {
     pub lowers: Vec<PathBuf>,
     /// Where writes go. The driver owns what is in it.
     pub upper: PathBuf,
+    /// A directory whose contents the upper starts with, as a fork's children start from what
+    /// their parent wrote. The driver copies it in with `tree::copy` once the upper is
+    /// made and before the cell sees it.
+    pub seed: Option<PathBuf>,
 }
 
 /// How the node agent reaches the guest agent inside a cell.

@@ -35,6 +35,8 @@ Snapshots:
          secrets are taken out, and one left outside an allowed path fails it. Each
          --squash-git repository is first left with one commit, what HEAD holds
   commit SNAPSHOT NAME                             names a scrubbed snapshot as an image
+  fork ID [-n N] [-l KEY=VALUE]... [--key KEY]     makes N cells, 16 at most, from what the
+         cell wrote, frozen only for a last pass. They start processes of their own
   create snapshot:SNAPSHOT ...                     makes cells from a snapshot
 
 Commands:
@@ -193,6 +195,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "verify" => verify(&client, &args).await,
         "snapshot" => snapshot(&client, &args).await,
         "commit" => commit(&client, &args).await,
+        "fork" => fork(&client, &args).await,
         _ => Err(format!("{command} is not a command. Try hivectl help.")),
     }
 }
@@ -273,6 +276,27 @@ async fn snapshot(client: &Client, args: &Args) -> Result<i32, String> {
     let snap = client.snapshot(id, args.has("--scrub"), &allow, &squash).await.map_err(err)?;
     println!("{snap}");
     Ok(0)
+}
+
+async fn fork(client: &Client, args: &Args) -> Result<i32, String> {
+    args.check(&["-n", "-l", "--label", "--key"])?;
+    let [id] = exactly(args, 1, "a cell id")? else { unreachable!() };
+    let count = match args.one(&["-n"]) {
+        Some(n) => n.parse().map_err(|_| format!("-n {n} is not a number"))?,
+        None => 1,
+    };
+    let made = client.fork(id, count, &args.labels()?, args.one(&["--key"])).await.map_err(err)?;
+    let mut failed = 0;
+    for m in made {
+        match m {
+            Ok(c) => println!("{}", c.id()),
+            Err(e) => {
+                failed += 1;
+                eprintln!("hivectl: {e}");
+            }
+        }
+    }
+    Ok(i32::from(failed > 0))
 }
 
 async fn commit(client: &Client, args: &Args) -> Result<i32, String> {

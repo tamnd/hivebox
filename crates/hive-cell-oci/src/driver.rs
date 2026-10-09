@@ -181,6 +181,10 @@ impl OciDriver {
             hive_cell::quota::limit(&rootfs.upper, project, bytes, bytes >> 14)?;
             extra.insert(PROJECT.to_string(), project.to_string());
         }
+        if let Some(seed) = &rootfs.seed {
+            // After the tag, so all that is copied in is the cell's and counts against its quota.
+            hive_cell::tree::copy(seed, &rootfs.upper)?;
+        }
         let lowers: Vec<String> = rootfs.lowers.iter().map(|l| l.display().to_string()).collect();
         // volatile skips every sync, which a cell's scratch layer never needs.
         let options = std::ffi::CString::new(format!(

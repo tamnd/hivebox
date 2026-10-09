@@ -80,7 +80,7 @@ impl Env {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let id = CellId::new(1, 1, 1, n, 7).unwrap();
         let slot = self.slot(id, n, &spec.resources);
-        let rootfs = RootfsPlan { lowers: vec![self.image.clone()], upper: slot.dir.join("upper") };
+        let rootfs = RootfsPlan { lowers: vec![self.image.clone()], upper: slot.dir.join("upper"), seed: None };
         let t = Instant::now();
         let mut h = self.driver.prepare(id, spec, &rootfs, &slot).await.unwrap();
         let prepared = t.elapsed();
@@ -260,7 +260,7 @@ async fn a_failed_prepare_or_start_leaves_nothing() {
     let id = CellId::new(1, 1, 1, n, 7).unwrap();
     let slot = e.slot(id, n, &s.resources);
     let missing =
-        RootfsPlan { lowers: vec![e.root.join("nothing")], upper: slot.dir.join("upper") };
+        RootfsPlan { lowers: vec![e.root.join("nothing")], upper: slot.dir.join("upper"), seed: None };
     assert!(e.driver.prepare(id, &s, &missing, &slot).await.is_err());
     assert!(!e.root.join("oci").join(id.to_string()).exists());
 
@@ -276,7 +276,7 @@ async fn a_failed_prepare_or_start_leaves_nothing() {
         uid_count: 65536,
     })
     .unwrap();
-    let rootfs = RootfsPlan { lowers: vec![e.image.clone()], upper: slot.dir.join("upper") };
+    let rootfs = RootfsPlan { lowers: vec![e.image.clone()], upper: slot.dir.join("upper"), seed: None };
     let mut h = broken.prepare(id, &s, &rootfs, &slot).await.unwrap();
     let err = broken.start(&mut h).await.unwrap_err();
     assert!(err.to_string().contains("making the container"), "{err}");

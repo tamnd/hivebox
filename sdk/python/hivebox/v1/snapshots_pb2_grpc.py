@@ -30,7 +30,8 @@ if _version_not_supported:
 class SnapshotsStub:
     """Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
     image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
-    same store can start cells from it. Fork, Delete and the other kinds are not in yet.
+    same store can start cells from it. Fork copies a cell on its own node. Delete and the other
+    kinds are not in yet.
     """
 
     def __init__(self, channel):
@@ -69,7 +70,8 @@ class SnapshotsStub:
 class SnapshotsServicer:
     """Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
     image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
-    same store can start cells from it. Fork, Delete and the other kinds are not in yet.
+    same store can start cells from it. Fork copies a cell on its own node. Delete and the other
+    kinds are not in yet.
     """
 
     def Snapshot(self, request, context):
@@ -87,7 +89,11 @@ class SnapshotsServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Fork(self, request, context):
-        """Copies a running cell count times, at most 16.
+        """Makes count cells, at most 16, from what a running or paused container cell wrote. Its
+        writable layer is copied while it runs, then the cell is frozen only while the copy is brought
+        up to date, and the children start on its image with the copy, its spec and the labels added.
+        Only the files come along: each child starts processes of its own. A retry with the same key
+        gets the same children back.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -145,7 +151,8 @@ def add_SnapshotsServicer_to_server(servicer, server):
 class Snapshots:
     """Disk snapshots of container cells. A snapshot is an image in the node's image store, the cell's
     image plus one layer with what the cell wrote, and its id is the image's id, so any node on the
-    same store can start cells from it. Fork, Delete and the other kinds are not in yet.
+    same store can start cells from it. Fork copies a cell on its own node. Delete and the other
+    kinds are not in yet.
     """
 
     @staticmethod

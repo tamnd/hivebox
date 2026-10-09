@@ -13,6 +13,7 @@ use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
 use hive_proto::v1::files_client::FilesClient;
+use hive_proto::v1::snapshots_client::SnapshotsClient;
 use hive_proto::v1::verify_client::VerifyClient;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
@@ -711,6 +712,75 @@ async fn verify_hands_the_runs_to_a_grader_for_a_reward() {
 }
 
 /// The events in the audit log in `dir`, oldest first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_makes_cells_like_the_parent_once_per_key() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let mut cells = api.cells();
+    let mut snaps = SnapshotsClient::new(api.channel.clone());
+    let parent = create(&mut cells, "p", 1, v1_spec("python", &[("run", "a")])).await.remove(0);
+    // The fake driver writes nothing, so the parent is given something to copy.
+    let upper = s.0.join("cells").join(&parent.id).join("upper");
+    std::fs::create_dir_all(upper.join("srv")).unwrap();
+    std::fs::write(upper.join("srv/note"), "one").unwrap();
+    let fork = |project: &str, count: u32, key: &str| {
+        let labels = [("branch".to_string(), "b".to_string())].into();
+        let r = v1::ForkRequest {
+            cell_id: parent.id.clone(),
+            count,
+            labels,
+            idempotency_key: key.into(),
+        };
+        req(project, r)
+    };
+
+    let e = snaps.fork(fork("p", 17, "")).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::InvalidArgument, "{e}");
+    let e = snaps.fork(fork("q", 1, "")).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::CellNotFound, "{e}");
+
+    let forked = |r| {
+        let mut snaps = snaps.clone();
+        async move {
+            let mut events = snaps.fork(r).await.unwrap().into_inner();
+            let mut out = vec![None; 3];
+            while let Some(e) = events.message().await.unwrap() {
+                match e.result.unwrap() {
+                    v1::create_event::Result::Cell(c) => out[e.index as usize] = Some(c),
+                    v1::create_event::Result::Error(e) => panic!("a child failed: {e:?}"),
+                }
+            }
+            out.into_iter().map(Option::unwrap).collect::<Vec<_>>()
+        }
+    };
+    let children = forked(fork("p", 3, "k")).await;
+    for c in &children {
+        assert_ne!(c.id, parent.id);
+        assert_eq!(c.state(), v1::CellState::Running);
+        let labels = &c.spec.as_ref().unwrap().labels;
+        assert_eq!((labels["run"].as_str(), labels["branch"].as_str()), ("a", "b"));
+    }
+    // A retry gets the same children, and the parent is not frozen and copied again.
+    let again = forked(fork("p", 3, "k")).await;
+    let ids = |v: &[v1::Cell]| v.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&again), ids(&children));
+    let text = api.comb.metrics().registry().render();
+    assert!(text.contains("hive_snapshot_seconds_count{stage=\"fork_copy\"} 1\n"), "{text}");
+    let forks = s.0.join("forks");
+    let until = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&forks).unwrap().next().is_some() {
+        assert!(Instant::now() < until, "the fork's copy was left");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let stop = v1::StopRequest { selector: Some(by_id(&parent.id)), ..Default::default() };
+    cells.stop(req("p", stop)).await.unwrap();
+    let e = snaps.fork(fork("p", 1, "")).await.unwrap_err();
+    assert_eq!(reason(&e), Reason::CellNotRunning, "{e}");
+    api.stop.cancel();
+}
+
 fn audited(dir: &Path) -> Vec<hive_telemetry::AuditEvent> {
     let mut hours: Vec<_> = std::fs::read_dir(dir)
         .unwrap()

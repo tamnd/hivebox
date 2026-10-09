@@ -23,6 +23,18 @@ asyncio.run(main())
 
 The endpoint is the first of the argument, `$HIVE_ENDPOINT`, or `unix:$HIVE_SOCKET`, and then `unix:/run/hivebox/comb.sock`. A gate is `https://host:port`, or `http://host:port` when it has no TLS, and the token is the argument or `$HIVE_TOKEN`. The project is the argument or `$HIVE_PROJECT`, and a comb puts calls that name none in `local`.
 
+## Fork
+
+`fork` makes up to 16 cells from what a running or paused container cell wrote, for best of N or a tree search from a shared prefix. The files are copied while the cell runs, and the cell is frozen only while the copy is brought up to date. The children start on the cell's image with the copy, its spec and the labels you add. Only the files come along, so each child starts processes of its own.
+
+```python
+await cell.run("pip install -e /work/repo && python prepare.py", timeout=600)
+kids = await cell.fork(4, labels={"branch": "b"}, idempotency_key="step-412-b")
+rewards = await asyncio.gather(*(k.run(f"python try.py --seed {i}") for i, k in enumerate(kids)))
+```
+
+A retry with the same key gets the same children back. If one child fails the others are stopped and the error is raised. On XFS with reflink the copy shares blocks with the parent, so a child costs little disk until it writes.
+
 ## Verify
 
 `hive.verify` checks what an agent did in one cell by running tests in a fresh cell of its own, with no network, so the policy never sees the tests. It is the reward step of an RL rollout.

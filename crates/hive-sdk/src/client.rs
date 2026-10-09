@@ -359,6 +359,45 @@ impl Client {
         Ok(())
     }
 
+    /// Makes `count` cells, at most 16, from what the running or paused container cell `id`
+    /// wrote, and returns each one's outcome in order. Its files are copied while it runs, and it
+    /// is frozen only while the copy is brought up to date. The children get its spec plus
+    /// `labels` and start processes of their own, since only the files come along. With `key`, a
+    /// retry gets the same cells back.
+    ///
+    /// # Errors
+    ///
+    /// The call as a whole failed: the cell is not found, not running or paused, or not a
+    /// container. A child that failed on its own is an error in the list.
+    pub async fn fork(
+        &self,
+        id: &str,
+        count: u32,
+        labels: &BTreeMap<String, String>,
+        key: Option<&str>,
+    ) -> Result<Vec<Result<Cell, Error>>, Error> {
+        let r = v1::ForkRequest {
+            cell_id: id.to_string(),
+            count,
+            labels: labels.clone().into_iter().collect(),
+            idempotency_key: key.unwrap_or_default().to_string(),
+        };
+        let mut c = SnapshotsClient::new(self.channel.clone());
+        let mut events = c.fork(self.req(r)).await.map_err(from_status)?.into_inner();
+        let mut out: Vec<Result<Cell, Error>> = (0..count.max(1))
+            .map(|_| Err(Error::new(Reason::Internal, "the fork ended without this cell")))
+            .collect();
+        while let Some(e) = events.message().await.map_err(from_status)? {
+            let Some(slot) = out.get_mut(e.index as usize) else { continue };
+            *slot = match e.result {
+                Some(v1::create_event::Result::Cell(c)) => Ok(Cell::new(self.clone(), c)),
+                Some(v1::create_event::Result::Error(e)) => Err(error_from_v1(&e)),
+                None => continue,
+            };
+        }
+        Ok(out)
+    }
+
     /// The changes of state of what `sel` picks, starting with each cell's current state. A
     /// watch by id ends once the cell has ended.
     ///

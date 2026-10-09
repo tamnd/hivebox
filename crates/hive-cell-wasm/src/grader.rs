@@ -196,7 +196,8 @@ impl Graders {
                 None => format!("the grader failed: {e:#}"),
             };
             let grader = pre.instantiate(&mut store).map_err(trapped)?;
-            let grade = grader.hivebox_reward_score().call_score(&mut store, &input).map_err(trapped)??;
+            let grade =
+                grader.hivebox_reward_score().call_score(&mut store, &input).map_err(trapped)??;
             if !grade.reward.is_finite() {
                 return Err(format!("the grader gave a reward of {}", grade.reward));
             }

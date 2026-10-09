@@ -15,6 +15,8 @@ mod driver;
 pub mod netns;
 #[cfg(target_os = "linux")]
 pub mod quota;
+#[cfg(target_os = "linux")]
+pub mod tree;
 
 use std::fmt;
 
