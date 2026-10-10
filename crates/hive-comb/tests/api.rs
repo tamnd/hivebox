@@ -506,8 +506,9 @@ async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
     assert_eq!(reason(&verify.run(req("q", r)).await.unwrap_err()), Reason::CellNotFound);
     assert_eq!(fake.live(), 1);
 
-    // A change to a protected file is left out and reported, and hidden files land in the
-    // workdir before the command runs.
+    // The fake's cells share one filesystem, so the verifier's checkout has the subject's change
+    // already, as if its image came with it. It is neither put in again nor taken as tampering, and
+    // hidden files land in the workdir before the command runs. Real cells are in test_live.py.
     std::fs::write(repo.join("test_lib.py"), "assert False\n").unwrap();
     let r = v1::VerifyRequest {
         argv: sh("cat hidden/check.txt && echo '=== 3 passed in 0.01s ==='"),
@@ -519,11 +520,11 @@ async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
     assert!(got.error.is_none(), "{:?}", got.error);
     assert!(got.passed && !got.flaky);
     assert_eq!(got.runs_passed, 2);
-    assert_eq!(got.tampered, ["test_lib.py"]);
+    assert!(got.tampered.is_empty());
     assert!(got.output.starts_with(b"ok\n"));
-    assert_eq!(got.scores["diff_bytes"], 0.0);
+    assert_eq!((got.scores["diff_bytes"], got.scores["undo_bytes"]), (0.0, 0.0));
     assert_eq!(got.scores["tests_passed"], 3.0);
-    for step in ["diff_ms", "create_ms", "apply_ms", "run_ms"] {
+    for step in ["diff_ms", "create_ms", "base_ms", "apply_ms", "run_ms"] {
         assert!(got.scores.contains_key(step), "{step}");
     }
 
@@ -537,25 +538,16 @@ async fn verify_checks_a_subjects_changes_in_a_cell_of_its_own() {
     assert!(!got.passed && got.flaky);
     assert_eq!((got.runs_passed, got.exit_code), (1, 3));
 
-    // The fake's cells share one filesystem, so the verifier sees the subject's change already
-    // made and the diff does not apply. That is the cell's doing, not hivebox's.
-    std::fs::write(repo.join("lib.py"), "x = 2\n").unwrap();
-    let r = v1::VerifyRequest { argv: sh("true"), ..base.clone() };
-    let got = verify.run(req("p", r)).await.unwrap().into_inner();
-    let e = got.error.unwrap();
-    assert!(!got.passed);
-    assert_eq!(e.reason, "FILE_ERROR");
-    assert!(!e.is_infra_error);
-    assert!(got.scores["diff_bytes"] > 0.0);
-
-    // So is a workdir that is not a git checkout.
+    // A workdir that is not a git checkout is the cell's doing, not hivebox's.
     let r = v1::VerifyRequest {
         argv: sh("true"),
         workdir: s.0.to_str().unwrap().into(),
         ..base.clone()
     };
     let got = verify.run(req("p", r)).await.unwrap().into_inner();
-    assert_eq!(got.error.unwrap().reason, "FILE_ERROR");
+    let e = got.error.unwrap();
+    assert_eq!(e.reason, "FILE_ERROR");
+    assert!(!e.is_infra_error);
 
     // Without a subject the image is verified as it is.
     let r = v1::VerifyRequest {

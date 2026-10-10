@@ -175,6 +175,22 @@ python -m hivebox.sandboxfusion --lang python=python --lang cpp=gcc --pool 4 --p
 
 A language is served when `--lang` gives it an image. Python, bash, C++, Go, Java, Node.js and Rust have their commands built in, and `create_app` takes others. `--pool N` keeps N cells ready for each language so a call does not wait for one to start, and a call with `memory_limit_MB` gets a cell with that limit, capped by `--max-mem-mib`. There is no auth, as in SandboxFusion, so it listens on 127.0.0.1 unless `--host` says otherwise. Install it with `pip install hivebox[sandboxfusion]`.
 
+## Datasets
+
+`python -m hivebox.datasets` turns SWE-bench style datasets into tasks for `hive-pollen` and checks them on a node. It knows SWE-bench, SWE-bench Lite, SWE-bench Verified, SWE-Gym and SWE-rebench by name, and takes any Hugging Face dataset id with the same columns or a local .jsonl or .json file of rows.
+
+```
+python -m hivebox.datasets import swe-bench-verified --agent gold --out tasks.jsonl --images images.txt
+python -m hivebox.datasets validate swe-bench-verified --only 'django__' --parallel 4
+hive-pollen --project swe --max-inflight 8 --out traj.jsonl tasks.jsonl
+```
+
+Each task starts a cell from the row's image with the repo at /testbed and the problem statement in `$HIVE_INSTRUCTION`. `--agent` is `gold` for the row's own fix, `none` for no change, or a shell command of yours. The check runs in a fresh cell with no network. It puts the test files back as they were, applies the row's test patch, runs the repo's test command and reads the log with the repo's parser, and it passes only when every `FAIL_TO_PASS` and `PASS_TO_PASS` test passed, the way SWE-bench grades a run. The test command, install step and log parser for each repo and version are SWE-bench's own, and a SWE-rebench row brings its own in `install_config`.
+
+`validate` runs every row twice, once with the gold patch, which has to pass, and once with no change, which has to fail, and prints how each row did and how many were sound. A row whose tests need the network, such as the requests rows that call httpbin.org, fails with the gold patch here, since the check has none.
+
+hivebox does not pull images. `--images` writes each image's name on the node and its registry reference, one pair a line, for importing first with `hive-nectar import-oci`. Rows come from the `datasets` package when it is installed, and from the Hugging Face rows API otherwise, with `$HF_TOKEN` sent when it is set.
+
 ## LLM route
 
 Cells with the `llm` network profile reach the node's LLM gateway at `http://llm.hive.internal`, so an agent that speaks the OpenAI or Anthropic API runs there unchanged with its base URL set to `http://llm.hive.internal/v1`. The gateway sends each call to the project's inference engine with the trainer's key, which the cell never sees, and keeps the token ids the engine saw and sampled, by the cell's `rollout_id` label, so the trainer gets the exact tokens without tokenizing again.

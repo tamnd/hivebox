@@ -4,6 +4,9 @@
 //!
 //! The diff is taken against the checkout's `HEAD` with a throwaway index, so the subject's own
 //! index is left alone and new files count. Changes to protected paths are left out and reported.
+//! The verifier takes the same diff of its own before anything is put in it, which is what the
+//! image came with, such as a build directory or a package's egg-info. A file both diffs change the
+//! same way is left as the image has it, and one the subject changed or put back is undone first.
 //! The comb's own protected paths count on top of the caller's, and by default they are the files
 //! that set up a test run, such as `conftest.py`, so a change cannot make every test pass with them.
 //! The verifier cell gets no network, then the diff, then the caller's files such as hidden tests,
@@ -33,6 +36,12 @@ use tonic::{Request, Response, Status};
 
 /// Where the diff is left in the subject and put in the verifier.
 const PATCH: &str = "/tmp/hive-verify.patch";
+/// Where the image's own changes the subject did not keep are put in the verifier.
+const UNDO: &str = "/tmp/hive-verify-undo.patch";
+/// The error when the image's changes cannot be taken back out.
+const UNDONE: &str = "the image's changes the subject did not keep do not undo";
+/// The error when the subject's changes cannot be put in.
+const APPLIED: &str = "the subject's changes do not apply";
 /// The biggest diff a subject may hand over.
 const MAX_DIFF: usize = 32 << 20;
 /// Output kept from the last run.
@@ -46,12 +55,20 @@ const MAX_GRADER_FILES: usize = 64;
 /// The biggest file a grader is handed.
 const MAX_GRADER_FILE: usize = 16 << 20;
 /// Takes the diff with an index of its own, so the subject's staged changes count the same as
-/// unstaged ones and its own index is not touched.
+/// unstaged ones and its own index is not touched. The index starts as a copy of the checkout's,
+/// set back to `HEAD`, so git keeps what it knew of each file and only reads the ones that
+/// changed. Without that it reads every file, which on a big repo in a lazy image is seconds.
+/// The inode numbers and change times are not the ones the image was built with, so only the
+/// size and the modification time are compared.
 const TAKE_DIFF: &str = r#"set -e
+index="$(git rev-parse --git-path index)"
 export GIT_INDEX_FILE="$(mktemp -u)"
 trap 'rm -f "$GIT_INDEX_FILE"' EXIT
-git read-tree HEAD
-git add -A
+if ! { cp -p "$index" "$GIT_INDEX_FILE" && git read-tree -m HEAD; } 2> /dev/null; then
+  rm -f "$GIT_INDEX_FILE"
+  git read-tree HEAD
+fi
+git -c core.checkStat=minimal -c core.trustCtime=false add -A
 git diff --cached --binary --no-color --no-ext-diff --no-renames HEAD > /tmp/hive-verify.patch"#;
 
 #[tonic::async_trait]
@@ -170,20 +187,14 @@ struct Done {
 impl Job<'_> {
     async fn run(mut self, project: String, spec: hive_types::CellSpec) -> v1::VerifyResult {
         let mut tampered = Vec::new();
-        let mut diff = Vec::new();
+        let mut diff = None;
         if let Some(id) = self.subject {
             let t = Instant::now();
             match self.take_diff(id).await {
-                Ok(d) => {
-                    let node = &self.api.comb.inner.cfg.protected_paths;
-                    let protected: Vec<String> =
-                        node.iter().chain(&self.req.protected_paths).cloned().collect();
-                    (diff, tampered) = screen(&d, &protected);
-                }
+                Ok(d) => diff = Some(d),
                 Err(e) => return failed(e, tampered, self.scores),
             }
             self.time("diff", t);
-            self.scores.insert("diff_bytes".into(), diff.len() as f64);
         }
         let t = Instant::now();
         let req = CreateRequest { spec, project, idem_key: None, anyway: false };
@@ -192,7 +203,7 @@ impl Job<'_> {
             Err(e) => return failed(e, tampered, self.scores),
         };
         self.time("create", t);
-        let result = self.check(cell, &diff).await;
+        let result = self.check(cell, diff.as_deref(), &mut tampered).await;
         let _ = self.api.comb.stop(cell, None).await;
         match result {
             Ok(mut done) => {
@@ -226,21 +237,40 @@ impl Job<'_> {
         Ok(diff)
     }
 
-    /// Puts the diff and the caller's files in the verifier cell and runs the command.
-    async fn check(&mut self, cell: CellId, diff: &[u8]) -> Result<Done, Error> {
+    /// Puts the subject's diff and the caller's files in the verifier cell and runs the command.
+    async fn check(
+        &mut self,
+        cell: CellId,
+        diff: Option<&[u8]>,
+        tampered: &mut Vec<String>,
+    ) -> Result<Done, Error> {
         let drone = self.api.comb.drone(cell).await?;
+        let mut patches = Vec::new();
+        if let Some(diff) = diff {
+            let t = Instant::now();
+            let base = self.take_diff(cell).await?;
+            self.time("base", t);
+            let node = &self.api.comb.inner.cfg.protected_paths;
+            let protected: Vec<String> =
+                node.iter().chain(&self.req.protected_paths).cloned().collect();
+            let s = screen(diff, &base, &protected);
+            *tampered = s.tampered;
+            self.scores.insert("diff_bytes".into(), s.apply.len() as f64);
+            self.scores.insert("undo_bytes".into(), s.undo.len() as f64);
+            patches = vec![(UNDO, s.undo, "-R ", UNDONE), (PATCH, s.apply, "", APPLIED)];
+        }
         let t = Instant::now();
-        if !diff.is_empty() {
-            let put = drone::FsWrite {
-                path: PATCH.into(),
-                data: Bytes::copy_from_slice(diff),
-                ..Default::default()
-            };
+        for (path, patch, how, what) in patches {
+            if patch.is_empty() {
+                continue;
+            }
+            let put =
+                drone::FsWrite { path: path.into(), data: patch.into(), ..Default::default() };
             drone.fs_write(&put).await?;
             let out =
-                self.sh(&drone, "git apply --whitespace=nowarn /tmp/hive-verify.patch", 0).await?;
+                self.sh(&drone, &format!("git apply {how}--whitespace=nowarn {path}"), 0).await?;
             if out.exit_code != 0 {
-                return Err(file_error("the subject's changes do not apply", &out));
+                return Err(file_error(what, &out));
             }
         }
         for (path, data) in &self.req.files {
@@ -462,25 +492,56 @@ pub(super) fn file_error(what: &str, out: &drone::RunResult) -> Error {
     Error::new(Reason::FileError, format!("{what}: exit {}: {tail}", out.exit_code))
 }
 
-/// The diff without the files that match a protected glob, and the paths of those files.
-fn screen(diff: &[u8], protected: &[String]) -> (Vec<u8>, Vec<String>) {
-    let mut kept = Vec::with_capacity(diff.len());
-    let mut tampered = Vec::new();
-    for part in parts(diff) {
-        let paths = paths(part);
-        // A part whose paths cannot be read is kept out too, since there is no telling what it
-        // touches.
-        let hit = if paths.is_empty() {
+/// What goes in the verifier, from the subject's diff and the verifier's own, both against `HEAD`.
+#[derive(Debug, Default)]
+struct Screened {
+    /// The image's changes the subject did not keep, to take back out first.
+    undo: Vec<u8>,
+    /// The subject's changes, past what the image came with.
+    apply: Vec<u8>,
+    /// The protected paths the subject changed, which the verifier keeps as the image has them.
+    tampered: Vec<String>,
+}
+
+/// Splits the subject's diff into what the verifier undoes and applies, leaving out the files that
+/// match a protected glob. A file `base`, the verifier's own diff, changes the same way is left
+/// alone.
+fn screen(diff: &[u8], base: &[u8], protected: &[String]) -> Screened {
+    // A part whose paths cannot be read is kept out too, since there is no telling what it
+    // touches.
+    let hit = |paths: &[String]| {
+        if protected.is_empty() {
+            None
+        } else if paths.is_empty() {
             Some("?".to_owned())
         } else {
-            paths.into_iter().find(|p| protected.iter().any(|g| glob(g, p)))
-        };
-        match hit {
-            Some(p) if !protected.is_empty() => tampered.push(p),
-            _ => kept.extend_from_slice(part),
+            paths.iter().find(|p| protected.iter().any(|g| glob(g, p))).cloned()
+        }
+    };
+    let ours: Vec<_> = parts(diff).into_iter().map(|p| (paths(p), p)).collect();
+    let image: Vec<_> = parts(base).into_iter().map(|p| (paths(p), p)).collect();
+    let mut out = Screened { apply: Vec::with_capacity(diff.len()), ..Default::default() };
+    for (paths, part) in &ours {
+        if image.iter().any(|(_, b)| b == part) {
+            continue;
+        }
+        match hit(paths) {
+            Some(p) => out.tampered.push(p),
+            None => out.apply.extend_from_slice(part),
         }
     }
-    (kept, tampered)
+    for (paths, part) in &image {
+        if ours.iter().any(|(_, s)| s == part) {
+            continue;
+        }
+        match hit(paths) {
+            // A protected file the subject changed was named above.
+            Some(p) if !ours.iter().any(|(s, _)| s == paths) => out.tampered.push(p),
+            Some(_) => {}
+            None => out.undo.extend_from_slice(part),
+        }
+    }
+    out
 }
 
 /// Splits a diff into one part per file, each starting at its `diff --git` line.
@@ -665,24 +726,25 @@ index 0000000..5555555
     #[test]
     fn protected_files_are_cut_out_of_the_diff() {
         let protected = ["test_*.py".to_owned(), "**/conftest.py".to_owned()];
-        let (kept, tampered) = screen(DIFF.as_bytes(), &protected);
-        let kept = String::from_utf8(kept).unwrap();
+        let s = screen(DIFF.as_bytes(), b"", &protected);
+        let kept = String::from_utf8(s.apply).unwrap();
         assert!(kept.starts_with("diff --git a/requests/sessions.py"));
         assert!(kept.ends_with("+method = to_native_string(method)\n"));
-        assert_eq!(tampered, ["test_requests.py", "tests/unit/conftest.py"]);
+        assert_eq!(s.tampered, ["test_requests.py", "tests/unit/conftest.py"]);
+        assert!(s.undo.is_empty());
 
-        let (kept, tampered) = screen(DIFF.as_bytes(), &[]);
-        assert_eq!(kept, DIFF.as_bytes());
-        assert!(tampered.is_empty());
+        let s = screen(DIFF.as_bytes(), b"", &[]);
+        assert_eq!(s.apply, DIFF.as_bytes());
+        assert!(s.tampered.is_empty());
     }
 
     #[test]
     fn the_default_paths_cut_out_what_sets_up_a_test_run() {
         let node: Vec<String> =
             crate::config::PROTECTED_PATHS.iter().map(|&p| p.to_owned()).collect();
-        let (kept, tampered) = screen(DIFF.as_bytes(), &node);
-        assert!(String::from_utf8(kept).unwrap().contains("b/test_requests.py"));
-        assert_eq!(tampered, ["tests/unit/conftest.py"]);
+        let s = screen(DIFF.as_bytes(), b"", &node);
+        assert!(String::from_utf8(s.apply).unwrap().contains("b/test_requests.py"));
+        assert_eq!(s.tampered, ["tests/unit/conftest.py"]);
         let hit = |p: &str| node.iter().any(|g| glob(g, p));
         assert!(hit("conftest.py"));
         assert!(hit("setup.cfg"));
@@ -695,12 +757,39 @@ index 0000000..5555555
     }
 
     #[test]
+    fn what_the_image_came_with_is_left_alone() {
+        let built = "diff --git a/build/lib/x.py b/build/lib/x.py\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/build/lib/x.py\n@@ -0,0 +1 @@\n+x = 1\n";
+        let egg = "diff --git a/r.egg-info/PKG-INFO b/r.egg-info/PKG-INFO\nnew file mode 100644\nindex 0000000..2222222\n--- /dev/null\n+++ b/r.egg-info/PKG-INFO\n@@ -0,0 +1 @@\n+Name: r\n";
+        let tmp = "diff --git a/tmp.txt b/tmp.txt\nnew file mode 100644\nindex 0000000..3333333\n--- /dev/null\n+++ b/tmp.txt\n@@ -0,0 +1 @@\n+t\n";
+        let tmp2 = "diff --git a/tmp.txt b/tmp.txt\nnew file mode 100644\nindex 0000000..4444444\n--- /dev/null\n+++ b/tmp.txt\n@@ -0,0 +1 @@\n+u\n";
+        let node: Vec<String> =
+            crate::config::PROTECTED_PATHS.iter().map(|&p| p.to_owned()).collect();
+        let base = format!("{built}{egg}{tmp}");
+
+        // Kept as the image had it, so nothing is applied and the egg-info is not tampering.
+        let s = screen(base.as_bytes(), base.as_bytes(), &node);
+        assert!(s.apply.is_empty() && s.undo.is_empty() && s.tampered.is_empty());
+
+        // The subject changed one file the image came with and took the build directory out.
+        let ours = format!("{egg}{tmp2}{DIFF}");
+        let s = screen(ours.as_bytes(), base.as_bytes(), &node);
+        assert_eq!(String::from_utf8(s.undo).unwrap(), format!("{built}{tmp}"));
+        assert!(String::from_utf8(s.apply).unwrap().starts_with(tmp2));
+        assert_eq!(s.tampered, ["tests/unit/conftest.py"]);
+
+        // Taking out a protected file the image came with is tampering, and it stays.
+        let s = screen(tmp.as_bytes(), base.as_bytes(), &node);
+        assert_eq!(String::from_utf8(s.undo).unwrap(), built);
+        assert_eq!(s.tampered, ["r.egg-info/PKG-INFO"]);
+    }
+
+    #[test]
     fn odd_names_are_read_from_the_minus_and_plus_lines() {
         let diff = "diff --git \"a/tests/we\\\"ird.py\" \"b/tests/we\\\"ird.py\"\n--- \"a/tests/we\\\"ird.py\"\n+++ \"b/tests/we\\\"ird.py\"\n@@ -1 +1 @@\n-a\n+b\n";
         assert_eq!(paths(diff.as_bytes()), ["tests/we\"ird.py"]);
-        let (kept, tampered) = screen(diff.as_bytes(), &["tests/**".to_owned()]);
-        assert!(kept.is_empty());
-        assert_eq!(tampered, ["tests/we\"ird.py"]);
+        let s = screen(diff.as_bytes(), b"", &["tests/**".to_owned()]);
+        assert!(s.apply.is_empty());
+        assert_eq!(s.tampered, ["tests/we\"ird.py"]);
         // A binary file that kept its name has only the header line.
         let bin = "diff --git a/tests/x.bin b/tests/x.bin\nindex 1..2 100644\nGIT binary patch\nliteral 1\n";
         assert_eq!(paths(bin.as_bytes()), ["tests/x.bin"]);
