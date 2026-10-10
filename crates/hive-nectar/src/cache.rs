@@ -349,7 +349,11 @@ impl Cache {
         let ideal = (store.caps().ideal_io as u64).max(CHUNK) / CHUNK * CHUNK;
         let batches = plan(&missing, size, ideal);
         futures::stream::iter(batches)
-            .map(|batch| store.read_vectored(blob, batch))
+            .map(|batch| {
+                let reqs =
+                    batch.into_iter().map(|(offset, len)| ReadReq { offset, buf: vec![0; len] });
+                store.read_vectored(blob, reqs.collect())
+            })
             .buffer_unordered(IN_FLIGHT)
             .map_err(|e| io::Error::new(e.kind(), format!("fetching {blob}: {e}")))
             .try_for_each(|reqs| {
@@ -458,8 +462,9 @@ pub(crate) fn open_part(
 }
 
 /// Groups missing chunks into reads of up to `ideal` bytes, joining neighbours, and the reads into
-/// batches of about [`BATCH`] bytes.
-fn plan(missing: &[u64], size: u64, ideal: u64) -> Vec<Vec<ReadReq>> {
+/// batches of about [`BATCH`] bytes. A read is its offset and length. Its buffer is made only when
+/// its batch is sent, so a fetch holds [`IN_FLIGHT`] batches at most rather than the whole blob.
+fn plan(missing: &[u64], size: u64, ideal: u64) -> Vec<Vec<(u64, usize)>> {
     let mut reads: Vec<(u64, u64)> = Vec::new();
     for &c in missing {
         let (start, end) = (c * CHUNK, ((c + 1) * CHUNK).min(size));
@@ -473,7 +478,7 @@ fn plan(missing: &[u64], size: u64, ideal: u64) -> Vec<Vec<ReadReq>> {
     let mut bytes = 0;
     for (s, e) in reads {
         let len = usize::try_from(e - s).expect("reads are at most ideal_io");
-        batch.push(ReadReq { offset: s, buf: vec![0; len] });
+        batch.push((s, len));
         bytes += e - s;
         if bytes >= BATCH {
             batches.push(std::mem::take(&mut batch));
@@ -514,7 +519,7 @@ mod tests {
         let size = 10 * CHUNK - 5;
         let batches = plan(&[0, 1, 2, 3, 4, 6, 9], size, 4 * CHUNK);
         let reads: Vec<(u64, usize)> =
-            batches.iter().flatten().map(|r| (r.offset / CHUNK, r.buf.len())).collect();
+            batches.iter().flatten().map(|&(offset, len)| (offset / CHUNK, len)).collect();
         let c = CHUNK as usize;
         assert_eq!(reads, vec![(0, 4 * c), (4, c), (6, c), (9, c - 5)]);
     }
