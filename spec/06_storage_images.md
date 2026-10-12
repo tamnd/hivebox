@@ -107,6 +107,7 @@ pub trait BlobStore: Send + Sync + 'static {
 - Eviction is scan-resistant (S3-FIFO or LRU-2) with pins. Bases and toolkits (high fanout) are pinned by the reference count of running sandboxes plus popularity. Workspaces (fanout ≈1) are evicted first.
 - Capacity target: 2-3 TB NVMe per node. Alarm when working-set churn exceeds 30%/hour.
 - Metadata blobs are always local. `hive-imaged` pushes them on registration to the nodes in the image's affinity set, or to all nodes if the image is popular.
+- What is in now: eviction is least recently used, and a blob is pinned while a layer made from it is mounted. A cell holds its image's layers from the time it starts until the driver has torn it down. A layer no cell holds stays mounted, so the next cell on that image finds it ready, until the cache needs room for another layer. Then every such layer is unmounted and the fetch is tried once more. A fetch that still does not fit fails with `IMAGE_UNAVAILABLE`.
 
 ### 5.4 Prefetch traces
 

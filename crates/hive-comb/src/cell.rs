@@ -16,6 +16,7 @@ use hive_cell::tree::Precopy;
 use hive_drone::Client;
 use hive_guard::wire::Veth;
 use hive_nectar::BlobId;
+use hive_nectar::mount::Lease;
 use hive_nectar::oci::Staged;
 use hive_nectar::upper::Scrub;
 use hive_types::{Backend, Cause, CellId, CellSpec, CellState, Error, IdleAction, Qos, Reason};
@@ -255,6 +256,8 @@ pub(crate) struct Actor {
     netns: Option<PathBuf>,
     /// The cell's interface in that namespace, when the node wires them.
     veth: Option<Veth>,
+    /// The image layers under the cell's root, kept mounted until the cell is over.
+    layers: Option<Lease>,
     /// Whether the paused cell's memory has been reclaimed, so the reclaim timer is done.
     reclaimed: bool,
     /// When the running cell last gave back its cold page cache.
@@ -288,6 +291,7 @@ impl Actor {
             cgroup: None,
             netns: None,
             veth: None,
+            layers: None,
             reclaimed: false,
             trimmed: None,
             trim_wait: None,
@@ -439,7 +443,8 @@ impl Actor {
             self.inner.rootfs(&self.cell.spec, &self.cell.project, &slot).await?
         };
         rootfs.seed = seed;
-        self.record.image = image.map(|i| i.as_bytes().to_vec()).unwrap_or_default();
+        self.record.image = image.as_ref().map(|(i, _)| i.as_bytes().to_vec()).unwrap_or_default();
+        self.layers = image.map(|(_, lease)| lease);
         lap("rootfs");
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
         self.handle = Some(handle);
@@ -1166,6 +1171,7 @@ impl Actor {
     /// bulk stop does not hold up the runtime.
     async fn release(&mut self) {
         self.reservation = None;
+        self.layers = None;
         let dir = self.inner.cell_dir(self.cell.id);
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
         if let Some(dir) = self.cgroup.take() {

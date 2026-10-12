@@ -18,7 +18,7 @@ use hive_drone::Client;
 use hive_guard::Profile;
 use hive_nectar::cas::Cuts;
 use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
-use hive_nectar::mount::{IdMap, Layers};
+use hive_nectar::mount::{IdMap, Layers, Lease};
 use hive_nectar::oci::{Commit, Importer, Staged, load_manifest};
 use hive_nectar::upper::{Scrub, SecretsFound, Shift};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
@@ -1037,13 +1037,13 @@ impl Inner {
     /// then in `data_dir/images`, where a directory is an unpacked root filesystem and a file
     /// holds the id of an image in the store. A snapshot is the id of an image in the store. The
     /// layers of an image from the store are fetched and mounted the first time a cell needs
-    /// them.
+    /// them, and stay mounted while the lease that comes with the image's id is held.
     pub(crate) async fn rootfs(
         &self,
         spec: &CellSpec,
         project: &str,
         slot: &Slot,
-    ) -> Result<(RootfsPlan, Option<BlobId>), Error> {
+    ) -> Result<(RootfsPlan, Option<(BlobId, Lease)>), Error> {
         let upper = slot.dir.join("upper");
         let (what, id) = match source(spec)? {
             Wanted::Snapshot(id) => (format!("snapshot {id}"), id),
@@ -1082,12 +1082,13 @@ impl Inner {
         let unavailable = |e: String| Error::new(Reason::ImageUnavailable, format!("{what}: {e}"));
         let manifest =
             load_manifest(&*nectar.store, id).await.map_err(|e| unavailable(e.to_string()))?;
-        let lowers = nectar
+        let lease = nectar
             .layers
-            .mount(&nectar.store, &manifest)
+            .lease(&nectar.store, &manifest)
             .await
             .map_err(|e| unavailable(e.to_string()))?;
-        Ok((RootfsPlan { lowers, upper, seed: None }, Some(id)))
+        let lowers = lease.lowers().to_vec();
+        Ok((RootfsPlan { lowers, upper, seed: None }, Some((id, lease))))
     }
 
     /// Where `project` keeps the ids of the images it committed, one file for each name.
