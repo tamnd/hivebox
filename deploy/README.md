@@ -1,6 +1,6 @@
 # Deploying hivebox
 
-Systemd units for the four services, and scripts that upgrade a node's comb without stopping its cells.
+Systemd units for the four services, scripts that upgrade a node's comb without stopping its cells, and Prometheus rules and a Grafana dashboard for the SLOs.
 
 ## Units
 
@@ -35,3 +35,41 @@ If the new comb does not answer within `HIVE_UP_WAIT` seconds, or lost a cell, t
 The check on cells taken back reads what the comb that just started reports, and combs before 0.0.43 do not report it. Upgrading from 0.0.42 is checked in full, but a rollback to 0.0.42 cannot tell whether it lost cells.
 
 Both read `HIVE_COMB_BIN`, `HIVE_COMB_UNIT`, `HIVE_SOCKET`, `HIVECTL` and `HIVE_UP_WAIT` when the defaults do not fit.
+
+## Metrics, alerts and the dashboard
+
+Each service serves Prometheus metrics when given an address: `metrics` under `[node]` in comb.toml, `metrics` under `[gate]` in gate.toml, and `--metrics` for scout. Bind them to an address only Prometheus reaches. Scrape them under the jobs `hive-comb`, `hive-gate` and `hive-scout`, which the alerts name:
+
+```yaml
+rule_files:
+  - /etc/prometheus/hivebox-rules.yml
+scrape_configs:
+  - job_name: hive-comb
+    static_configs: [{targets: ["node1:9464", "node2:9464"]}]
+  - job_name: hive-gate
+    static_configs: [{targets: ["gate1:9467"]}]
+  - job_name: hive-scout
+    static_configs: [{targets: ["scout1:9469"]}]
+```
+
+`prometheus/hivebox-rules.yml` has the recording rules and alerts. The SLOs are the ones in spec/02: at most 0.1% of cells fail for an infrastructure cause, and warm creates finish within 400 ms at p99 for containers and 300 ms for microVMs. Infra failures are alerted on by burn rate over two windows each, for cells as the combs count them and for creates as the gates count them:
+
+| alert | when | severity |
+|---|---|---|
+| `HiveCellInfraFailuresFast`, `HiveCreateInfraFailuresFast` | the budget burns 14.4 times too fast over 1h and 5m, or 6 times over 6h and 30m | page |
+| `HiveCellInfraFailuresSlow`, `HiveCreateInfraFailuresSlow` | 3 times over 1d and 2h, or 1 time over 3d and 6h, for an hour | ticket |
+| `HiveCreateSlow` | a node's create p99 is past the target over both 5m and 1h, for 15 minutes | warning |
+| `HiveCombDown` | a comb does not answer scrapes for a minute | page |
+| `HiveControlPlaneDown` | a gate or scout does not answer scrapes for 2 minutes | page |
+| `HiveCombRestarting` | a comb started at least 3 times in an hour | warning |
+| `HiveCombLostCells` | a comb could not take back some cells when it started | warning |
+| `HiveMemoryStall` | cells on a node stall on memory more than 10% of the time for 10 minutes | warning |
+| `HiveScoutNodesDown` | scout has not heard from a node for 5 minutes | warning |
+| `HiveNodeCordonedLong` | a node has been cordoned for 12 hours | ticket |
+| `HiveMetricsOverflow` | a metric hit its series cap and folds new labels into `other` | ticket |
+
+Latencies are taken per node and never summed across nodes. A node only writes the histogram buckets that hold something, so the buckets of two nodes do not line up and a quantile of their sum would be wrong. Exec p99 is on the dashboard but not alerted on, since it includes the command's own run time. There is no alert for keeper leader churn yet, since keeper serves no metrics.
+
+`promtool test rules prometheus/hivebox-rules.test.yml` runs the unit tests for the rules, one case each alert fires on and cases where it must not.
+
+`grafana/hivebox.json` is a dashboard over the same metrics: the SLOs and burn rates, cells by state and how they end, creates by result and stage, exec, stop and snapshot latencies, memory pressure, what each comb found when it started, cordoned nodes, scout's view and the gate's calls. Import it, or put it in a Grafana dashboard provisioning directory. It asks for the Prometheus data source and the nodes to show.

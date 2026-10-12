@@ -76,7 +76,7 @@ impl Api {
                 start: Instant::now(),
                 creates: registry.counter(
                     "hive_gate_cells_created_total",
-                    "Cells asked for through the gate, by what became of them.",
+                    "Cells asked for through the gate, by what became of them: created, infra_error when the platform failed them, or caller_error.",
                     &["result"],
                 ),
                 create_seconds: registry.histogram(
@@ -757,7 +757,8 @@ impl Batch {
         let inner = &self.api.inner;
         let (label, result) = match result {
             Ok(c) => ("created", v1::create_event::Result::Cell(c)),
-            Err(e) => ("failed", v1::create_event::Result::Error(e)),
+            Err(e) if e.is_infra_error => ("infra_error", v1::create_event::Result::Error(e)),
+            Err(e) => ("caller_error", v1::create_event::Result::Error(e)),
         };
         inner.creates.with(&[label]).inc();
         inner.create_seconds.with(&[]).observe_duration(self.started.elapsed());
