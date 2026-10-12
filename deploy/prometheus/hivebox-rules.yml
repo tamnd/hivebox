@@ -61,6 +61,7 @@ groups:
         annotations:
           summary: Cells are failing for infrastructure causes fast enough to spend the monthly budget in days.
           description: The share of ended cells that failed is past the 0.1% SLO many times over. hive_cells_ended_total by cause says which.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecellinfrafailuresfast
 
       - alert: HiveCellInfraFailuresSlow
         expr: |
@@ -72,6 +73,7 @@ groups:
         annotations:
           summary: Cells are failing for infrastructure causes faster than the 0.1% SLO allows.
           description: At this rate the monthly budget runs out before the month does. hive_cells_ended_total by cause says which.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecellinfrafailuresslow
 
       - alert: HiveCreateInfraFailuresFast
         expr: |
@@ -83,6 +85,7 @@ groups:
         annotations:
           summary: Creates through the gate are failing for infrastructure reasons.
           description: More than 0.1% of creates end in an infra error many times over. Look at hive_create_total by result on the combs.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecreateinfrafailuresfast
 
       - alert: HiveCreateInfraFailuresSlow
         expr: |
@@ -94,6 +97,7 @@ groups:
         annotations:
           summary: Creates through the gate fail for infrastructure reasons faster than the 0.1% SLO allows.
           description: Look at hive_create_total by result on the combs.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecreateinfrafailuresslow
 
       - alert: HiveCreateSlow
         expr: |
@@ -105,6 +109,7 @@ groups:
         annotations:
           summary: Creates on {{ $labels.instance }} are past the p99 target.
           description: The targets are for warm creates, so a node pulling many new images runs slower. hive_create_seconds by stage says which part grew.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecreateslow
 
       - alert: HiveCombDown
         expr: up{job="hive-comb"} == 0
@@ -114,6 +119,7 @@ groups:
         annotations:
           summary: The comb on {{ $labels.instance }} does not answer scrapes.
           description: Its cells keep running, but nothing on the node can be created, run or stopped until it is back. See journalctl -u hive-comb.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecombdown
 
       - alert: HiveCombRestarting
         expr: changes(hive_comb_start_time_seconds[1h]) > 2
@@ -122,6 +128,7 @@ groups:
         annotations:
           summary: The comb on {{ $labels.instance }} started at least 3 times in the last hour.
           description: Each start takes the cells back from the WAL. See journalctl -u hive-comb for why it stops.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecombrestarting
 
       - alert: HiveCombLostCells
         expr: hive_comb_start_cells{result="lost"} > 0
@@ -130,6 +137,7 @@ groups:
         annotations:
           summary: The comb on {{ $labels.instance }} could not take back some cells when it started.
           description: Those cells failed with cause RECOVERY or NODE_LOST. The comb log has a line for each. This clears when the comb next starts.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecomblostcells
 
       - alert: HiveMemoryStall
         expr: hive_memory_stall_basis_points > 1000
@@ -139,6 +147,7 @@ groups:
         annotations:
           summary: Cells on {{ $labels.instance }} spend more than 10% of their time stalled on memory.
           description: The pressure brake pauses idle cells and reclaims from best effort ones, which is not keeping up. The node may be packed too tight.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivememorystall
 
       - alert: HiveNodeCordonedLong
         expr: hive_node_cordoned == 1
@@ -148,6 +157,7 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} has been cordoned for 12 hours."
           description: A failed upgrade leaves the node cordoned on purpose. Uncordon it with hivectl node uncordon once it is fixed.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivenodecordonedlong
 
       - alert: HiveScoutNodesDown
         expr: hive_scout_nodes{state="down"} > 0
@@ -157,6 +167,7 @@ groups:
         annotations:
           summary: Scout has nodes it no longer hears from.
           description: Waggle places nothing on them. Check the combs on those nodes and their network.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivescoutnodesdown
 
       - alert: HiveControlPlaneDown
         expr: up{job=~"hive-gate|hive-scout"} == 0
@@ -166,6 +177,7 @@ groups:
         annotations:
           summary: "{{ $labels.job }} on {{ $labels.instance }} does not answer scrapes."
           description: Cells keep running without it, but creates through this instance fail.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecontrolplanedown
 
       - alert: HiveMetricsOverflow
         expr: increase(hive_telemetry_overflow_total[1h]) > 0
@@ -174,3 +186,4 @@ groups:
         annotations:
           summary: "{{ $labels.metric }} on {{ $labels.instance }} hit its series cap."
           description: New label values are folded into the series labelled other, so this metric undercounts by label.
+          runbook_url: https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivemetricsoverflow

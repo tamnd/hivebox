@@ -68,6 +68,8 @@ scrape_configs:
 | `HiveNodeCordonedLong` | a node has been cordoned for 12 hours | ticket |
 | `HiveMetricsOverflow` | a metric hit its series cap and folds new labels into `other` | ticket |
 
+Each alert has a `runbook_url` annotation that links to its section of [docs/runbooks.md](../docs/runbooks.md), which says what to look at and what to do.
+
 Latencies are taken per node and never summed across nodes. A node only writes the histogram buckets that hold something, so the buckets of two nodes do not line up and a quantile of their sum would be wrong. Exec p99 is on the dashboard but not alerted on, since it includes the command's own run time. There is no alert for keeper leader churn yet, since keeper serves no metrics.
 
 `promtool test rules prometheus/hivebox-rules.test.yml` runs the unit tests for the rules, one case each alert fires on and cases where it must not.
