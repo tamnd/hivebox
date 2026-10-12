@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.42
+
+SandboxFusion server and dataset importers, with fixes found running SWE-bench on a real comb.
+
 - A node no longer runs out of image cache after it has seen enough images. Mounted layers kept their blobs pinned in the cache forever, so once the cache filled with layers of images no cell used any more, every new image failed with `IMAGE_UNAVAILABLE`. A cell now holds its image's layers only while it runs. A layer no cell holds stays mounted for the next cell on that image, and is unmounted when the cache needs its room. On server3 with a 6 GiB cache and 16 SWE-bench Verified rows whose 15 images take 11.3 GiB, validate and both `hive-pollen` runs finished with no errors, where a 4 GiB cache failed after about 10 images before.
 
 - Dataset importers. `python -m hivebox.datasets import` turns SWE-bench, SWE-bench Lite, SWE-bench Verified, SWE-Gym and SWE-rebench rows, or any file or Hugging Face dataset with the same columns, into `hive-pollen` tasks whose check grades the run the way SWE-bench does, with its own test commands and log parsers. `validate` runs each row with the gold patch and with no change. On 16 SWE-bench Verified rows on server3, with the dataset's own images, 10 were sound and the other 6 are requests rows whose tests call httpbin.org, which a check with no network cannot reach. On the 10 sound rows `hive-pollen` gave the gold patch reward 1 on all 10 and no change reward 0 on all 10.
