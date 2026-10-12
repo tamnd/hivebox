@@ -302,8 +302,9 @@ fn attach(file: &Path) -> io::Result<Loop> {
     Err(io::Error::other("no free loop device after 64 tries"))
 }
 
-/// The layers mounted on a node, each once however many cells use it. A layer stays mounted, with
-/// its blobs pinned in the cache, for as long as this lives.
+/// The layers mounted on a node, each once however many cells use it. A mounted layer keeps its
+/// blobs pinned in the cache. One no [`Lease`] holds stays mounted until the cache needs its room
+/// for another layer, and is then unmounted.
 #[derive(Debug)]
 pub struct Layers {
     dir: PathBuf,
@@ -311,6 +312,26 @@ pub struct Layers {
     idmap: Option<Arc<IdMap>>,
     lazy: bool,
     mounted: Mutex<HashMap<BlobId, Arc<OnceCell<Arc<Layer>>>>>,
+    /// Layers [`Layers::mount`] keeps for as long as this lives.
+    kept: Mutex<HashMap<BlobId, Arc<Layer>>>,
+    /// Held while idle layers are unmounted, so a fetch that finds nothing left to unmount waits
+    /// for the room another one is making.
+    trimming: tokio::sync::Mutex<()>,
+}
+
+/// An image's layers, mounted and kept that way until this is dropped.
+#[derive(Debug)]
+pub struct Lease {
+    lowers: Vec<PathBuf>,
+    held: Vec<(BlobId, Arc<Layer>)>,
+}
+
+impl Lease {
+    /// Where the layers are mounted, top first as overlayfs wants them.
+    #[must_use]
+    pub fn lowers(&self) -> &[PathBuf] {
+        &self.lowers
+    }
 }
 
 /// A mounted layer. The fields drop in order, so the mount goes before the device under it.
@@ -326,7 +347,23 @@ struct Layer {
 enum Data {
     None,
     Whole(Held),
-    Lazy { _device: hive_blockd::Device, _fill: Filling, lazy: Lazy },
+    Lazy { _device: hive_blockd::Device, fill: Filling, lazy: Lazy },
+}
+
+impl Layer {
+    /// Unmounts it and lets go of its blobs, once the fill of a lazy layer has stopped, since the
+    /// fill holds the blob too.
+    async fn close(mut self) {
+        if let Data::Lazy { fill, .. } = &mut self._data {
+            fill.0.abort();
+            let _ = (&mut fill.0).await;
+        }
+        let _ = blocking(move || {
+            drop(self);
+            Ok(())
+        })
+        .await;
+    }
 }
 
 /// The background fill of a lazy layer, stopped when the layer goes.
@@ -359,7 +396,15 @@ impl Layers {
             let _ = unmount(&path, UnmountFlags::DETACH);
             std::fs::remove_dir(&path)?;
         }
-        Ok(Self { dir, cache, idmap: idmap.map(Arc::new), lazy: false, mounted: Mutex::default() })
+        Ok(Self {
+            dir,
+            cache,
+            idmap: idmap.map(Arc::new),
+            lazy: false,
+            mounted: Mutex::default(),
+            kept: Mutex::default(),
+            trimming: tokio::sync::Mutex::default(),
+        })
     }
 
     /// Mounts layers that have leaves before their data is in: the data blob is served on an NBD
@@ -402,7 +447,8 @@ impl Layers {
 
     /// Fetches the image's blobs from `store` into the cache where they are not there yet, mounts
     /// the layers that are not mounted yet, and returns where they are, top first as overlayfs
-    /// wants them. Lazily, the data blobs are not fetched first.
+    /// wants them. Lazily, the data blobs are not fetched first. The layers stay mounted for as
+    /// long as this lives. [`Layers::lease`] lets them go.
     ///
     /// # Errors
     ///
@@ -412,9 +458,56 @@ impl Layers {
         store: &Arc<dyn BlobStore>,
         image: &Manifest,
     ) -> io::Result<Vec<PathBuf>> {
-        let each = image.layers.iter().rev().map(|l| self.one(store, l));
-        let layers = futures::future::try_join_all(each).await?;
-        Ok(layers.iter().map(|l| l.mounted.path().to_owned()).collect())
+        let lease = self.lease(store, image).await?;
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner).extend(lease.held);
+        Ok(lease.lowers)
+    }
+
+    /// Mounts the image's layers as [`Layers::mount`] does, and keeps them until the lease is
+    /// dropped. When the cache is full of pinned blobs, the layers no lease holds are unmounted to
+    /// make room, and the fetch is tried once more.
+    ///
+    /// # Errors
+    ///
+    /// A blob cannot be fetched, there is no room for it even then, or a layer cannot be mounted.
+    pub async fn lease(&self, store: &Arc<dyn BlobStore>, image: &Manifest) -> io::Result<Lease> {
+        let each = image.layers.iter().rev().map(|l| async move {
+            let got = match self.one(store, l).await {
+                // Another layer may have made room already, so this tries again even when it
+                // finds nothing to unmount itself.
+                Err(e) if e.kind() == io::ErrorKind::StorageFull => {
+                    self.trim().await;
+                    self.one(store, l).await
+                }
+                got => got,
+            };
+            got.map(|got| (l.digest, got))
+        });
+        let held = futures::future::try_join_all(each).await?;
+        let lowers = held.iter().map(|(_, l)| l.mounted.path().to_owned()).collect();
+        Ok(Lease { lowers, held })
+    }
+
+    /// Unmounts the layers nothing holds.
+    async fn trim(&self) {
+        let _one = self.trimming.lock().await;
+        let idle: Vec<Arc<Layer>> = {
+            let mut m = self.mounted.lock().unwrap_or_else(PoisonError::into_inner);
+            // Anyone about to use a layer holds its cell, which is only taken under this lock.
+            let gone: Vec<BlobId> = m
+                .iter()
+                .filter(|(_, c)| {
+                    Arc::strong_count(c) == 1 && c.get().is_some_and(|l| Arc::strong_count(l) == 1)
+                })
+                .map(|(d, _)| *d)
+                .collect();
+            gone.iter().filter_map(|d| Arc::into_inner(m.remove(d)?)?.into_inner()).collect()
+        };
+        for layer in idle {
+            if let Some(layer) = Arc::into_inner(layer) {
+                layer.close().await;
+            }
+        }
     }
 
     /// How many layers are mounted.
@@ -496,7 +589,7 @@ impl Layers {
                             };
                             let _ = filler.fill_rest(&first).await;
                         }));
-                        Data::Lazy { _device: device, _fill: fill, lazy }
+                        Data::Lazy { _device: device, fill, lazy }
                     }
                     _ => Data::Whole(self.cache.get(&**store, layer.data).await?),
                 };

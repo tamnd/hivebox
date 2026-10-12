@@ -13,9 +13,9 @@ use std::time::Instant;
 
 use hive_nectar::cas::Cuts;
 use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
-use hive_nectar::mount::{IdMap, Layers};
+use hive_nectar::mount::{IdMap, Layers, Lease};
 use hive_nectar::oci::{Importer, Platform};
-use hive_nectar::{BlobStore, Cache, PosixStore, S3Config, S3Store};
+use hive_nectar::{BlobStore, Cache, Manifest, PosixStore, S3Config, S3Store};
 
 const BASE: u32 = 1_000_000;
 
@@ -126,6 +126,86 @@ async fn an_image_mounts_once_idmapped_and_goes_away_cleanly() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(loops_under(&cache_dir), 0, "every loop device was freed");
+    assert_eq!(cache.usage().pinned, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A tar holding one file, `big`, of `size` bytes that do not repeat, made from `seed`.
+fn one_file_tar(path: &Path, seed: u64, size: usize) {
+    let mut x = seed | 1;
+    let body: Vec<u8> = (0..size)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let mut b = tar::Builder::new(std::fs::File::create(path).unwrap());
+    let mut h = tar::Header::new_gnu();
+    h.set_mode(0o644);
+    h.set_mtime(1_700_000_000);
+    h.set_size(body.len() as u64);
+    b.append_data(&mut h, "big", &body[..]).unwrap();
+    b.finish().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn layers_no_cell_holds_make_room_for_new_ones() {
+    if !rustix::process::geteuid().is_root() {
+        eprintln!("skipped: needs root");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hive-nectar-lease-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store: Arc<dyn BlobStore> = Arc::new(PosixStore::open(dir.join("store")).unwrap());
+    let importer = Importer::new(builder(), dir.join("work")).unwrap();
+    let mut images = Vec::new();
+    let mut bodies = Vec::new();
+    for seed in [1, 2] {
+        let tar = dir.join(format!("{seed}.tar"));
+        one_file_tar(&tar, seed, 8 << 20);
+        let mut a = tar::Archive::new(std::fs::File::open(&tar).unwrap());
+        let mut entry = a.entries().unwrap().next().unwrap().unwrap();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+        bodies.push(body);
+        images.push(importer.import_tar(&*store, &tar).await.unwrap().manifest);
+    }
+    let size = |m: &Manifest| m.layers.iter().map(|l| l.meta_size + l.data_size).sum::<u64>();
+    // Room for one image, not both.
+    let cache =
+        Cache::open(dir.join("l1"), size(&images[0]).max(size(&images[1])) * 3 / 2).unwrap();
+    let layers = Layers::new(dir.join("layers"), cache.clone(), None).unwrap();
+    let read = |lease: &Lease| std::fs::read(lease.lowers()[0].join("big")).unwrap();
+
+    let a = layers.lease(&store, &images[0]).await.unwrap();
+    assert!(read(&a) == bodies[0]);
+    let e = layers.lease(&store, &images[1]).await.unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::StorageFull, "{e}");
+    assert_eq!(layers.len(), 1);
+
+    // Let go of, the layer stays mounted until the room is wanted.
+    drop(a);
+    assert_eq!((layers.len(), mounts_under(&dir.join("layers"))), (1, 1));
+    let t = Instant::now();
+    let b = layers.lease(&store, &images[1]).await.unwrap();
+    println!("the idle layer went and the other came in {:.2?}", t.elapsed());
+    assert!(read(&b) == bodies[1]);
+    assert_eq!((layers.len(), mounts_under(&dir.join("layers"))), (1, 1));
+    drop(b);
+    let again = layers.lease(&store, &images[0]).await.unwrap();
+    assert!(read(&again) == bodies[0]);
+    drop(again);
+
+    // What mount gives out stays, so nothing makes room for the other image.
+    layers.mount(&store, &images[0]).await.unwrap();
+    let e = layers.lease(&store, &images[1]).await.unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::StorageFull, "{e}");
+
+    drop(layers);
+    assert_eq!(mounts_under(&dir), 0);
     assert_eq!(cache.usage().pinned, 0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
