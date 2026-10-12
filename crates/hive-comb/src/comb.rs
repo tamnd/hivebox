@@ -31,13 +31,15 @@ use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 const SHARDS: usize = 64;
+/// The file in the data directory whose presence means the node is cordoned.
+const CORDON_FILE: &str = "cordoned";
 /// Sequence numbers are reserved in the WAL this many at a time, so most creates don't write
 /// the counter.
 const SEQ_BLOCK: u64 = 4096;
@@ -155,6 +157,10 @@ pub(crate) struct Inner {
     turned: Mutex<Turned>,
     seq: tokio::sync::Mutex<SeqBlock>,
     events: broadcast::Sender<CellEvent>,
+    /// An operator cordoned the node, so it takes no new cells.
+    cordoned: AtomicBool,
+    /// Held while the cordon changes, so the file and the flag agree.
+    cordoning: Mutex<()>,
 }
 
 /// The policies `cfg` names, each compiled, so a node does not start with one it cannot run.
@@ -318,6 +324,10 @@ impl Comb {
             None => None,
         };
         let mut records = replay.records;
+        let cordoned = cfg.data_dir.join(CORDON_FILE).exists();
+        if cordoned {
+            eprintln!("hive-comb: the node is cordoned, so it takes no new cells until uncordoned");
+        }
         let next = records.remove(&SEQ_KEY).and_then(|b| Seq::decode(b).ok()).map_or(1, |s| s.next);
         let inner = Arc::new(Inner {
             cfg,
@@ -342,6 +352,8 @@ impl Comb {
             // starts past all of it.
             seq: tokio::sync::Mutex::new(SeqBlock { next, reserved: next }),
             events: broadcast::channel(4096).0,
+            cordoned: AtomicBool::new(cordoned),
+            cordoning: Mutex::new(()),
         });
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
         // Copies for forks that were under way when the comb last ended.
@@ -557,12 +569,23 @@ impl Comb {
             {
                 return wait_started(&cell).await;
             }
-            if !req.anyway && inner.lock_turned().has(&req.project, key, Instant::now()) {
-                return Err(Error::new(
-                    Reason::CapacityUnavailable,
-                    "this node turned the key away for room lately, so it goes where it went then",
-                ));
-            }
+        }
+        // After the key, so a cordoned node still answers for a cell it has. A gate tries the
+        // next node for anything else.
+        if inner.cordoned.load(Ordering::Relaxed) {
+            return Err(Error::new(
+                Reason::CapacityUnavailable,
+                "this node is cordoned, so it takes no new cells",
+            ));
+        }
+        if let Some(key) = &idem
+            && !req.anyway
+            && inner.lock_turned().has(&req.project, key, Instant::now())
+        {
+            return Err(Error::new(
+                Reason::CapacityUnavailable,
+                "this node turned the key away for room lately, so it goes where it went then",
+            ));
         }
         let reservation = match inner.admission.reserve(&req.spec) {
             Ok(r) => r,
@@ -642,6 +665,16 @@ impl Comb {
 
     /// Stops a cell and returns once it has ended. `grace` defaults to the configured one.
     pub async fn stop(&self, id: CellId, grace: Option<Duration>) -> Result<CellInfo, Error> {
+        self.stop_for(id, Cause::Requested, grace).await
+    }
+
+    /// Stops a cell as [`Comb::stop`] does, ending it with `cause`.
+    pub(crate) async fn stop_for(
+        &self,
+        id: CellId,
+        cause: Cause,
+        grace: Option<Duration>,
+    ) -> Result<CellInfo, Error> {
         let cell = self.inner.find(id)?;
         if cell.state().is_terminal() {
             return Ok(cell.info());
@@ -650,10 +683,38 @@ impl Comb {
         let (done, wait) = oneshot::channel();
         // A cell still starting gets the stop once its create is over, since the actor only reads
         // its queue once the cell is up.
-        if cell.send(Cmd::Stop { cause: Cause::Requested, grace, done }).await {
+        if cell.send(Cmd::Stop { cause, grace, done }).await {
             let _ = wait.await;
         }
         Ok(cell.info())
+    }
+
+    /// Whether an operator cordoned the node, so it takes no new cells.
+    #[must_use]
+    pub fn cordoned(&self) -> bool {
+        self.inner.cordoned.load(Ordering::Relaxed)
+    }
+
+    /// Cordons the node when `on`, so it takes no new cells, or lifts the cordon. The cells it has
+    /// are not touched. The mark is a file in the data directory, so a restart keeps it.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written or removed. The node is left as it was.
+    pub fn cordon(&self, on: bool) -> io::Result<()> {
+        let path = self.inner.cfg.data_dir.join(CORDON_FILE);
+        let _one = self.inner.cordoning.lock().unwrap_or_else(PoisonError::into_inner);
+        if on {
+            std::fs::write(&path, b"").map_err(at("writing", &path))?;
+        } else if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return Err(at("removing", &path)(e));
+        }
+        if self.inner.cordoned.swap(on, Ordering::Relaxed) != on {
+            eprintln!("hive-comb: {}", if on { "cordoned" } else { "uncordoned" });
+        }
+        Ok(())
     }
 
     /// Pauses a running cell.

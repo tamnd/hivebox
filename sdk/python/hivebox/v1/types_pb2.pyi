@@ -60,6 +60,7 @@ class Cause(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CAUSE_DRONE_LOST: _ClassVar[Cause]
     CAUSE_NODE_LOST: _ClassVar[Cause]
     CAUSE_RECOVERY: _ClassVar[Cause]
+    CAUSE_DRAINED: _ClassVar[Cause]
 BACKEND_UNSPECIFIED: Backend
 BACKEND_FNCALL: Backend
 BACKEND_CONTAINER: Backend
@@ -95,6 +96,7 @@ CAUSE_START_FAILED: Cause
 CAUSE_DRONE_LOST: Cause
 CAUSE_NODE_LOST: Cause
 CAUSE_RECOVERY: Cause
+CAUSE_DRAINED: Cause
 
 class Resources(_message.Message):
     __slots__ = ("vcpu_milli", "mem_mib", "disk_gib", "pids", "open_files")

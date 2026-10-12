@@ -100,6 +100,7 @@ struct Reporter {
 struct Sent {
     at: Instant,
     healthy: bool,
+    cordoned: bool,
     held: bool,
     cells: u32,
     mem_mib: u64,
@@ -168,8 +169,8 @@ impl Reporter {
         }
     }
 
-    /// Whether a report should go now: a second passed, health changed, the pressure brake went
-    /// on or off, or cells or memory moved by more than 5% of the node's room.
+    /// Whether a report should go now: a second passed, health or the cordon changed, the
+    /// pressure brake went on or off, or cells or memory moved by more than 5% of the node's room.
     fn due(&self, comb: &Comb) -> bool {
         let Some(last) = self.last else { return true };
         if last.at.elapsed() >= EVERY {
@@ -181,6 +182,7 @@ impl Reporter {
         let max = inner.admission.max_cells() as u64;
         let moved = |a: u64, b: u64, whole: u64| a.abs_diff(b) as f64 > whole as f64 * URGENT_SHARE;
         !inner.shutdown.is_cancelled() != last.healthy
+            || comb.cordoned() != last.cordoned
             || inner.admission.held() != last.held
             || moved(u64::from(last.cells), usage.cells as u64, max)
             || moved(last.mem_mib, usage.mem >> 20, admit)
@@ -196,6 +198,7 @@ impl Reporter {
         let clock = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_micros());
         self.seq = (self.seq + 1).max(u64::try_from(clock).unwrap_or(u64::MAX));
         let healthy = !inner.shutdown.is_cancelled();
+        let cordoned = comb.cordoned();
         let cells = u32::try_from(usage.cells).unwrap_or(u32::MAX);
         let mem_committed_mib = usage.mem >> 20;
         let mut layers: Vec<[u8; 32]> = inner.mounted_layers();
@@ -218,7 +221,8 @@ impl Reporter {
         self.layers = layers;
         let held = inner.admission.held();
         let census = census(comb);
-        self.last = Some(Sent { at: now, healthy, held, cells, mem_mib: mem_committed_mib });
+        self.last =
+            Some(Sent { at: now, healthy, cordoned, held, cells, mem_mib: mem_committed_mib });
         // While the brake holds admits the node has no room, whatever its ceiling says, so the
         // placer looks elsewhere and not at a node that would turn the create away.
         let ceiling = inner.admission.ceiling_for(Qos::Standard) >> 20;
@@ -229,6 +233,7 @@ impl Reporter {
             seq: self.seq,
             addr: self.addr.clone(),
             healthy,
+            cordoned,
             cloud: inner.cfg.cloud,
             backends: self.backends,
             cpu_milli: self.cpu_milli,

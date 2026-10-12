@@ -18,6 +18,7 @@ fn report(node: u16, seq: u64) -> NodeReport {
         seq,
         addr: Arc::from("unix:/run/hivebox/comb.sock"),
         healthy: true,
+        cordoned: false,
         cloud: false,
         idle_cells: 0,
         idle_mem_mib: 0,

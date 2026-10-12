@@ -13,14 +13,15 @@ pub struct ClusterView {
 }
 
 impl ClusterView {
-    /// How much of the admittable memory of the healthy on-prem nodes is committed, from 0 to 1.
+    /// How much of the admittable memory of the healthy on-prem nodes that are not cordoned is
+    /// committed, from 0 to 1.
     /// Below [`crate::PACK_BELOW`] placement packs cells for image locality, above it spreads
     /// them. Cloud nodes are left out, since they are mostly empty and would hide how full the
     /// rest is.
     #[must_use]
     pub fn utilization(&self) -> f64 {
         let (mut used, mut total) = (0u64, 0u64);
-        for n in self.nodes.iter().filter(|n| n.healthy && !n.cloud) {
+        for n in self.nodes.iter().filter(|n| n.healthy && !n.cordoned && !n.cloud) {
             used += n.mem_committed_mib;
             total += n.mem_admit_mib;
         }
@@ -41,6 +42,9 @@ pub struct NodeView {
     pub report: u64,
     /// Whether the comb is taking creates.
     pub healthy: bool,
+    /// Whether an operator cordoned the node. It takes no new cells, but still answers for an
+    /// idempotency key it already has.
+    pub cordoned: bool,
     /// Whether the node is a cloud VM that takes cells only past [`crate::BURST_ABOVE`], and
     /// only of the images it has staged.
     pub cloud: bool,
@@ -85,6 +89,7 @@ impl NodeView {
             epoch: 0,
             report: 0,
             healthy: true,
+            cordoned: false,
             cloud: false,
             backends: BackendSet::of(&[Backend::Container, Backend::Microvm]),
             cpu_milli,

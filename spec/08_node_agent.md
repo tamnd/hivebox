@@ -122,6 +122,8 @@ Policy: a cell idle for at least `idle_ttl` gets Freeze. Reclaim follows after 1
 
 `hivectl node drain <n>` stops admits, SnapshotKills idle cells, waits (with a timeout), then reports. `cordon` and `uncordon` are also available, and kernel upgrades go through drain plus reboot. Node labels cover kernel version, backends ready (KVM present, ublk, fanotify pre-content), CPU flags and GPU.
 
+What is in now: the `hivebox.internal.v1.Node` service on the comb, which a gate does not pass on, with `Status`, `Cordon`, `Uncordon` and `Drain`, and `hivectl node` over it. The cordon is a file in the data dir. A cordoned node answers creates whose idempotency key it has and refuses the rest with `CAPACITY_UNAVAILABLE`. Scout carries the cordon, and waggle skips the node when it places and rebalances, but keeps it in a key's node order so a retried create still finds its cell. A drain stops paused cells at once, eight at a time, each after a disk snapshot when asked, which is the disk-only form of SnapshotKill. Running cells are waited on until the timeout, then stopped or left. Cells the drain stops fail with cause `DRAINED`, which is infra. The drain streams one event a cell and a total at the end, and is audited. Upgrades and reboots through it are not automated yet.
+
 ## 11. Config
 
 Config is TOML, and a subset of it is hot-reloadable.

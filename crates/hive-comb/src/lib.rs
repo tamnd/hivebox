@@ -13,6 +13,7 @@ mod cgroups;
 mod comb;
 mod config;
 mod core_sched;
+mod drain;
 pub mod lease;
 mod llm;
 mod metrics;
@@ -30,4 +31,5 @@ pub use comb::{CellEvent, Comb, CreateRequest, Quarantined, WalStats};
 pub use config::{
     Config, ContainerBackend, FncallBackend, Images, KeeperLink, Llm, Network, ScoutLink, SiemLink,
 };
+pub use drain::{DrainOptions, DrainTotals, Drained, How};
 pub use metrics::Metrics;

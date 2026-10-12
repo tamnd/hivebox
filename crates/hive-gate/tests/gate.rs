@@ -572,6 +572,7 @@ fn report(node: u16, addr: SocketAddr, seq: u64) -> NodeReport {
         seq,
         addr: Arc::from(format!("http://{addr}")),
         healthy: true,
+        cordoned: false,
         cloud: false,
         idle_cells: 0,
         idle_mem_mib: 0,

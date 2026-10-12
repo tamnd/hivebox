@@ -4,6 +4,8 @@ use crate::Error;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use hive_proto::convert;
+use hive_proto::internal as node;
+use hive_proto::internal::node_client::NodeClient;
 use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
@@ -410,6 +412,45 @@ impl Client {
     ) -> Result<BoxStream<'static, Result<v1::CellEvent, Error>>, Error> {
         let r = v1::WatchCellsRequest { selector: Some(sel.to_v1()) };
         let events = self.cells().watch(self.req(r)).await.map_err(from_status)?.into_inner();
+        Ok(events.map_err(from_status).boxed())
+    }
+
+    /// The comb's node: whether it is cordoned and how many cells it has. Only a comb answers
+    /// this and the other node calls, not a gate.
+    ///
+    /// # Errors
+    ///
+    /// The call failed.
+    pub async fn node_status(&self) -> Result<node::NodeStatus, Error> {
+        let mut c = NodeClient::new(self.channel.clone());
+        Ok(c.status(self.req(node::NodeRequest {})).await.map_err(from_status)?.into_inner())
+    }
+
+    /// Cordons the comb's node when `on`, so it takes no new cells, or lifts the cordon, and
+    /// returns the node as it is then.
+    ///
+    /// # Errors
+    ///
+    /// The call failed.
+    pub async fn cordon(&self, on: bool) -> Result<node::NodeStatus, Error> {
+        let mut c = NodeClient::new(self.channel.clone());
+        let r = self.req(node::NodeRequest {});
+        let r = if on { c.cordon(r).await } else { c.uncordon(r).await };
+        Ok(r.map_err(from_status)?.into_inner())
+    }
+
+    /// Drains the comb's node: cordons it, stops its idle cells and waits up to `req.timeout`
+    /// for the rest. One event comes for each cell as it goes, and the last has the totals.
+    ///
+    /// # Errors
+    ///
+    /// The drain could not start.
+    pub async fn drain(
+        &self,
+        req: node::DrainRequest,
+    ) -> Result<BoxStream<'static, Result<node::DrainEvent, Error>>, Error> {
+        let mut c = NodeClient::new(self.channel.clone());
+        let events = c.drain(self.req(req)).await.map_err(from_status)?.into_inner();
         Ok(events.map_err(from_status).boxed())
     }
 }

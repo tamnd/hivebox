@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package hivebox.internal.v1;
+
+import "google/protobuf/duration.proto";
+
+// What an operator does to one node, served by its comb next to the cell services. The gate does
+// not pass these on, so only someone who can reach the comb's own socket or port can call them.
+service Node {
+  rpc Status(NodeRequest) returns (NodeStatus);
+  // Stops the node taking new cells, until Uncordon. The cells it has keep running. The mark is
+  // kept on disk, so a cordoned node is still cordoned after its comb restarts.
+  rpc Cordon(NodeRequest) returns (NodeStatus);
+  rpc Uncordon(NodeRequest) returns (NodeStatus);
+  // Cordons the node and empties it. Idle cells, which are the paused ones, are stopped at once,
+  // each with a disk snapshot first when asked. The running ones are given until the timeout to
+  // end on their own, and are then stopped or left as they are. There is one event per cell as
+  // it goes and a last one with the totals. The node stays cordoned afterwards.
+  rpc Drain(DrainRequest) returns (stream DrainEvent);
+}
+
+message NodeRequest {}
+
+message NodeStatus {
+  // The comb's node index.
+  uint32 node = 1;
+  bool cordoned = 2;
+  // Cells that have not ended, and of those the ones running and paused.
+  uint32 live = 3;
+  uint32 running = 4;
+  uint32 paused = 5;
+  // The comb's version.
+  string version = 6;
+}
+
+message DrainRequest {
+  // How long the running cells get to end on their own. Ten minutes when unset.
+  google.protobuf.Duration timeout = 1;
+  // Stop the cells still running when the timeout is up, rather than leaving them.
+  bool stop_rest = 2;
+  // Take a disk snapshot of each idle container cell before it is stopped. The snapshot ids are
+  // in the events.
+  bool snapshot = 3;
+}
+
+message DrainEvent {
+  oneof event {
+    DrainedCell cell = 1;
+    DrainDone done = 2;
+  }
+}
+
+message DrainedCell {
+  string cell_id = 1;
+  string project = 2;
+  enum How {
+    HOW_UNSPECIFIED = 0;
+    // It was idle and the drain stopped it.
+    HOW_IDLE = 1;
+    // It ended on its own while the drain waited.
+    HOW_ENDED = 2;
+    // It was still running at the timeout and the drain stopped it.
+    HOW_STOPPED = 3;
+    // It was still running at the timeout and was left running.
+    HOW_LEFT = 4;
+  }
+  How how = 3;
+  // The snapshot taken before an idle cell was stopped.
+  string snapshot_id = 4;
+  // Why a snapshot that was asked for was not taken. The cell was stopped anyway.
+  string error = 5;
+}
+
+message DrainDone {
+  NodeStatus status = 1;
+  // Cells by how they left, in the order of DrainedCell.How.
+  uint32 idle = 2;
+  uint32 ended = 3;
+  uint32 stopped = 4;
+  uint32 left = 5;
+  google.protobuf.Duration took = 6;
+}

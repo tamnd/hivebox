@@ -59,13 +59,22 @@ Files:
   files ID PATH [--depth N]
   rm ID PATH [-r]
 
+Nodes, on a comb's own socket or port:
+  node status                                      whether the node is cordoned, and its cells
+  node cordon|uncordon                             stops new cells coming to the node, or lets
+         them come again. The cells it has keep running either way
+  node drain [--timeout DURATION] [--stop-rest] [--snapshot]
+         cordons the node, stops its idle cells at once, each after a disk snapshot with
+         --snapshot, and waits up to DURATION, 10m by default, for the rest to end. With
+         --stop-rest the ones still running then are stopped. The node stays cordoned
+
 Audit:
   audit verify DIR [--keeper HOST:PORT]...
                       checks a node's audit chain in DIR and prints its root, or where it breaks.
                       With --keeper, it also checks the chain against the roots the keeper holds
 
 The socket is $HIVE_SOCKET, or /run/hivebox/comb.sock. The project is $HIVE_PROJECT, or local.
-Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out. `verify` exits 0 when every run passed, 1 when one failed, and 2 when hivebox could not tell. `audit verify` exits 1 when the chain is broken.
+Durations are seconds, or a number with s, m or h. `run` exits with the command's exit code, or 124 when it timed out. `verify` exits 0 when every run passed, 1 when one failed, and 2 when hivebox could not tell. `audit verify` exits 1 when the chain is broken. `node drain` exits 1 when it left cells running.
 ";
 
 /// A command line split into flags and the rest.
@@ -76,7 +85,8 @@ pub struct Args {
 }
 
 /// Flags that stand alone. Every other flag takes a value.
-const SWITCHES: &[&str] = &["-i", "-r", "--all", "--scrub", "-h", "--help"];
+const SWITCHES: &[&str] =
+    &["-i", "-r", "--all", "--scrub", "--stop-rest", "--snapshot", "-h", "--help"];
 
 impl Args {
     /// Splits `args`.
@@ -196,6 +206,7 @@ pub async fn main(args: Vec<String>) -> Result<i32, String> {
         "snapshot" => snapshot(&client, &args).await,
         "commit" => commit(&client, &args).await,
         "fork" => fork(&client, &args).await,
+        "node" => node(&client, &args).await,
         _ => Err(format!("{command} is not a command. Try hivectl help.")),
     }
 }
@@ -774,6 +785,85 @@ fn pairs(items: &[&str]) -> Result<BTreeMap<String, String>, String> {
             _ => Err(format!("{p} is not KEY=VALUE")),
         })
         .collect()
+}
+
+async fn node(client: &Client, args: &Args) -> Result<i32, String> {
+    let what = args.rest.first().map(String::as_str);
+    if what == Some("drain") {
+        args.check(&["--timeout", "--stop-rest", "--snapshot"])?;
+    } else {
+        args.check(&[])?;
+    }
+    if args.rest.len() != 1 {
+        return Err("this needs one of status, cordon, uncordon or drain".to_string());
+    }
+    let status = match what {
+        Some("status") => client.node_status().await.map_err(err)?,
+        Some("cordon") => client.cordon(true).await.map_err(err)?,
+        Some("uncordon") => client.cordon(false).await.map_err(err)?,
+        Some("drain") => return drain(client, args).await,
+        Some(w) => return Err(format!("node {w}: status, cordon, uncordon or drain")),
+        None => unreachable!(),
+    };
+    println!("{}", node_line(&status));
+    Ok(0)
+}
+
+/// One line on a node: its index, whether it is cordoned, its cells and its version.
+fn node_line(s: &pb::NodeStatus) -> String {
+    format!(
+        "node {} {}, {} cells ({} running, {} paused), hive-comb {}",
+        s.node,
+        if s.cordoned { "cordoned" } else { "taking cells" },
+        s.live,
+        s.running,
+        s.paused,
+        s.version
+    )
+}
+
+async fn drain(client: &Client, args: &Args) -> Result<i32, String> {
+    let timeout = args.one(&["--timeout"]).map(duration).transpose()?;
+    let req = pb::DrainRequest {
+        timeout: timeout.map(hive_proto::convert::duration_to_v1),
+        stop_rest: args.has("--stop-rest"),
+        snapshot: args.has("--snapshot"),
+    };
+    let mut events = client.drain(req).await.map_err(err)?;
+    let mut left = 0;
+    while let Some(e) = futures::StreamExt::next(&mut events).await {
+        match e.map_err(err)?.event {
+            Some(pb::drain_event::Event::Cell(c)) => {
+                let how = c.how();
+                left += u32::from(how == pb::drained_cell::How::Left);
+                let mut line =
+                    format!("{} {} {}", c.cell_id, c.project, enum_name(how.as_str_name(), "HOW_"));
+                if !c.snapshot_id.is_empty() {
+                    line.push_str(&format!(" snapshot {}", c.snapshot_id));
+                }
+                if !c.error.is_empty() {
+                    line.push_str(&format!(" no snapshot: {}", c.error));
+                }
+                println!("{line}");
+            }
+            Some(pb::drain_event::Event::Done(d)) => {
+                let took = d.took.and_then(|t| Duration::try_from(t).ok()).unwrap_or_default();
+                println!(
+                    "drained in {:.1}s: {} idle stopped, {} ended, {} stopped at the timeout, {} left",
+                    took.as_secs_f64(),
+                    d.idle,
+                    d.ended,
+                    d.stopped,
+                    d.left
+                );
+                if let Some(s) = &d.status {
+                    println!("{}", node_line(s));
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(i32::from(left > 0))
 }
 
 /// Seconds, or a number with `s`, `m` or `h`.

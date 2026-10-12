@@ -134,6 +134,7 @@ fn report(node: u16, seq: u64, layers: Option<LayerBloom>) -> NodeReport {
         seq,
         addr: Arc::from(format!("10.0.{}.{}:7400", node >> 8, node & 0xff)),
         healthy: true,
+        cordoned: false,
         cloud: false,
         idle_cells: 0,
         idle_mem_mib: 0,

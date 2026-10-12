@@ -62,6 +62,9 @@ pub struct NodeReport {
     pub addr: Arc<str>,
     /// Whether the comb is taking creates.
     pub healthy: bool,
+    /// Whether an operator cordoned the node. It takes no new cells, but still answers for an
+    /// idempotency key it already has.
+    pub cordoned: bool,
     /// Whether the node is a cloud VM, which takes cells only past the burst threshold.
     pub cloud: bool,
     /// The backends it can run now.
@@ -143,6 +146,7 @@ impl Snapshot {
             t.nodes += 1;
             if view.healthy {
                 t.healthy += 1;
+                t.cordoned += u32::from(view.cordoned);
                 t.cells += u64::from(view.cells);
                 t.mem_admit_mib += view.mem_admit_mib;
                 t.mem_committed_mib += view.mem_committed_mib;
@@ -179,6 +183,8 @@ pub struct Totals {
     pub nodes: u32,
     /// Of those, the ones reporting and healthy.
     pub healthy: u32,
+    /// Of the healthy ones, those an operator cordoned.
+    pub cordoned: u32,
     /// Cells on the healthy nodes.
     pub cells: u64,
     /// Memory the healthy nodes admit, in MiB.
@@ -251,6 +257,7 @@ impl Scout {
                 layers = e.view.layers.clone();
                 urgent = !e.live
                     || e.view.healthy != report.healthy
+                    || e.view.cordoned != report.cordoned
                     || e.view.cloud != report.cloud
                     || moved(
                         e.view.mem_committed_mib,
@@ -270,6 +277,7 @@ impl Scout {
             epoch: report.epoch,
             report: self.taken,
             healthy: report.healthy,
+            cordoned: report.cordoned,
             cloud: report.cloud,
             backends: report.backends,
             cpu_milli: report.cpu_milli,
