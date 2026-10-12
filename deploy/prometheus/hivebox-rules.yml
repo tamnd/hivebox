@@ -1,0 +1,176 @@
+# Recording rules and alerts for hivebox. Load with rule_files in prometheus.yml. The comb, gate and
+# scout are expected under the jobs hive-comb, hive-gate and hive-scout. See deploy/README.md.
+#
+# The SLOs are from spec/02_requirements_slos.md: at most 0.1% of cells fail for an infrastructure
+# cause, and warm creates finish within 400 ms at p99 for containers and 300 ms for microVMs. The
+# infra failure SLOs alert on multi-window burn rates, as in the Google SRE workbook: a page when
+# both the 1h and 5m windows burn the budget 14.4 times too fast, or both the 6h and 30m windows
+# 6 times, and a ticket for 3 times over 1d and 2h, or 1 time over 3d and 6h.
+#
+# Latencies are taken per node and series, never summed across nodes, since a node only writes the
+# histogram buckets that hold something and the buckets of two nodes do not line up.
+groups:
+  - name: hivebox-sli
+    rules:
+      - record: hive:cell_infra_failure:ratio_rate5m
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[5m])) / sum(rate(hive_cells_ended_total[5m]))
+      - record: hive:cell_infra_failure:ratio_rate30m
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[30m])) / sum(rate(hive_cells_ended_total[30m]))
+      - record: hive:cell_infra_failure:ratio_rate1h
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[1h])) / sum(rate(hive_cells_ended_total[1h]))
+      - record: hive:cell_infra_failure:ratio_rate2h
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[2h])) / sum(rate(hive_cells_ended_total[2h]))
+      - record: hive:cell_infra_failure:ratio_rate6h
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[6h])) / sum(rate(hive_cells_ended_total[6h]))
+      - record: hive:cell_infra_failure:ratio_rate1d
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[1d])) / sum(rate(hive_cells_ended_total[1d]))
+      - record: hive:cell_infra_failure:ratio_rate3d
+        expr: sum(rate(hive_cells_ended_total{state="failed"}[3d])) / sum(rate(hive_cells_ended_total[3d]))
+      - record: hive:create_infra_failure:ratio_rate5m
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[5m])) / sum(rate(hive_gate_cells_created_total[5m]))
+      - record: hive:create_infra_failure:ratio_rate30m
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[30m])) / sum(rate(hive_gate_cells_created_total[30m]))
+      - record: hive:create_infra_failure:ratio_rate1h
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[1h])) / sum(rate(hive_gate_cells_created_total[1h]))
+      - record: hive:create_infra_failure:ratio_rate2h
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[2h])) / sum(rate(hive_gate_cells_created_total[2h]))
+      - record: hive:create_infra_failure:ratio_rate6h
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[6h])) / sum(rate(hive_gate_cells_created_total[6h]))
+      - record: hive:create_infra_failure:ratio_rate1d
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[1d])) / sum(rate(hive_gate_cells_created_total[1d]))
+      - record: hive:create_infra_failure:ratio_rate3d
+        expr: sum(rate(hive_gate_cells_created_total{result="infra_error"}[3d])) / sum(rate(hive_gate_cells_created_total[3d]))
+      - record: hive:create_seconds:p99_5m
+        expr: histogram_quantile(0.99, rate(hive_create_seconds_bucket{stage="total"}[5m]))
+      - record: hive:create_seconds:p99_1h
+        expr: histogram_quantile(0.99, rate(hive_create_seconds_bucket{stage="total"}[1h]))
+      - record: hive:exec_seconds:p99_5m
+        expr: histogram_quantile(0.99, rate(hive_exec_seconds_bucket[5m]))
+      - record: hive:gate_create_seconds:p99_5m
+        expr: histogram_quantile(0.99, rate(hive_gate_create_seconds_bucket[5m]))
+
+  - name: hivebox-alerts
+    rules:
+      - alert: HiveCellInfraFailuresFast
+        expr: |
+          (hive:cell_infra_failure:ratio_rate1h > 14.4 * 0.001 and hive:cell_infra_failure:ratio_rate5m > 14.4 * 0.001)
+          or (hive:cell_infra_failure:ratio_rate6h > 6 * 0.001 and hive:cell_infra_failure:ratio_rate30m > 6 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Cells are failing for infrastructure causes fast enough to spend the monthly budget in days.
+          description: The share of ended cells that failed is past the 0.1% SLO many times over. hive_cells_ended_total by cause says which.
+
+      - alert: HiveCellInfraFailuresSlow
+        expr: |
+          (hive:cell_infra_failure:ratio_rate1d > 3 * 0.001 and hive:cell_infra_failure:ratio_rate2h > 3 * 0.001)
+          or (hive:cell_infra_failure:ratio_rate3d > 0.001 and hive:cell_infra_failure:ratio_rate6h > 0.001)
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: Cells are failing for infrastructure causes faster than the 0.1% SLO allows.
+          description: At this rate the monthly budget runs out before the month does. hive_cells_ended_total by cause says which.
+
+      - alert: HiveCreateInfraFailuresFast
+        expr: |
+          (hive:create_infra_failure:ratio_rate1h > 14.4 * 0.001 and hive:create_infra_failure:ratio_rate5m > 14.4 * 0.001)
+          or (hive:create_infra_failure:ratio_rate6h > 6 * 0.001 and hive:create_infra_failure:ratio_rate30m > 6 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Creates through the gate are failing for infrastructure reasons.
+          description: More than 0.1% of creates end in an infra error many times over. Look at hive_create_total by result on the combs.
+
+      - alert: HiveCreateInfraFailuresSlow
+        expr: |
+          (hive:create_infra_failure:ratio_rate1d > 3 * 0.001 and hive:create_infra_failure:ratio_rate2h > 3 * 0.001)
+          or (hive:create_infra_failure:ratio_rate3d > 0.001 and hive:create_infra_failure:ratio_rate6h > 0.001)
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: Creates through the gate fail for infrastructure reasons faster than the 0.1% SLO allows.
+          description: Look at hive_create_total by result on the combs.
+
+      - alert: HiveCreateSlow
+        expr: |
+          (hive:create_seconds:p99_5m{backend="container"} > 0.4 and hive:create_seconds:p99_1h{backend="container"} > 0.4)
+          or (hive:create_seconds:p99_5m{backend!="container"} > 0.3 and hive:create_seconds:p99_1h{backend!="container"} > 0.3)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Creates on {{ $labels.instance }} are past the p99 target.
+          description: The targets are for warm creates, so a node pulling many new images runs slower. hive_create_seconds by stage says which part grew.
+
+      - alert: HiveCombDown
+        expr: up{job="hive-comb"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: The comb on {{ $labels.instance }} does not answer scrapes.
+          description: Its cells keep running, but nothing on the node can be created, run or stopped until it is back. See journalctl -u hive-comb.
+
+      - alert: HiveCombRestarting
+        expr: changes(hive_comb_start_time_seconds[1h]) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: The comb on {{ $labels.instance }} started at least 3 times in the last hour.
+          description: Each start takes the cells back from the WAL. See journalctl -u hive-comb for why it stops.
+
+      - alert: HiveCombLostCells
+        expr: hive_comb_start_cells{result="lost"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The comb on {{ $labels.instance }} could not take back some cells when it started.
+          description: Those cells failed with cause RECOVERY or NODE_LOST. The comb log has a line for each. This clears when the comb next starts.
+
+      - alert: HiveMemoryStall
+        expr: hive_memory_stall_basis_points > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Cells on {{ $labels.instance }} spend more than 10% of their time stalled on memory.
+          description: The pressure brake pauses idle cells and reclaims from best effort ones, which is not keeping up. The node may be packed too tight.
+
+      - alert: HiveNodeCordonedLong
+        expr: hive_node_cordoned == 1
+        for: 12h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} has been cordoned for 12 hours."
+          description: A failed upgrade leaves the node cordoned on purpose. Uncordon it with hivectl node uncordon once it is fixed.
+
+      - alert: HiveScoutNodesDown
+        expr: hive_scout_nodes{state="down"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Scout has nodes it no longer hears from.
+          description: Waggle places nothing on them. Check the combs on those nodes and their network.
+
+      - alert: HiveControlPlaneDown
+        expr: up{job=~"hive-gate|hive-scout"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }} on {{ $labels.instance }} does not answer scrapes."
+          description: Cells keep running without it, but creates through this instance fail.
+
+      - alert: HiveMetricsOverflow
+        expr: increase(hive_telemetry_overflow_total[1h]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.metric }} on {{ $labels.instance }} hit its series cap."
+          description: New label values are folded into the series labelled other, so this metric undercounts by label.

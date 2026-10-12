@@ -361,6 +361,8 @@ impl Actor {
     /// Shows a new state without writing it down. Only for states a restart has nothing to do
     /// about.
     fn show(&mut self, state: CellState, cause: Option<Cause>, message: &str) {
+        let from = self.cell.state();
+        self.inner.metrics.moved(self.cell.spec.backend, Some(from), state, cause);
         let status = Status {
             state,
             cause,

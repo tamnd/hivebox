@@ -39,6 +39,8 @@
 
 Multi-window burn-rate alerts cover create success, create p99 by path, exec p99, infra_error_ratio, node PSI, pool depth exhaustion, 3FS latency, and keeper leader churn.
 
+What is in now: `deploy/prometheus/hivebox-rules.yml` and `deploy/grafana/hivebox.json`. The infra failure ratio comes from `hive_cells_ended_total{backend,state,cause}`, where a failed cell is one that ended for an infra cause, and create success from the gate's `hive_gate_cells_created_total`, whose result is `created`, `infra_error` or `caller_error`. Both get burn-rate alerts over 1h and 5m, 6h and 30m, 1d and 2h, and 3d and 6h. Create p99 is alerted per node and backend against the warm targets, since the comb does not yet tell warm from cold creates. Node PSI is `hive_memory_stall_basis_points`. Exec p99 is on the dashboard only, as it includes the command's run time. The comb also exports `hive_cells{backend,state}`, `hive_node_cordoned`, `hive_comb_start_time_seconds` and `hive_comb_start_cells{result}`. Pool depth, 3FS latency and keeper leader churn have no metrics yet, so no alerts.
+
 ## 2. Testing strategy
 
 | Layer | Tooling | Scope |

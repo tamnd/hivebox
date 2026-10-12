@@ -1,0 +1,236 @@
+# Unit tests for hivebox-rules.yml: promtool test rules deploy/prometheus/hivebox-rules.test.yml
+rule_files:
+  - hivebox-rules.yml
+evaluation_interval: 1m
+tests:
+  # 5% of cells fail for an infra cause: a page within minutes, and the ticket after its hour.
+  - interval: 1m
+    input_series:
+      - series: 'hive_cells_ended_total{job="hive-comb",instance="n1",backend="container",state="stopped",cause="exited"}'
+        values: '0+95x200'
+      - series: 'hive_cells_ended_total{job="hive-comb",instance="n1",backend="container",state="failed",cause="drone_lost"}'
+        values: '0+5x200'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HiveCellInfraFailuresFast
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: HiveCellInfraFailuresFast
+        exp_alerts:
+          - exp_labels: {severity: "page"}
+            exp_annotations: {summary: "Cells are failing for infrastructure causes fast enough to spend the monthly budget in days.", description: "The share of ended cells that failed is past the 0.1% SLO many times over. hive_cells_ended_total by cause says which."}
+      - eval_time: 10m
+        alertname: HiveCellInfraFailuresSlow
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: HiveCellInfraFailuresSlow
+        exp_alerts:
+          - exp_labels: {severity: "ticket"}
+            exp_annotations: {summary: "Cells are failing for infrastructure causes faster than the 0.1% SLO allows.", description: "At this rate the monthly budget runs out before the month does. hive_cells_ended_total by cause says which."}
+
+  # 0.05% of cells fail, inside the SLO, and nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'hive_cells_ended_total{job="hive-comb",instance="n1",backend="container",state="stopped",cause="exited"}'
+        values: '0+1999x200'
+      - series: 'hive_cells_ended_total{job="hive-comb",instance="n1",backend="container",state="failed",cause="drone_lost"}'
+        values: '0+1x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: HiveCellInfraFailuresFast
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: HiveCellInfraFailuresSlow
+        exp_alerts: []
+
+  # No cells end at all, so there is no ratio and nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'hive_cells_ended_total{job="hive-comb",instance="n1",backend="container",state="stopped",cause="exited"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: HiveCellInfraFailuresFast
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: HiveCellInfraFailuresSlow
+        exp_alerts: []
+
+  # 2% of creates through the gate fail for the platform, and caller errors do not count.
+  - interval: 1m
+    input_series:
+      - series: 'hive_gate_cells_created_total{job="hive-gate",instance="g1",result="created"}'
+        values: '0+980x200'
+      - series: 'hive_gate_cells_created_total{job="hive-gate",instance="g1",result="infra_error"}'
+        values: '0+20x200'
+      - series: 'hive_gate_cells_created_total{job="hive-gate",instance="g1",result="caller_error"}'
+        values: '0+500x200'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HiveCreateInfraFailuresFast
+        exp_alerts:
+          - exp_labels: {severity: "page"}
+            exp_annotations: {summary: "Creates through the gate are failing for infrastructure reasons.", description: "More than 0.1% of creates end in an infra error many times over. Look at hive_create_total by result on the combs."}
+      - eval_time: 150m
+        alertname: HiveCreateInfraFailuresSlow
+        exp_alerts:
+          - exp_labels: {severity: "ticket"}
+            exp_annotations: {summary: "Creates through the gate fail for infrastructure reasons faster than the 0.1% SLO allows.", description: "Look at hive_create_total by result on the combs."}
+
+  # Only caller errors, which spend no budget.
+  - interval: 1m
+    input_series:
+      - series: 'hive_gate_cells_created_total{job="hive-gate",instance="g1",result="created"}'
+        values: '0+980x200'
+      - series: 'hive_gate_cells_created_total{job="hive-gate",instance="g1",result="caller_error"}'
+        values: '0+500x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: HiveCreateInfraFailuresFast
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: HiveCreateInfraFailuresSlow
+        exp_alerts: []
+
+  # Creates on n1 land in the bucket up to 0.5 s, those on n2 within 0.1 s. Only n1 is slow.
+  - interval: 1m
+    input_series:
+      - series: 'hive_create_seconds_bucket{job="hive-comb",instance="n1",backend="container",stage="total",le="0.5"}'
+        values: '0+10x100'
+      - series: 'hive_create_seconds_bucket{job="hive-comb",instance="n1",backend="container",stage="total",le="+Inf"}'
+        values: '0+10x100'
+      - series: 'hive_create_seconds_bucket{job="hive-comb",instance="n2",backend="container",stage="total",le="0.1"}'
+        values: '0+10x100'
+      - series: 'hive_create_seconds_bucket{job="hive-comb",instance="n2",backend="container",stage="total",le="+Inf"}'
+        values: '0+10x100'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HiveCreateSlow
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HiveCreateSlow
+        exp_alerts:
+          - exp_labels: {backend: "container", instance: "n1", job: "hive-comb", severity: "warning", stage: "total"}
+            exp_annotations: {summary: "Creates on n1 are past the p99 target.", description: "The targets are for warm creates, so a node pulling many new images runs slower. hive_create_seconds by stage says which part grew."}
+
+  # A comb that stops answering scrapes, and a gate.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="hive-comb",instance="n1"}'
+        values: '1 1 0 0 0 0'
+      - series: 'up{job="hive-comb",instance="n2"}'
+        values: '1x5'
+      - series: 'up{job="hive-gate",instance="g1"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HiveCombDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: HiveCombDown
+        exp_alerts:
+          - exp_labels: {instance: "n1", job: "hive-comb", severity: "page"}
+            exp_annotations: {summary: "The comb on n1 does not answer scrapes.", description: "Its cells keep running, but nothing on the node can be created, run or stopped until it is back. See journalctl -u hive-comb."}
+      - eval_time: 4m
+        alertname: HiveControlPlaneDown
+        exp_alerts:
+          - exp_labels: {instance: "g1", job: "hive-gate", severity: "page"}
+            exp_annotations: {summary: "hive-gate on g1 does not answer scrapes.", description: "Cells keep running without it, but creates through this instance fail."}
+
+  # A comb that starts four times in a few minutes.
+  - interval: 1m
+    input_series:
+      - series: 'hive_comb_start_time_seconds{job="hive-comb",instance="n1"}'
+        values: '100 100 200 200 300 300 400 400'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HiveCombRestarting
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: HiveCombRestarting
+        exp_alerts:
+          - exp_labels: {instance: "n1", job: "hive-comb", severity: "warning"}
+            exp_annotations: {summary: "The comb on n1 started at least 3 times in the last hour.", description: "Each start takes the cells back from the WAL. See journalctl -u hive-comb for why it stops."}
+
+  # A comb that started and lost two cells.
+  - interval: 1m
+    input_series:
+      - series: 'hive_comb_start_cells{job="hive-comb",instance="n1",result="taken_back"}'
+        values: '5x5'
+      - series: 'hive_comb_start_cells{job="hive-comb",instance="n1",result="lost"}'
+        values: '0 0 2 2 2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HiveCombLostCells
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: HiveCombLostCells
+        exp_alerts:
+          - exp_labels: {instance: "n1", job: "hive-comb", result: "lost", severity: "warning"}
+            exp_annotations: {summary: "The comb on n1 could not take back some cells when it started.", description: "Those cells failed with cause RECOVERY or NODE_LOST. The comb log has a line for each. This clears when the comb next starts."}
+
+  # Cells on n1 stall 15% of the time, those on n2 5%.
+  - interval: 1m
+    input_series:
+      - series: 'hive_memory_stall_basis_points{job="hive-comb",instance="n1"}'
+        values: '1500x30'
+      - series: 'hive_memory_stall_basis_points{job="hive-comb",instance="n2"}'
+        values: '500x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HiveMemoryStall
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: HiveMemoryStall
+        exp_alerts:
+          - exp_labels: {instance: "n1", job: "hive-comb", severity: "warning"}
+            exp_annotations: {summary: "Cells on n1 spend more than 10% of their time stalled on memory.", description: "The pressure brake pauses idle cells and reclaims from best effort ones, which is not keeping up. The node may be packed too tight."}
+
+  # n1 stays cordoned for 13 hours, n2 only for an hour.
+  - interval: 1m
+    input_series:
+      - series: 'hive_node_cordoned{job="hive-comb",instance="n1"}'
+        values: '1x800'
+      - series: 'hive_node_cordoned{job="hive-comb",instance="n2"}'
+        values: '1x60 0x740'
+    alert_rule_test:
+      - eval_time: 11h
+        alertname: HiveNodeCordonedLong
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: HiveNodeCordonedLong
+        exp_alerts:
+          - exp_labels: {instance: "n1", job: "hive-comb", severity: "ticket"}
+            exp_annotations: {summary: "n1 has been cordoned for 12 hours.", description: "A failed upgrade leaves the node cordoned on purpose. Uncordon it with hivectl node uncordon once it is fixed."}
+
+  # Scout loses a node.
+  - interval: 1m
+    input_series:
+      - series: 'hive_scout_nodes{job="hive-scout",instance="s1",state="healthy"}'
+        values: '3 2 2 2 2 2 2 2 2'
+      - series: 'hive_scout_nodes{job="hive-scout",instance="s1",state="down"}'
+        values: '0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HiveScoutNodesDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: HiveScoutNodesDown
+        exp_alerts:
+          - exp_labels: {instance: "s1", job: "hive-scout", severity: "warning", state: "down"}
+            exp_annotations: {summary: "Scout has nodes it no longer hears from.", description: "Waggle places nothing on them. Check the combs on those nodes and their network."}
+
+  # A metric hits its series cap.
+  - interval: 1m
+    input_series:
+      - series: 'hive_telemetry_overflow_total{job="hive-comb",instance="n1",metric="hive_create_total"}'
+        values: '0 0 3 3'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HiveMetricsOverflow
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: HiveMetricsOverflow
+        exp_alerts:
+          - exp_labels: {instance: "n1", job: "hive-comb", metric: "hive_create_total", severity: "ticket"}
+            exp_annotations: {summary: "hive_create_total on n1 hit its series cap.", description: "New label values are folded into the series labelled other, so this metric undercounts by label."}

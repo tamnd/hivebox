@@ -372,6 +372,7 @@ impl Comb {
             opened: Instant::now(),
             started: std::sync::OnceLock::new(),
         });
+        inner.metrics.cordoned(cordoned);
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
         // Copies for forks that were under way when the comb last ended.
         let _ = std::fs::remove_dir_all(inner.cfg.data_dir.join("forks"));
@@ -532,6 +533,7 @@ impl Comb {
                 started.taken_back, started.ended, started.lost
             );
         }
+        self.inner.metrics.started(started.taken_back, started.ended, started.lost);
         let _ = self.inner.started.set(started);
     }
 
@@ -769,6 +771,7 @@ impl Comb {
         {
             return Err(at("removing", &path)(e));
         }
+        self.inner.metrics.cordoned(on);
         if self.inner.cordoned.swap(on, Ordering::Relaxed) != on {
             eprintln!("hive-comb: {}", if on { "cordoned" } else { "uncordoned" });
         }
@@ -1114,6 +1117,7 @@ impl Inner {
     }
 
     fn insert(&self, cell: &Arc<Cell>) {
+        self.metrics.moved(cell.spec.backend, None, cell.state(), None);
         self.shard(cell.id)
             .write()
             .unwrap_or_else(PoisonError::into_inner)

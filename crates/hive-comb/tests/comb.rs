@@ -568,6 +568,16 @@ async fn a_restarted_comb_picks_up_every_cell() {
     assert_eq!(dead.status.cause, Some(Cause::Exited));
     assert_eq!(comb.committed(), (4, 4 * (256 << 20)));
     assert_eq!(comb.started(), Started { taken_back: 4, ended: 1, lost: 0 });
+    let text = comb.metrics().registry().render();
+    for line in [
+        r#"hive_cells{backend="container",state="running"} 3"#,
+        r#"hive_cells{backend="container",state="paused"} 1"#,
+        r#"hive_cells_ended_total{backend="container",state="stopped",cause="exited"} 1"#,
+        r#"hive_comb_start_cells{result="taken_back"} 4"#,
+        r#"hive_comb_start_cells{result="ended"} 1"#,
+    ] {
+        assert!(text.contains(line), "{line} not in\n{text}");
+    }
 
     // The secrets came back from the WAL, so the channels work.
     assert_eq!(echo(&comb, ids[0], "again").await, "again\n");
@@ -612,6 +622,15 @@ async fn a_comb_back_in_a_new_epoch_stops_the_old_cells() {
     assert_eq!(fake.live(), 0);
     assert_eq!(comb.committed(), (0, 0));
     assert_eq!(comb.started(), Started { taken_back: 0, ended: 0, lost: 3 });
+    let text = comb.metrics().registry().render();
+    for line in [
+        r#"hive_cells{backend="container",state="running"} 0"#,
+        r#"hive_cells{backend="container",state="paused"} 0"#,
+        r#"hive_cells_ended_total{backend="container",state="failed",cause="node_lost"} 3"#,
+        r#"hive_comb_start_cells{result="lost"} 3"#,
+    ] {
+        assert!(text.contains(line), "{line} not in\n{text}");
+    }
     let new = comb.create(request(spec("python"))).await.unwrap().id;
     assert_eq!(new.epoch(), ids[0].epoch() + 1);
     assert_eq!(echo(&comb, new, "fresh").await, "fresh\n");

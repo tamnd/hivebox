@@ -12,10 +12,14 @@
 //!
 //! A disk snapshot is timed too: `read` is what the cell wrote being read out, which is how long a
 //! running cell stands frozen, `build` makes that a layer and stores it, and `total` is all of it.
+//!
+//! `hive_cells` counts the live cells by state, and `hive_cells_ended_total` the cells that ended,
+//! by their last state and cause. A cell that failed ended for an infrastructure cause, so the
+//! share of ended cells that failed is the infra failure rate the SLO is about.
 
 use hive_telemetry::{CounterVec, GaugeVec, HistogramVec, Registry};
-use hive_types::Backend;
-use std::time::Duration;
+use hive_types::{Backend, Cause, CellState};
+use std::time::{Duration, SystemTime};
 
 /// The comb's metrics and the registry they are in.
 #[derive(Clone, Debug)]
@@ -31,6 +35,11 @@ pub struct Metrics {
     reclaimed: CounterVec,
     squeezed: CounterVec,
     trimmed: CounterVec,
+    cells: GaugeVec,
+    ended: CounterVec,
+    cordoned: GaugeVec,
+    started_at: GaugeVec,
+    start_cells: GaugeVec,
 }
 
 impl Default for Metrics {
@@ -87,6 +96,27 @@ impl Default for Metrics {
                 "Page cache idle running cells gave back.",
                 &[],
             ),
+            cells: registry.gauge("hive_cells", "Live cells, by state.", &["backend", "state"]),
+            ended: registry.counter(
+                "hive_cells_ended_total",
+                "Cells that ended, by their last state and why they ended.",
+                &["backend", "state", "cause"],
+            ),
+            cordoned: registry.gauge(
+                "hive_node_cordoned",
+                "1 when the node is cordoned and takes no new cells.",
+                &[],
+            ),
+            started_at: registry.gauge(
+                "hive_comb_start_time_seconds",
+                "When this comb started, in seconds since the epoch.",
+                &[],
+            ),
+            start_cells: registry.gauge(
+                "hive_comb_start_cells",
+                "Cells this comb found live in its WAL when it started, by what became of them: taken_back, ended while no comb ran, or lost.",
+                &["result"],
+            ),
             registry,
         }
     }
@@ -138,6 +168,44 @@ impl Metrics {
     pub(crate) fn trimmed(&self, bytes: u64) {
         self.trimmed.with(&[]).add(bytes);
     }
+
+    /// A cell went from `from` to `to`, or showed up in `to` when `from` is `None`. Only a cell
+    /// that was live and no longer is counts as ended.
+    pub(crate) fn moved(
+        &self,
+        backend: Backend,
+        from: Option<CellState>,
+        to: CellState,
+        cause: Option<Cause>,
+    ) {
+        if from == Some(to) {
+            return;
+        }
+        let b = backend.as_str();
+        if let Some(f) = from
+            && !f.is_terminal()
+        {
+            self.cells.with(&[b, &f.as_str().to_ascii_lowercase()]).add(-1);
+        }
+        let state = to.as_str().to_ascii_lowercase();
+        if !to.is_terminal() {
+            self.cells.with(&[b, &state]).add(1);
+        } else if from.is_some_and(|f| !f.is_terminal()) {
+            self.ended.with(&[b, &state, cause.map_or("none", Cause::as_str)]).inc();
+        }
+    }
+
+    pub(crate) fn cordoned(&self, on: bool) {
+        self.cordoned.with(&[]).set(i64::from(on));
+    }
+
+    pub(crate) fn started(&self, taken_back: u32, ended: u32, lost: u32) {
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        self.started_at.with(&[]).set(i64::try_from(now.as_secs()).unwrap_or(i64::MAX));
+        for (result, n) in [("taken_back", taken_back), ("ended", ended), ("lost", lost)] {
+            self.start_cells.with(&[result]).set(i64::from(n));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +222,16 @@ mod tests {
         m.snapshot("read", Duration::from_millis(5));
         m.trimmed(4096);
         m.policy("rl", "change", Duration::from_micros(80));
+        let c = Backend::Container;
+        m.moved(c, None, CellState::Pending, None);
+        m.moved(c, None, CellState::Running, None);
+        m.moved(c, None, CellState::Stopped, Some(Cause::Requested));
+        m.moved(c, Some(CellState::Pending), CellState::Failed, Some(Cause::StartFailed));
+        m.moved(c, Some(CellState::Running), CellState::Running, None);
+        m.moved(c, Some(CellState::Running), CellState::Stopping, Some(Cause::Idle));
+        m.moved(c, Some(CellState::Stopping), CellState::Stopped, Some(Cause::Idle));
+        m.cordoned(true);
+        m.started(4, 1, 0);
         let text = m.registry().render();
         assert!(text.contains(r#"hive_create_seconds_count{backend="container",stage="pool"} 1"#));
         assert!(text.contains(r#"hive_create_total{backend="container",result="ok"} 1"#));
@@ -162,5 +240,18 @@ mod tests {
         assert!(text.contains(r#"hive_snapshot_seconds_count{stage="read"} 1"#));
         assert!(text.contains("hive_memory_trimmed_bytes_total 4096"));
         assert!(text.contains(r#"hive_policy_seconds_count{policy="rl",result="change"} 1"#));
+        assert!(text.contains(r#"hive_cells{backend="container",state="pending"} 0"#), "{text}");
+        assert!(text.contains(r#"hive_cells{backend="container",state="running"} 0"#), "{text}");
+        assert!(text.contains(r#"hive_cells{backend="container",state="stopping"} 0"#), "{text}");
+        let ended = |state, cause| {
+            format!(
+                r#"hive_cells_ended_total{{backend="container",state="{state}",cause="{cause}"}} 1"#
+            )
+        };
+        assert!(text.contains(&ended("failed", "start_failed")), "{text}");
+        assert!(text.contains(&ended("stopped", "idle")), "{text}");
+        assert!(!text.contains("requested"), "a cell that was never live did not end here");
+        assert!(text.contains("hive_node_cordoned 1"));
+        assert!(text.contains(r#"hive_comb_start_cells{result="taken_back"} 4"#));
     }
 }
