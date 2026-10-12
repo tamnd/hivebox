@@ -18,7 +18,7 @@ tests:
         alertname: HiveCellInfraFailuresFast
         exp_alerts:
           - exp_labels: {severity: "page"}
-            exp_annotations: {summary: "Cells are failing for infrastructure causes fast enough to spend the monthly budget in days.", description: "The share of ended cells that failed is past the 0.1% SLO many times over. hive_cells_ended_total by cause says which."}
+            exp_annotations: {summary: "Cells are failing for infrastructure causes fast enough to spend the monthly budget in days.", description: "The share of ended cells that failed is past the 0.1% SLO many times over. hive_cells_ended_total by cause says which.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecellinfrafailuresfast"}
       - eval_time: 10m
         alertname: HiveCellInfraFailuresSlow
         exp_alerts: []
@@ -26,7 +26,7 @@ tests:
         alertname: HiveCellInfraFailuresSlow
         exp_alerts:
           - exp_labels: {severity: "ticket"}
-            exp_annotations: {summary: "Cells are failing for infrastructure causes faster than the 0.1% SLO allows.", description: "At this rate the monthly budget runs out before the month does. hive_cells_ended_total by cause says which."}
+            exp_annotations: {summary: "Cells are failing for infrastructure causes faster than the 0.1% SLO allows.", description: "At this rate the monthly budget runs out before the month does. hive_cells_ended_total by cause says which.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecellinfrafailuresslow"}
 
   # 0.05% of cells fail, inside the SLO, and nothing fires.
   - interval: 1m
@@ -70,12 +70,12 @@ tests:
         alertname: HiveCreateInfraFailuresFast
         exp_alerts:
           - exp_labels: {severity: "page"}
-            exp_annotations: {summary: "Creates through the gate are failing for infrastructure reasons.", description: "More than 0.1% of creates end in an infra error many times over. Look at hive_create_total by result on the combs."}
+            exp_annotations: {summary: "Creates through the gate are failing for infrastructure reasons.", description: "More than 0.1% of creates end in an infra error many times over. Look at hive_create_total by result on the combs.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecreateinfrafailuresfast"}
       - eval_time: 150m
         alertname: HiveCreateInfraFailuresSlow
         exp_alerts:
           - exp_labels: {severity: "ticket"}
-            exp_annotations: {summary: "Creates through the gate fail for infrastructure reasons faster than the 0.1% SLO allows.", description: "Look at hive_create_total by result on the combs."}
+            exp_annotations: {summary: "Creates through the gate fail for infrastructure reasons faster than the 0.1% SLO allows.", description: "Look at hive_create_total by result on the combs.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecreateinfrafailuresslow"}
 
   # Only caller errors, which spend no budget.
   - interval: 1m
@@ -111,7 +111,7 @@ tests:
         alertname: HiveCreateSlow
         exp_alerts:
           - exp_labels: {backend: "container", instance: "n1", job: "hive-comb", severity: "warning", stage: "total"}
-            exp_annotations: {summary: "Creates on n1 are past the p99 target.", description: "The targets are for warm creates, so a node pulling many new images runs slower. hive_create_seconds by stage says which part grew."}
+            exp_annotations: {summary: "Creates on n1 are past the p99 target.", description: "The targets are for warm creates, so a node pulling many new images runs slower. hive_create_seconds by stage says which part grew.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecreateslow"}
 
   # A comb that stops answering scrapes, and a gate.
   - interval: 1m
@@ -130,12 +130,12 @@ tests:
         alertname: HiveCombDown
         exp_alerts:
           - exp_labels: {instance: "n1", job: "hive-comb", severity: "page"}
-            exp_annotations: {summary: "The comb on n1 does not answer scrapes.", description: "Its cells keep running, but nothing on the node can be created, run or stopped until it is back. See journalctl -u hive-comb."}
+            exp_annotations: {summary: "The comb on n1 does not answer scrapes.", description: "Its cells keep running, but nothing on the node can be created, run or stopped until it is back. See journalctl -u hive-comb.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecombdown"}
       - eval_time: 4m
         alertname: HiveControlPlaneDown
         exp_alerts:
           - exp_labels: {instance: "g1", job: "hive-gate", severity: "page"}
-            exp_annotations: {summary: "hive-gate on g1 does not answer scrapes.", description: "Cells keep running without it, but creates through this instance fail."}
+            exp_annotations: {summary: "hive-gate on g1 does not answer scrapes.", description: "Cells keep running without it, but creates through this instance fail.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecontrolplanedown"}
 
   # A comb that starts four times in a few minutes.
   - interval: 1m
@@ -150,7 +150,7 @@ tests:
         alertname: HiveCombRestarting
         exp_alerts:
           - exp_labels: {instance: "n1", job: "hive-comb", severity: "warning"}
-            exp_annotations: {summary: "The comb on n1 started at least 3 times in the last hour.", description: "Each start takes the cells back from the WAL. See journalctl -u hive-comb for why it stops."}
+            exp_annotations: {summary: "The comb on n1 started at least 3 times in the last hour.", description: "Each start takes the cells back from the WAL. See journalctl -u hive-comb for why it stops.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecombrestarting"}
 
   # A comb that started and lost two cells.
   - interval: 1m
@@ -167,7 +167,7 @@ tests:
         alertname: HiveCombLostCells
         exp_alerts:
           - exp_labels: {instance: "n1", job: "hive-comb", result: "lost", severity: "warning"}
-            exp_annotations: {summary: "The comb on n1 could not take back some cells when it started.", description: "Those cells failed with cause RECOVERY or NODE_LOST. The comb log has a line for each. This clears when the comb next starts."}
+            exp_annotations: {summary: "The comb on n1 could not take back some cells when it started.", description: "Those cells failed with cause RECOVERY or NODE_LOST. The comb log has a line for each. This clears when the comb next starts.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivecomblostcells"}
 
   # Cells on n1 stall 15% of the time, those on n2 5%.
   - interval: 1m
@@ -184,7 +184,7 @@ tests:
         alertname: HiveMemoryStall
         exp_alerts:
           - exp_labels: {instance: "n1", job: "hive-comb", severity: "warning"}
-            exp_annotations: {summary: "Cells on n1 spend more than 10% of their time stalled on memory.", description: "The pressure brake pauses idle cells and reclaims from best effort ones, which is not keeping up. The node may be packed too tight."}
+            exp_annotations: {summary: "Cells on n1 spend more than 10% of their time stalled on memory.", description: "The pressure brake pauses idle cells and reclaims from best effort ones, which is not keeping up. The node may be packed too tight.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivememorystall"}
 
   # n1 stays cordoned for 13 hours, n2 only for an hour.
   - interval: 1m
@@ -201,7 +201,7 @@ tests:
         alertname: HiveNodeCordonedLong
         exp_alerts:
           - exp_labels: {instance: "n1", job: "hive-comb", severity: "ticket"}
-            exp_annotations: {summary: "n1 has been cordoned for 12 hours.", description: "A failed upgrade leaves the node cordoned on purpose. Uncordon it with hivectl node uncordon once it is fixed."}
+            exp_annotations: {summary: "n1 has been cordoned for 12 hours.", description: "A failed upgrade leaves the node cordoned on purpose. Uncordon it with hivectl node uncordon once it is fixed.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivenodecordonedlong"}
 
   # Scout loses a node.
   - interval: 1m
@@ -218,7 +218,7 @@ tests:
         alertname: HiveScoutNodesDown
         exp_alerts:
           - exp_labels: {instance: "s1", job: "hive-scout", severity: "warning", state: "down"}
-            exp_annotations: {summary: "Scout has nodes it no longer hears from.", description: "Waggle places nothing on them. Check the combs on those nodes and their network."}
+            exp_annotations: {summary: "Scout has nodes it no longer hears from.", description: "Waggle places nothing on them. Check the combs on those nodes and their network.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivescoutnodesdown"}
 
   # A metric hits its series cap.
   - interval: 1m
@@ -233,4 +233,4 @@ tests:
         alertname: HiveMetricsOverflow
         exp_alerts:
           - exp_labels: {instance: "n1", job: "hive-comb", metric: "hive_create_total", severity: "ticket"}
-            exp_annotations: {summary: "hive_create_total on n1 hit its series cap.", description: "New label values are folded into the series labelled other, so this metric undercounts by label."}
+            exp_annotations: {summary: "hive_create_total on n1 hit its series cap.", description: "New label values are folded into the series labelled other, so this metric undercounts by label.", runbook_url: "https://github.com/tamnd/hivebox/blob/main/docs/runbooks.md#hivemetricsoverflow"}

@@ -6,7 +6,7 @@ hivebox runs hundreds of thousands of short lived, isolated execution environmen
 
 The design follows DeepSeek's DSec ([arXiv 2609.22978](https://arxiv.org/abs/2609.22978)), which reports one scale unit of about 160 nodes serving around three million sandboxes a day, 380K of them concurrently at peak, with more than 5,000 creates a second. hivebox takes that as the bar and tries to reach it in the open, with the parts DSec leaves unspecified written down and measured.
 
-This is early. What exists is the workspace, the layer rule that keeps it modular, the cell id codec and state machine that everything else will share, and CI. The full technical design is in [`spec/`](spec/) and the milestones that build it are tracked as issues.
+This is early. What exists is the workspace, the layer rule that keeps it modular, the cell id codec and state machine that everything else will share, and CI. The full technical design is in [`spec/`](spec/) and the milestones that build it are tracked as issues. How to run it is in [`docs/`](docs/README.md), and the units, scripts, alerts and dashboard to deploy are in [`deploy/`](deploy/README.md).
 
 ## The targets
 

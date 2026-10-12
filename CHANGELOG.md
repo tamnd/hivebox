@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Operator docs in `docs/`: how to set up one node or a cluster and keep it running (operations.md), every key of comb.toml, gate.toml and keeper.toml with its default (configuration.md), and a runbook for each alert and for the failures that have none (runbooks.md). Each alert in `deploy/prometheus/hivebox-rules.yml` now has a `runbook_url` that links to its runbook.
+
 ## 0.0.43
 
 Node operations: cordon and drain, comb upgrades that keep cells running, and SLO alerts with a dashboard.
