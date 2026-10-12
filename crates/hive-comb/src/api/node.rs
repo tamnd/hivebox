@@ -17,10 +17,15 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Api {
     fn node_status(&self) -> pb::NodeStatus {
+        let started = self.comb.started();
         let mut s = pb::NodeStatus {
             node: u32::from(self.comb.inner.cfg.node),
             cordoned: self.comb.cordoned(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            up: Some(convert::duration_to_v1(self.comb.up())),
+            taken_back: started.taken_back,
+            ended_while_down: started.ended,
+            lost_on_start: started.lost,
             ..pb::NodeStatus::default()
         };
         for c in self.comb.list() {

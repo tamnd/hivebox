@@ -1,0 +1,19 @@
+# The API gate. Install the binary as /usr/local/bin/hive-gate and its config as
+# /etc/hivebox/gate.toml. Run two or more behind a load balancer, and restart them one at a time.
+[Unit]
+Description=hivebox API gate (hive-gate)
+Documentation=https://github.com/tamnd/hivebox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hive-gate --config /etc/hivebox/gate.toml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

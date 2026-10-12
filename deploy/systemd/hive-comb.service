@@ -1,0 +1,28 @@
+# The node agent. Install the binary as /usr/local/bin/hive-comb and its config as
+# /etc/hivebox/comb.toml, then `systemctl enable --now hive-comb`.
+[Unit]
+Description=hivebox node agent (hive-comb)
+Documentation=https://github.com/tamnd/hivebox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hive-comb --config /etc/hivebox/comb.toml
+# The cells outlive the comb. On stop or restart only the comb itself gets SIGTERM, and the next
+# comb takes the cells back from its WAL. The default, which kills the whole unit, would take the
+# drones and their containers down with it.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+# The comb makes and moves cgroups for its cells, under cgroup_root in its config.
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitMEMLOCK=infinity
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

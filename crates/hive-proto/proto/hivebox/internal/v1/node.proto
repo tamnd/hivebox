@@ -31,6 +31,14 @@ message NodeStatus {
   uint32 paused = 5;
   // The comb's version.
   string version = 6;
+  // How long this comb has been up.
+  google.protobuf.Duration up = 7;
+  // The cells that were live when this comb started: the ones it took back, the ones that ended
+  // while no comb ran, and the ones it could not take back, which failed. An upgrade checks these
+  // after the restart.
+  uint32 taken_back = 8;
+  uint32 ended_while_down = 9;
+  uint32 lost_on_start = 10;
 }
 
 message DrainRequest {

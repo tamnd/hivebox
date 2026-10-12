@@ -9,7 +9,7 @@ pub use hive_cell::{
     CellDriver, CellHandle, DriverCaps, DriverRegistry, ExitInfo, GuestChannel, Liveness, NodeFit,
     PauseMode, RootfsPlan, Slot,
 };
-pub use hive_comb::{CellInfo, Comb, Config, CreateRequest, Images, Network};
+pub use hive_comb::{CellInfo, Comb, Config, CreateRequest, Images, Network, Started};
 pub use hive_drone::Drone;
 pub use hive_proto::drone::api::{Command, RunRequest};
 pub use hive_types::{
