@@ -82,6 +82,39 @@ async fn one_idempotency_key_makes_one_cell() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_cordoned_node_answers_for_its_keys_and_takes_nothing_new() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let comb = open(config(&s.0), &fake).await;
+    let keyed = |k: &str| CreateRequest { idem_key: Some(k.into()), ..request(spec("python")) };
+    let made = comb.create(keyed("k1")).await.unwrap().id;
+    comb.cordon(true).unwrap();
+    assert!(comb.cordoned());
+    assert_eq!(comb.create(keyed("k1")).await.unwrap().id, made);
+    for req in [keyed("k2"), request(spec("python"))] {
+        let e = comb.create(req).await.unwrap_err();
+        assert_eq!(e.reason, Reason::CapacityUnavailable, "{e:?}");
+        assert!(e.message.contains("cordoned"), "{e:?}");
+    }
+    // A key turned away for the cordon is not one turned away for room, so it is made here once
+    // the cordon is lifted.
+    assert_eq!(comb.list().len(), 1);
+
+    // The cordon outlasts a restart, and the cell is still there for its key.
+    comb.shutdown().await;
+    drop(comb);
+    let comb = open(config(&s.0), &fake).await;
+    assert!(comb.cordoned());
+    assert_eq!(comb.create(keyed("k1")).await.unwrap().id, made);
+    comb.cordon(false).unwrap();
+    comb.cordon(false).unwrap();
+    assert!(!comb.cordoned() && !s.0.join("cordoned").exists());
+    comb.create(keyed("k2")).await.unwrap();
+    assert_eq!(comb.list().len(), 2);
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_key_turned_away_for_room_is_turned_away_again() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());

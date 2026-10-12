@@ -9,6 +9,8 @@ mod graders;
 
 use common::*;
 use hive_comb::api;
+use hive_proto::internal as pb;
+use hive_proto::internal::node_client::NodeClient;
 use hive_proto::v1;
 use hive_proto::v1::cells_client::CellsClient;
 use hive_proto::v1::exec_client::ExecClient;
@@ -897,6 +899,115 @@ async fn a_quarantine_says_what_it_did_to_each_cell() {
         assert!(e.result.starts_with("ok network=unmanaged cut_ms="), "{e:?}");
         assert!(e.result.ends_with(" snapshot PermissionDenied"), "{e:?}");
     }
+    api.stop.cancel();
+}
+
+/// Runs a drain to the end, and returns its cells by id with how each left, and the totals.
+async fn drain(
+    node: &mut NodeClient<Channel>,
+    r: pb::DrainRequest,
+) -> (HashMap<String, pb::DrainedCell>, pb::DrainDone) {
+    let mut events = node.drain(req("ops", r)).await.unwrap().into_inner();
+    let (mut cells, mut done) = (HashMap::new(), None);
+    while let Some(e) = events.message().await.unwrap() {
+        match e.event.unwrap() {
+            pb::drain_event::Event::Cell(c) => {
+                assert!(cells.insert(c.cell_id.clone(), c).is_none())
+            }
+            pb::drain_event::Event::Done(d) => done = Some(d),
+        }
+    }
+    (cells, done.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_stops_idle_cells_and_waits_on_the_rest() {
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    let api = Served::new(&s, &fake).await;
+    let mut cells = api.cells();
+    let mut node = NodeClient::new(api.channel.clone());
+    let mut spec = v1_spec("python", &[]);
+    spec.hard_ttl = Some(prost_types::Duration { seconds: 3600, nanos: 0 });
+    let made = create(&mut cells, "p", 4, spec.clone()).await;
+
+    let st = node.status(req("ops", pb::NodeRequest {})).await.unwrap().into_inner();
+    assert_eq!((st.cordoned, st.live, st.running, st.paused), (false, 4, 4, 0));
+    assert_eq!(st.version, env!("CARGO_PKG_VERSION"));
+    let st = node.cordon(req("ops", pb::NodeRequest {})).await.unwrap().into_inner();
+    assert!(st.cordoned && s.0.join("cordoned").exists());
+    let r = v1::CreateRequest { spec: Some(spec.clone()), count: 1, ..Default::default() };
+    let mut events = cells.create(req("p", r)).await.unwrap().into_inner();
+    match events.message().await.unwrap().unwrap().result.unwrap() {
+        v1::create_event::Result::Error(e) => assert_eq!(e.reason, "CAPACITY_UNAVAILABLE"),
+        v1::create_event::Result::Cell(c) => panic!("a cordoned node made {c:?}"),
+    }
+    let st = node.uncordon(req("ops", pb::NodeRequest {})).await.unwrap().into_inner();
+    assert!(!st.cordoned && !s.0.join("cordoned").exists());
+
+    // One idle cell, one that ends while the drain waits, and two still running at the timeout.
+    cells.pause(req("p", by_id(&made[0].id))).await.unwrap();
+    let ending = made[1].id.clone();
+    let (comb, id) = (api.comb.clone(), ending.parse().unwrap());
+    let stopper = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        comb.stop(id, None).await.unwrap();
+    });
+    let r = pb::DrainRequest {
+        timeout: Some(prost_types::Duration { seconds: 2, nanos: 0 }),
+        stop_rest: false,
+        snapshot: true,
+    };
+    let (got, done) = drain(&mut node, r).await;
+    stopper.await.unwrap();
+    let how = |id: &str| got[id].how();
+    assert_eq!(how(&made[0].id), pb::drained_cell::How::Idle);
+    // The fake's image is not from a store, so the snapshot fails, and the cell is stopped anyway.
+    assert!(got[&made[0].id].snapshot_id.is_empty() && !got[&made[0].id].error.is_empty());
+    assert_eq!(how(&ending), pb::drained_cell::How::Ended);
+    assert_eq!(
+        (how(&made[2].id), how(&made[3].id)),
+        (pb::drained_cell::How::Left, pb::drained_cell::How::Left)
+    );
+    assert_eq!((done.idle, done.ended, done.stopped, done.left), (1, 1, 0, 2));
+    let st = done.status.unwrap();
+    assert_eq!((st.cordoned, st.live, st.running), (true, 2, 2));
+    let took = Duration::try_from(done.took.unwrap()).unwrap();
+    assert!(took >= Duration::from_secs(2), "{took:?}");
+    let first = cells.get(req("p", v1::GetCellRequest { id: made[0].id.clone() })).await.unwrap();
+    let first = first.into_inner();
+    // The platform ended it, so it failed, and a trainer retries it elsewhere.
+    assert_eq!((first.state(), first.cause()), (v1::CellState::Failed, v1::Cause::Drained));
+
+    // With no time and stop_rest, the rest are stopped at once.
+    let r = pb::DrainRequest {
+        timeout: Some(prost_types::Duration::default()),
+        stop_rest: true,
+        snapshot: false,
+    };
+    let (got, done) = drain(&mut node, r).await;
+    assert_eq!(got.len(), 2);
+    assert!(got.values().all(|c| c.how() == pb::drained_cell::How::Stopped));
+    assert_eq!((done.stopped, done.status.unwrap().live), (2, 0));
+    let last = cells.get(req("p", v1::GetCellRequest { id: made[3].id.clone() })).await.unwrap();
+    assert_eq!(last.into_inner().cause(), v1::Cause::Drained);
+
+    let log = api.comb.audit().unwrap();
+    tokio::task::block_in_place(|| log.flush()).unwrap();
+    let ops: Vec<(String, String)> = audited(&s.0.join("audit"))
+        .into_iter()
+        .filter(|e| e.op.starts_with("node."))
+        .map(|e| (e.op, e.result))
+        .collect();
+    let want = [
+        ("node.cordon", "ok"),
+        ("node.uncordon", "ok"),
+        ("node.drain", "ok idle=1 ended=1 stopped=0 left=2"),
+        ("node.drain", "ok idle=0 ended=0 stopped=2 left=0"),
+    ];
+    let want: Vec<(String, String)> =
+        want.iter().map(|(a, b)| ((*a).into(), (*b).into())).collect();
+    assert_eq!(ops, want);
     api.stop.cancel();
 }
 

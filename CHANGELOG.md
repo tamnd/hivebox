@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Cordon, uncordon and drain. `hivectl node cordon` stops new cells coming to a node, and the cordon is kept in the data dir, so it lasts through a restart. A cordoned node still answers a create whose idempotency key it already has, and refuses any other with `CAPACITY_UNAVAILABLE`, so the gate tries the next node. Scout reports the cordon, waggle places nothing on a cordoned node and moves nothing to or from it, and `hive_scout_nodes` has a `cordoned` state. `hivectl node drain [--timeout D] [--stop-rest] [--snapshot]` cordons the node, stops its paused cells at once, eight at a time and each after a disk snapshot if asked, waits on the running ones until the timeout, then stops them or leaves them, and prints each cell as it goes. Cells it stops fail with the new cause `DRAINED`, which counts as infra, so a trainer masks or retries them. The drain is audited, and it stops if the caller goes away. On server3 at a load of 65, a drain with snapshots took 11.3 s for 12 paused cells holding 16 MiB each and 23.5 s for 24. A mixed drain of 12 paused, 6 running and 6 ending cells with a 60 s timeout stopped the 12, saw the 6 end, and left 6, and a second drain with no timeout and `--stop-rest` stopped those 6 in 0.3 s. Three cells made from the drain snapshots had the same data as the cells they came from. Cordon and uncordon took 5 ms, and a create on the cordoned node was refused in 2 ms.
+
 ## 0.0.42
 
 SandboxFusion server and dataset importers, with fixes found running SWE-bench on a real comb.

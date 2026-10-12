@@ -3,8 +3,8 @@
 //!
 //! The design is in `spec/04_control_plane.md`, section 5.1. A batch goes through four steps:
 //!
-//! - Nodes that are unhealthy, lack the backend, are excluded or have no room are dropped. Room
-//!   counts what this placer sent in the last few seconds that the node's reports do not show yet.
+//! - Nodes that are unhealthy, cordoned, lack the backend, are excluded or have no room are
+//!   dropped. Room counts what this placer sent in the last few seconds that the node's reports do not show yet.
 //! - Of the rest, `clamp(2n, 8, all)` are drawn at random with odds by headroom, the batch
 //!   sampling from Sparrow, so replicas do not all pick the same emptiest node.
 //! - Each is scored on free memory and CPU, cached image layers, pool depth, recent creates and

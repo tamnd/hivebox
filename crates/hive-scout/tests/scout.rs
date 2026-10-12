@@ -14,6 +14,7 @@ fn report(node: u16, seq: u64) -> NodeReport {
         seq,
         addr: Arc::from(format!("10.0.0.{node}:7400")),
         healthy: true,
+        cordoned: false,
         cloud: false,
         idle_cells: 0,
         idle_mem_mib: 0,

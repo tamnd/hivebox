@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/hivebox/v1/tokens.proto",
         "proto/hivebox/internal/v1/scout.proto",
         "proto/hivebox/internal/v1/keeper.proto",
+        "proto/hivebox/internal/v1/node.proto",
         "proto/hivebox/plugin/v1/driver.proto",
     ];
     println!("cargo:rerun-if-changed=proto");

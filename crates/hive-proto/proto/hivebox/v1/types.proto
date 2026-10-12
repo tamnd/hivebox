@@ -57,6 +57,8 @@ enum Cause {
   CAUSE_DRONE_LOST = 8;
   CAUSE_NODE_LOST = 9;
   CAUSE_RECOVERY = 10;
+  // Its node was drained for maintenance.
+  CAUSE_DRAINED = 11;
 }
 
 // Zero fields mean the server default.

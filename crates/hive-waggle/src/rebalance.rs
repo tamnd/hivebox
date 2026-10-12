@@ -126,8 +126,12 @@ impl Rebalancer {
     /// cluster, and a node below that share takes them until it is up to it, so a move never
     /// makes a node hot. Cells move whole, each taken as the average idle cell on its node.
     pub fn plan(&mut self, view: &ClusterView) -> Plan {
-        let onprem: Vec<&NodeView> =
-            view.nodes.iter().filter(|n| n.healthy && !n.cloud && n.mem_admit_mib > 0).collect();
+        // A cordoned node neither gives nor takes. A drain empties it instead.
+        let onprem: Vec<&NodeView> = view
+            .nodes
+            .iter()
+            .filter(|n| n.healthy && !n.cordoned && !n.cloud && n.mem_admit_mib > 0)
+            .collect();
         let used: u64 = onprem.iter().map(|n| n.mem_committed_mib).sum();
         let total: u64 = onprem.iter().map(|n| n.mem_admit_mib).sum();
         let share = if total == 0 { 1.0 } else { (used as f64 / total as f64).min(1.0) };
@@ -189,7 +193,7 @@ impl Rebalancer {
             cloud_room_mib: view
                 .nodes
                 .iter()
-                .filter(|n| n.healthy && n.cloud)
+                .filter(|n| n.healthy && !n.cordoned && n.cloud)
                 .map(|n| n.mem_admit_mib.saturating_sub(n.mem_committed_mib))
                 .sum(),
         });

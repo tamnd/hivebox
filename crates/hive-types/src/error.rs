@@ -218,11 +218,13 @@ pub enum Cause {
     NodeLost,
     /// The node agent found it half made or broken while recovering after a restart.
     Recovery,
+    /// Its node was drained for maintenance.
+    Drained,
 }
 
 impl Cause {
     /// Every cause, in declaration order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Requested,
         Self::Idle,
         Self::HardTtl,
@@ -233,12 +235,16 @@ impl Cause {
         Self::DroneLost,
         Self::NodeLost,
         Self::Recovery,
+        Self::Drained,
     ];
 
     /// Whether the platform is to blame. The same split as [`Reason::is_infra`].
     #[must_use]
     pub const fn is_infra(self) -> bool {
-        matches!(self, Self::StartFailed | Self::DroneLost | Self::NodeLost | Self::Recovery)
+        matches!(
+            self,
+            Self::StartFailed | Self::DroneLost | Self::NodeLost | Self::Recovery | Self::Drained
+        )
     }
 
     /// The name used on the wire and in metrics.
@@ -255,6 +261,7 @@ impl Cause {
             Self::DroneLost => "drone_lost",
             Self::NodeLost => "node_lost",
             Self::Recovery => "recovery",
+            Self::Drained => "drained",
         }
     }
 }

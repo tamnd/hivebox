@@ -1,6 +1,6 @@
 //! The local API: the `hivebox.v1` Cells, Exec, Files, Verify, Llm and Snapshots services on a Unix
 //! socket, for standalone mode, where no gate sits in front of the comb, and on TCP for gates
-//! when `node.listen` is set.
+//! when `node.listen` is set. The operator's `Node` service, for cordons and drains, is on both.
 //!
 //! Whoever can open the socket is trusted, the way whoever can open the Docker socket is. The
 //! socket is made with mode 0600, so that is root unless the operator hands it on. The TCP port
@@ -14,6 +14,7 @@ use futures::stream::{self, BoxStream, FuturesUnordered, StreamExt, TryStreamExt
 use hive_drone::Output;
 use hive_proto::convert;
 use hive_proto::drone::api as drone;
+use hive_proto::internal::node_server::NodeServer;
 use hive_proto::v1;
 use hive_proto::v1::cells_server::{Cells, CellsServer};
 use hive_proto::v1::exec_server::{Exec, ExecServer};
@@ -39,6 +40,7 @@ use tonic::{Request, Response, Status, Streaming};
 mod audit;
 mod junit;
 mod llm;
+mod node;
 mod snapshots;
 mod verify;
 
@@ -145,6 +147,7 @@ struct Router {
     verify: VerifyServer<Api>,
     llm: LlmServer<Api>,
     snapshots: SnapshotsServer<Api>,
+    node: NodeServer<Api>,
 }
 
 impl Router {
@@ -155,7 +158,8 @@ impl Router {
             files: FilesServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             verify: VerifyServer::new(api.clone()).max_decoding_message_size(MAX_REQUEST),
             llm: LlmServer::new(api.clone()),
-            snapshots: SnapshotsServer::new(api),
+            snapshots: SnapshotsServer::new(api.clone()),
+            node: NodeServer::new(api),
         }
     }
 }
@@ -187,6 +191,7 @@ where
             Some(<SnapshotsServer<Api> as NamedService>::NAME) => {
                 Box::pin(self.snapshots.call(req))
             }
+            Some(<NodeServer<Api> as NamedService>::NAME) => Box::pin(self.node.call(req)),
             _ => {
                 let status = Status::unimplemented(format!("no service at {}", req.uri().path()));
                 Box::pin(async move { Ok(status.into_http()) })

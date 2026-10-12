@@ -226,6 +226,31 @@ fn the_same_seed_and_view_give_the_same_placement() {
 }
 
 #[test]
+fn a_cordoned_node_gets_no_batch_but_keeps_its_keys() {
+    let mut view = cluster(4);
+    view.nodes[2].cordoned = true;
+    view.nodes[3].mem_committed_mib = view.nodes[3].mem_admit_mib / 2;
+    let mut placer = Placer::new(3);
+    let p = placer.place(&view, &req(300, res(100, 64)), T0);
+    assert!(p.nodes.iter().all(|(n, _)| *n != 2), "{:?}", p.nodes);
+    assert_eq!(total(&p), 300);
+    // Keys keep their order, so a retry still reaches the cell the cordoned node has.
+    let mut homes = 0;
+    for k in 0..200u32 {
+        let key = format!("k{k}");
+        let order = Placer::key_order(&view, Backend::Container, key.as_bytes());
+        assert_eq!(order.len(), 4);
+        let home = placer.home(&view, &req(1, res(100, 64)), key.as_bytes(), T0);
+        assert_eq!(home, Some(order[0]));
+        homes += u32::from(home == Some(2));
+    }
+    assert!(homes > 0);
+    // Nor does it count toward the share in use, full or not.
+    view.nodes[2].mem_committed_mib = view.nodes[2].mem_admit_mib;
+    assert!((view.utilization() - 1.0 / 6.0).abs() < 1e-9, "{}", view.utilization());
+}
+
+#[test]
 fn a_key_goes_to_the_same_node_from_any_placer_and_moves_only_with_its_node() {
     let mut view = cluster(6);
     view.nodes[1].backends = BackendSet::of(&[Backend::Microvm]);

@@ -82,7 +82,7 @@ impl Service {
                 "Node reports received, by what became of them.",
                 &["result"],
             ),
-            nodes: registry.gauge("hive_scout_nodes", "Nodes scout knows, by state.", &["state"]),
+            nodes: registry.gauge("hive_scout_nodes", "Nodes scout knows, by state: healthy, cordoned or down.", &["state"]),
             cells: registry.gauge("hive_scout_cells", "Cells on the healthy nodes.", &[]),
             mem_admit: registry.gauge(
                 "hive_scout_mem_admit_mib",
@@ -296,7 +296,8 @@ impl Inner {
         let now = self.start.elapsed();
         let Some(snap) = self.scout().tick(now) else { return };
         let (m, t) = (&self.metrics, snap.totals);
-        m.nodes.with(&["healthy"]).set(i64::from(t.healthy));
+        m.nodes.with(&["healthy"]).set(i64::from(t.healthy - t.cordoned));
+        m.nodes.with(&["cordoned"]).set(i64::from(t.cordoned));
         m.nodes.with(&["down"]).set(i64::from(t.nodes - t.healthy));
         m.cells.with(&[]).set(gauge(t.cells));
         m.mem_admit.with(&[]).set(gauge(t.mem_admit_mib));

@@ -127,7 +127,8 @@ impl Placer {
         // On-prem memory in use and in all, with what this placer just sent counted.
         let (mut used, mut total) = (0u64, 0u64);
         for node in &view.nodes {
-            if !node.healthy {
+            // A cordoned node is left out of the share too, since it takes nothing more.
+            if !node.healthy || node.cordoned {
                 continue;
             }
             if node.cloud {
@@ -206,7 +207,8 @@ impl Placer {
     /// without. Every placer picks the same node from the same view, so a create that is tried
     /// again reaches the comb that has its key and gets the same cell back, and a node leaving
     /// moves only the keys it had. A comb checks the key before its room, so a full one still
-    /// answers for a cell it has and turns a new one away. Asked again with that node excluded,
+    /// answers for a cell it has and turns a new one away. A cordoned node keeps its place in the
+    /// order for the same reason: it answers for its keys and turns new ones away. Asked again with that node excluded,
     /// this picks the next node in the same order, so every try walks the nodes the same way.
     pub fn home(
         &mut self,

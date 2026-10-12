@@ -100,6 +100,7 @@ pub fn cause_to_v1(c: Cause) -> v1::Cause {
         Cause::DroneLost => v1::Cause::DroneLost,
         Cause::NodeLost => v1::Cause::NodeLost,
         Cause::Recovery => v1::Cause::Recovery,
+        Cause::Drained => v1::Cause::Drained,
     }
 }
 

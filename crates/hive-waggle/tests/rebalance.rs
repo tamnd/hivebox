@@ -69,6 +69,17 @@ fn cloud_and_down_nodes_take_nothing() {
 }
 
 #[test]
+fn a_cordoned_node_neither_gives_nor_takes() {
+    let cordoned = NodeView { cordoned: true, ..node(3, 0, 0) };
+    let plan = Rebalancer::new().plan(&view(vec![node(1, 9800, 20), node(2, 7000, 0), cordoned]));
+    // The same plan as without node 3, which is empty but takes nothing.
+    assert_eq!(plan.moves, [Move { from: 1, to: 2, cells: 5, mem_mib: 1280 }]);
+    let hot = NodeView { cordoned: true, ..node(3, 9900, 20) };
+    let plan = Rebalancer::new().plan(&view(vec![node(1, 1000, 0), hot]));
+    assert!(plan.moves.is_empty(), "{:?}", plan.moves);
+}
+
+#[test]
 fn a_burst_is_said_only_after_the_share_stays_past_the_line() {
     let cloud = NodeView { cloud: true, mem_committed_mib: 1000, ..node(9, 0, 0) };
     // 34000 of 40000 is 85%, 2000 MiB over the 80% line.

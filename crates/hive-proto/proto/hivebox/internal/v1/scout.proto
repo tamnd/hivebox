@@ -57,6 +57,9 @@ message NodeReport {
   // MiB. The rebalancer moves these off a hot node.
   uint32 idle_cells = 19;
   uint64 idle_mem_mib = 20;
+  // An operator cordoned the node, so it takes no new cells. The ones it has keep running, and it
+  // still answers for an idempotency key it already has.
+  bool cordoned = 21;
 }
 
 message ProjectCells {
@@ -110,4 +113,5 @@ message NodeState {
   bool cloud = 18;
   uint32 idle_cells = 19;
   uint64 idle_mem_mib = 20;
+  bool cordoned = 21;
 }
