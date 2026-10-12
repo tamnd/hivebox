@@ -1,0 +1,19 @@
+# The cluster view. Install the binary as /usr/local/bin/hive-scout, and put its flags in
+# /etc/hivebox/scout.env as SCOUT_ARGS, for example SCOUT_ARGS="--listen 0.0.0.0:7400".
+[Unit]
+Description=hivebox cluster view (hive-scout)
+Documentation=https://github.com/tamnd/hivebox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/hivebox/scout.env
+ExecStart=/usr/local/bin/hive-scout $SCOUT_ARGS
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -38,6 +38,17 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 const SHARDS: usize = 64;
+
+/// The cells that were live in the WAL when a comb started, by what became of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// Still live, so the comb took them back.
+    pub taken_back: u32,
+    /// They ended while no comb ran, or were stopping and finished.
+    pub ended: u32,
+    /// The comb could not take them back, or they were from an older epoch, so they failed.
+    pub lost: u32,
+}
 /// The file in the data directory whose presence means the node is cordoned.
 const CORDON_FILE: &str = "cordoned";
 /// Sequence numbers are reserved in the WAL this many at a time, so most creates don't write
@@ -161,6 +172,10 @@ pub(crate) struct Inner {
     cordoned: AtomicBool,
     /// Held while the cordon changes, so the file and the flag agree.
     cordoning: Mutex<()>,
+    /// When the comb opened.
+    opened: Instant,
+    /// The cells it found live in the WAL then, and what became of them.
+    started: std::sync::OnceLock<Started>,
 }
 
 /// The policies `cfg` names, each compiled, so a node does not start with one it cannot run.
@@ -354,13 +369,16 @@ impl Comb {
             events: broadcast::channel(4096).0,
             cordoned: AtomicBool::new(cordoned),
             cordoning: Mutex::new(()),
+            opened: Instant::now(),
+            started: std::sync::OnceLock::new(),
         });
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
         // Copies for forks that were under way when the comb last ended.
         let _ = std::fs::remove_dir_all(inner.cfg.data_dir.join("forks"));
         let comb = Self { inner };
-        let (claimed, claimed_netns) = comb.recover(records).await;
+        let (claimed, claimed_netns, live) = comb.recover(records).await;
         comb.fence().await;
+        comb.count_started(&live);
         if let Some(pool) = &comb.inner.netns {
             let swept = pool.sweep(&claimed_netns).await?;
             if swept > 0 {
@@ -412,16 +430,17 @@ impl Comb {
     }
 
     /// Starts an actor for every cell in the WAL. Returns the cgroups and network namespaces the
-    /// live ones hold.
+    /// live ones hold, and the live ones.
     async fn recover(
         &self,
         records: HashMap<u128, bytes::Bytes>,
-    ) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    ) -> (HashSet<PathBuf>, HashSet<PathBuf>, Vec<CellId>) {
         let inner = &self.inner;
         let mut waits = Vec::new();
         let mut known = HashSet::new();
         let mut claimed = HashSet::new();
         let mut claimed_netns = HashSet::new();
+        let mut live = Vec::new();
         for (key, bytes) in records {
             let id = CellId::from_bits(key);
             known.insert(inner.cell_dir(id));
@@ -462,6 +481,9 @@ impl Comb {
                 status,
             );
             inner.insert(&cell);
+            if !state.is_terminal() {
+                live.push(id);
+            }
             let Some(driver) = inner.drivers.get(cell.spec.backend).cloned() else {
                 eprintln!(
                     "hive-comb: no {} driver for {id}, which stays as it is",
@@ -486,7 +508,31 @@ impl Comb {
                 }
             }
         }
-        (claimed, claimed_netns)
+        (claimed, claimed_netns, live)
+    }
+
+    /// Sorts the cells that were live when the comb started by what became of them.
+    fn count_started(&self, live: &[CellId]) {
+        let mut started = Started::default();
+        for &id in live {
+            let n = match self.get(id) {
+                // A cell whose backend this comb has no driver for is only a record now.
+                Ok(c) if self.inner.drivers.get(c.spec.backend).is_none() => &mut started.lost,
+                Ok(c) if !c.status.state.is_terminal() => &mut started.taken_back,
+                Ok(c) if !matches!(c.status.cause, Some(Cause::Recovery | Cause::NodeLost)) => {
+                    &mut started.ended
+                }
+                _ => &mut started.lost,
+            };
+            *n += 1;
+        }
+        if !live.is_empty() {
+            eprintln!(
+                "hive-comb: took back {} cells, {} ended while no comb ran, {} lost",
+                started.taken_back, started.ended, started.lost
+            );
+        }
+        let _ = self.inner.started.set(started);
     }
 
     /// Stops the cells left from an older epoch of this node. The node registered again since,
@@ -687,6 +733,18 @@ impl Comb {
             let _ = wait.await;
         }
         Ok(cell.info())
+    }
+
+    /// What became of the cells that were live when this comb started.
+    #[must_use]
+    pub fn started(&self) -> Started {
+        self.inner.started.get().copied().unwrap_or_default()
+    }
+
+    /// How long this comb has been open.
+    #[must_use]
+    pub fn up(&self) -> Duration {
+        self.inner.opened.elapsed()
     }
 
     /// Whether an operator cordoned the node, so it takes no new cells.

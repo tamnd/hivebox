@@ -1,0 +1,17 @@
+# One member of the keeper group. Install the binary as /usr/local/bin/hive-keeper and its config
+# as /etc/hivebox/keeper.toml. Restart the members one at a time, so the group keeps a majority.
+[Unit]
+Description=hivebox keeper member (hive-keeper)
+Documentation=https://github.com/tamnd/hivebox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hive-keeper --config /etc/hivebox/keeper.toml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

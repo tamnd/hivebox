@@ -543,6 +543,7 @@ async fn a_restarted_comb_picks_up_every_cell() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());
     let comb = open(config(&s.0), &fake).await;
+    assert_eq!(comb.started(), Started::default());
     let mut ids = Vec::new();
     for _ in 0..6 {
         ids.push(comb.create(request(spec("python"))).await.unwrap().id);
@@ -566,6 +567,7 @@ async fn a_restarted_comb_picks_up_every_cell() {
     let dead = reaches(&comb, ids[3], CellState::Stopped).await;
     assert_eq!(dead.status.cause, Some(Cause::Exited));
     assert_eq!(comb.committed(), (4, 4 * (256 << 20)));
+    assert_eq!(comb.started(), Started { taken_back: 4, ended: 1, lost: 0 });
 
     // The secrets came back from the WAL, so the channels work.
     assert_eq!(echo(&comb, ids[0], "again").await, "again\n");
@@ -580,6 +582,7 @@ async fn a_restarted_comb_picks_up_every_cell() {
     drop(comb);
     let comb = open(config(&s.0), &fake).await;
     assert_eq!(comb.list().len(), 7);
+    assert_eq!(comb.started(), Started { taken_back: 5, ended: 0, lost: 0 });
     assert_eq!(echo(&comb, new, "third").await, "third\n");
     comb.shutdown().await;
 }
@@ -608,6 +611,7 @@ async fn a_comb_back_in_a_new_epoch_stops_the_old_cells() {
     }
     assert_eq!(fake.live(), 0);
     assert_eq!(comb.committed(), (0, 0));
+    assert_eq!(comb.started(), Started { taken_back: 0, ended: 0, lost: 3 });
     let new = comb.create(request(spec("python"))).await.unwrap().id;
     assert_eq!(new.epoch(), ids[0].epoch() + 1);
     assert_eq!(echo(&comb, new, "fresh").await, "fresh\n");

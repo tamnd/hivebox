@@ -60,7 +60,8 @@ Files:
   rm ID PATH [-r]
 
 Nodes, on a comb's own socket or port:
-  node status                                      whether the node is cordoned, and its cells
+  node status [--shell]                            whether the node is cordoned, its cells, and
+         what its comb took back when it started. --shell prints KEY=VALUE lines for scripts
   node cordon|uncordon                             stops new cells coming to the node, or lets
          them come again. The cells it has keep running either way
   node drain [--timeout DURATION] [--stop-rest] [--snapshot]
@@ -86,7 +87,7 @@ pub struct Args {
 
 /// Flags that stand alone. Every other flag takes a value.
 const SWITCHES: &[&str] =
-    &["-i", "-r", "--all", "--scrub", "--stop-rest", "--snapshot", "-h", "--help"];
+    &["-i", "-r", "--all", "--scrub", "--stop-rest", "--snapshot", "--shell", "-h", "--help"];
 
 impl Args {
     /// Splits `args`.
@@ -791,6 +792,8 @@ async fn node(client: &Client, args: &Args) -> Result<i32, String> {
     let what = args.rest.first().map(String::as_str);
     if what == Some("drain") {
         args.check(&["--timeout", "--stop-rest", "--snapshot"])?;
+    } else if what == Some("status") {
+        args.check(&["--shell"])?;
     } else {
         args.check(&[])?;
     }
@@ -805,8 +808,40 @@ async fn node(client: &Client, args: &Args) -> Result<i32, String> {
         Some(w) => return Err(format!("node {w}: status, cordon, uncordon or drain")),
         None => unreachable!(),
     };
+    if args.has("--shell") {
+        print!("{}", node_vars(&status));
+        return Ok(0);
+    }
     println!("{}", node_line(&status));
+    if what == Some("status") {
+        let up = status.up.and_then(|t| Duration::try_from(t).ok()).unwrap_or_default();
+        println!(
+            "up {:.1}s, and at start took back {} cells, {} had ended while no comb ran, {} lost",
+            up.as_secs_f64(),
+            status.taken_back,
+            status.ended_while_down,
+            status.lost_on_start
+        );
+    }
     Ok(0)
+}
+
+/// The node's status as `KEY=VALUE` lines, for a script to read.
+fn node_vars(s: &pb::NodeStatus) -> String {
+    let up = s.up.and_then(|t| Duration::try_from(t).ok()).unwrap_or_default();
+    let vars = [
+        ("NODE", s.node.to_string()),
+        ("CORDONED", u8::from(s.cordoned).to_string()),
+        ("LIVE", s.live.to_string()),
+        ("RUNNING", s.running.to_string()),
+        ("PAUSED", s.paused.to_string()),
+        ("VERSION", s.version.clone()),
+        ("UP_MS", up.as_millis().to_string()),
+        ("TAKEN_BACK", s.taken_back.to_string()),
+        ("ENDED_WHILE_DOWN", s.ended_while_down.to_string()),
+        ("LOST_ON_START", s.lost_on_start.to_string()),
+    ];
+    vars.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
 }
 
 /// One line on a node: its index, whether it is cordoned, its cells and its version.
@@ -1084,6 +1119,26 @@ mod tests {
         assert_eq!(a.rest, ["snapshot", "abc"]);
         assert!(a.has("--scrub"));
         assert_eq!(a.all(&["--allow"]), ["tests", "fixtures"]);
+    }
+
+    #[test]
+    fn a_node_status_reads_as_shell_variables() {
+        let s = pb::NodeStatus {
+            node: 3,
+            cordoned: true,
+            live: 24,
+            running: 16,
+            paused: 8,
+            version: "0.0.43".into(),
+            up: Some(hive_proto::convert::duration_to_v1(Duration::from_millis(2500))),
+            taken_back: 24,
+            ended_while_down: 1,
+            lost_on_start: 0,
+        };
+        let vars = node_vars(&s);
+        assert!(vars.starts_with("NODE=3\nCORDONED=1\nLIVE=24\n"), "{vars}");
+        assert!(vars.contains("\nVERSION=0.0.43\nUP_MS=2500\nTAKEN_BACK=24\n"), "{vars}");
+        assert!(vars.ends_with("ENDED_WHILE_DOWN=1\nLOST_ON_START=0\n"), "{vars}");
     }
 
     #[test]
