@@ -118,7 +118,7 @@ message PrepareRequest {
 }
 
 message Vsock {
-  // The host side socket. The node agent sends "CONNECT <port>" first.
+  // The host side socket. The node agent sends `CONNECT <port>` first.
   string uds = 1;
   uint32 port = 2;
 }

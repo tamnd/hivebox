@@ -11,10 +11,14 @@ hive-types = 0
 hive-proto = 1
 hive-rt = 1
 hive-telemetry = 1
+# The ublk server. It uses no other hivebox crate, and nectar's lazy fill is built on it.
+hive-blockd = 1
 hive-auth = 2
 hive-cell = 2
 hive-nectar = 2
 hive-drone = 2
+# Placement. The comb and the scout use its layer bloom and backend set in the node report.
+hive-waggle = 2
 hive-cell-wasm = 3
 hive-cell-proc = 3
 hive-cell-oci = 3
@@ -24,13 +28,13 @@ hive-cell-qemu = 3
 hive-cell-plugin = 3
 hive-uffd = 3
 hive-snap = 3
-hive-blockd = 3
 hive-guard = 3
+# The comb builds the report the scout reads with the scout's own types, and the comb's tests
+# start a keeper.
+hive-scout = 3
+hive-keeper = 3
 hive-imaged = 4
 hive-comb = 4
-hive-waggle = 4
-hive-scout = 4
-hive-keeper = 4
 hive-gate = 5
 hive-sdk = 5
 hive-pollen = 6

@@ -7,7 +7,13 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Both are unmaintained with no fixed release to move to, and both only run at build time:
+# paste through netlink-packet-core under youki's libcontainer, and proc-macro-error2 through
+# biscuit-auth's macros. They go when those crates move off them.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste, a build time macro under libcontainer" },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2, a build time macro under biscuit-auth" },
+]
 
 [licenses]
 version = 2
@@ -20,6 +26,9 @@ allow = [
   "BSD-3-Clause",
   "ISC",
   "MIT",
+  # pathrs, under youki's libcontainer and libcgroups, is MPL-2.0 or LGPL-3.0, and MPL-2.0 is
+  # per file, so it covers only pathrs's own files.
+  "MPL-2.0",
   "Unicode-3.0",
   "Zlib",
 ]

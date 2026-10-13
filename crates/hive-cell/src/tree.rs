@@ -582,7 +582,8 @@ mod tests {
         assert_eq!(done.bytes, want as u64);
         for i in (0..600).step_by(10) {
             let f = b.join(format!("d{}", i % 13)).join(format!("f{i}"));
-            let (f, l) = (fs::metadata(f).unwrap(), fs::metadata(b.join(format!("link{i}"))).unwrap());
+            let (f, l) =
+                (fs::metadata(f).unwrap(), fs::metadata(b.join(format!("link{i}"))).unwrap());
             assert_eq!((f.ino(), f.nlink(), f.len()), (l.ino(), 2, l.len()));
         }
         assert_eq!(fs::read(b.join("d1/f599")).unwrap(), "599".repeat(599).as_bytes());
@@ -609,7 +610,8 @@ mod tests {
                 };
                 let attr = xattr(&p, "user.note");
                 let key = p.strip_prefix(root).unwrap().to_path_buf();
-                let line = format!("{:o} {} {} {} {what} {attr:?}", m.mode(), m.uid(), m.gid(), m.mtime());
+                let line =
+                    format!("{:o} {} {} {} {what} {attr:?}", m.mode(), m.uid(), m.gid(), m.mtime());
                 out.insert(key, line);
             }
         }
@@ -619,13 +621,16 @@ mod tests {
     #[test]
     fn a_precopy_is_brought_up_to_date_once_the_tree_stops() {
         for racy in [false, true] {
-            let root = std::env::temp_dir().join(format!("hive-tree-pre-{}-{racy}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("hive-tree-pre-{}-{racy}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             let (a, b) = (root.join("a"), root.join("b"));
             fs::create_dir_all(a.join("sub")).unwrap();
             fs::create_dir_all(a.join("old/deep")).unwrap();
             fs::create_dir(&b).unwrap();
-            for f in ["keep", "change", "gone", "swap", "mode", "sub/x", "old/deep/y", "linked", "attr"] {
+            for f in
+                ["keep", "change", "gone", "swap", "mode", "sub/x", "old/deep/y", "linked", "attr"]
+            {
                 fs::write(a.join(f), f).unwrap();
             }
             fs::hard_link(a.join("linked"), a.join("sub/link2")).unwrap();
@@ -637,7 +642,12 @@ mod tests {
             )
             .is_ok();
             let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-            fs::File::options().write(true).open(a.join("keep")).unwrap().set_modified(old).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(a.join("keep"))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
 
             let mut pre = Precopy::start(&a, &b).unwrap();
             let kept = fs::metadata(b.join("keep")).unwrap().ino();

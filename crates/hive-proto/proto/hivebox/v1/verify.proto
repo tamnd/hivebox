@@ -42,7 +42,7 @@ message VerifyRequest {
   // the report names them, the class name and the name joined by a dot.
   repeated string must_pass = 10;
   // A reward plugin on the node to grade the runs with, a component of the world
-  // hivebox:reward/grader named <grader>.wasm in the node's graders dir. It is given every run's
+  // hivebox:reward/grader named `<grader>.wasm` in the node's graders dir. It is given every run's
   // output, `task`, the files in `grader_files` and whether the runs passed, and its reward comes
   // back in the result. Empty for none.
   string grader = 11;
