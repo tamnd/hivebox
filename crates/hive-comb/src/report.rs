@@ -291,7 +291,7 @@ fn census(comb: &Comb) -> Census {
         *by.entry(cell.project.as_str()).or_default() += 1;
         let idle = match state {
             CellState::Paused => true,
-            CellState::Running => cell.quiet_for() >= IDLE_AFTER,
+            CellState::Running => cell.quiet_for() >= IDLE_AFTER && !cell.busy(),
             _ => false,
         };
         if idle {
