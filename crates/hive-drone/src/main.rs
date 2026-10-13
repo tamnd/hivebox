@@ -1,7 +1,8 @@
 //! The `hive-drone` binary.
 //!
 //! ```text
-//! hive-drone [--init] --listen (unix:PATH | fd:N) (--secret-stdin | --secret-file PATH)
+//! hive-drone --vm
+//! hive-drone [--init] --listen (unix:PATH | fd:N | vsock:PORT) (--secret-stdin | --secret-file PATH)
 //!            [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell /bin/sh]
 //!            [--session-shell /bin/bash] [--workdir /] [--uid N] [--gid N] [--root PATH]...
 //! ```
@@ -11,7 +12,10 @@
 //! come first, runs the drone under a small PID 1 that waits on orphans. `--harden` applies
 //! Landlock and seccomp before serving, and makes each `--protect` path read only. `--env` adds
 //! to the environment every command starts with. `--listen fd:N` takes a socket that is already
-//! listening from its parent, which is how a container gets one bound outside it.
+//! listening from its parent, which is how a container gets one bound outside it. `--listen
+//! vsock:PORT` listens on a vsock port, which is how the drone in a virtual machine is reached.
+//! `--vm` is for the drone as `/init` of a virtual machine's initramfs, and takes its arguments
+//! from there (see `hive_drone::vm`).
 
 // Unsafe is denied everywhere but the one call that takes the inherited socket in `bind`.
 #![deny(unsafe_code)]
@@ -24,7 +28,7 @@ use std::io::Read;
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
-const USAGE: &str = "usage: hive-drone [--init] --listen (unix:PATH | fd:N) (--secret-stdin | --secret-file PATH) [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
+const USAGE: &str = "usage: hive-drone --vm | hive-drone [--init] --listen (unix:PATH | fd:N | vsock:PORT) (--secret-stdin | --secret-file PATH) [--harden] [--protect PATH]... [--env KEY=VALUE]... [--shell PATH] [--session-shell PATH] [--workdir PATH] [--uid N] [--gid N] [--root PATH]...";
 
 #[cfg(target_os = "linux")]
 struct Args {
@@ -105,6 +109,9 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).is_some_and(|a| a == "--init") {
         return hive_drone::init::run(std::env::args_os().skip(2).collect());
     }
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--vm") {
+        return hive_drone::vm::boot();
+    }
     let args = match parse() {
         Ok(args) => args,
         Err(e) => {
@@ -172,10 +179,23 @@ fn read_secret(file: Option<&std::path::Path>) -> std::io::Result<[u8; 32]> {
     Ok(secret)
 }
 
+/// A bound socket, before the runtime starts.
+#[cfg(target_os = "linux")]
+enum Listener {
+    Unix(std::os::unix::net::UnixListener),
+    Vsock(std::os::fd::OwnedFd),
+}
+
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn bind(listen: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+fn bind(listen: &str) -> std::io::Result<Listener> {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    if let Some(port) = listen.strip_prefix("vsock:") {
+        let port = port
+            .parse()
+            .map_err(|_| std::io::Error::other(format!("{listen} does not name a port")))?;
+        return Ok(Listener::Vsock(hive_drone::vsock::bind(port)?));
+    }
     let listener = if let Some(fd) = listen.strip_prefix("fd:") {
         let fd: RawFd =
             fd.parse().ok().filter(|n| *n > 2).ok_or_else(|| {
@@ -198,30 +218,44 @@ fn bind(listen: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
         std::os::unix::net::UnixListener::bind(path)?
     } else {
         return Err(std::io::Error::other(format!(
-            "cannot listen on {listen}, only unix:PATH and fd:N are supported"
+            "cannot listen on {listen}, only unix:PATH, fd:N and vsock:PORT are supported"
         )));
     };
     listener.set_nonblocking(true)?;
-    Ok(listener)
+    Ok(Listener::Unix(listener))
 }
 
 #[cfg(target_os = "linux")]
-async fn serve(
-    listener: std::os::unix::net::UnixListener,
-    cfg: Config,
-    secret: [u8; 32],
-) -> std::io::Result<()> {
-    let listener = tokio::net::UnixListener::from_std(listener)?;
+async fn serve(listener: Listener, cfg: Config, secret: [u8; 32]) -> std::io::Result<()> {
     let drone = Drone::new(cfg, secret);
-    loop {
-        let (conn, _) = listener.accept().await?;
-        let drone = drone.clone();
-        tokio::spawn(async move {
-            if let Err(e) = drone.serve(conn).await {
-                eprintln!("hive-drone: connection ended: {e}");
+    match listener {
+        Listener::Unix(l) => {
+            let l = tokio::net::UnixListener::from_std(l)?;
+            loop {
+                let (conn, _) = l.accept().await?;
+                spawn(&drone, conn);
             }
-        });
+        }
+        Listener::Vsock(fd) => {
+            let l = hive_drone::vsock::VsockListener::new(fd)?;
+            loop {
+                spawn(&drone, l.accept().await?);
+            }
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn<T>(drone: &std::sync::Arc<Drone>, conn: T)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let drone = drone.clone();
+    tokio::spawn(async move {
+        if let Err(e) = drone.serve(conn).await {
+            eprintln!("hive-drone: connection ended: {e}");
+        }
+    });
 }
 
 #[cfg(not(target_os = "linux"))]

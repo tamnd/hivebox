@@ -4,6 +4,7 @@
 use crate::spec::{self, Host};
 use crate::worker::{Create, Reply};
 use futures::future::BoxFuture;
+use hive_cell::pid::{alive, pidfd, start_time};
 use hive_cell::{
     CellDriver, CellHandle, DriverCaps, ExitInfo, GuestChannel, Liveness, NodeFit, PauseMode,
     Result, RootfsPlan, Slot, SnapshotCaps, cgroup,
@@ -388,7 +389,7 @@ impl CellDriver for OciDriver {
             let pid = u32::try_from(pid).map_err(|_| failed(format!("pid {pid}")))?;
             h.pid = Some(pid);
             if let Some(start) = start_time(pid) {
-                h.extra.insert("start".into(), start.to_string());
+                h.extra.insert(hive_cell::pid::START.into(), start.to_string());
             }
             Ok(())
         })
@@ -516,38 +517,6 @@ impl CellDriver for OciDriver {
     }
 }
 
-/// Whether the handle's init is still running: the pid is there, is the same process that was
-/// started, and has not exited yet.
-fn alive(h: &CellHandle) -> bool {
-    let Some(pid) = h.pid else { return false };
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
-    let Some((state, start)) = stat_fields(&stat) else { return false };
-    let same = h.extra.get("start").is_none_or(|s| s.parse() == Ok(start));
-    same && state != 'Z' && state != 'X'
-}
-
-/// The state letter and the start time from a `/proc/PID/stat` line.
-fn stat_fields(stat: &str) -> Option<(char, u64)> {
-    // The command name can hold spaces and brackets, so the fields start after the last `)`.
-    let rest = &stat[stat.rfind(')')? + 2..];
-    let mut fields = rest.split(' ');
-    let state = fields.next()?.chars().next()?;
-    // starttime is field 22 of the line, the 20th after the state.
-    let start = fields.nth(18)?.parse().ok()?;
-    Some((state, start))
-}
-
-fn start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat_fields(&stat).map(|(_, start)| start)
-}
-
-fn pidfd(pid: u32) -> std::io::Result<OwnedFd> {
-    let pid = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw);
-    let pid = pid.ok_or_else(|| std::io::Error::other("bad pid"))?;
-    Ok(rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?)
-}
-
 fn uid(n: u32) -> rustix::fs::Uid {
     rustix::fs::Uid::from_raw(n)
 }
@@ -660,6 +629,7 @@ fn is_static(elf: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn only_a_static_elf_passes_for_the_shell() {
@@ -684,14 +654,5 @@ mod tests {
         let e = OciDriver::new(cfg).err().unwrap();
         assert!(e.to_string().contains("not a static ELF"), "{e}");
         std::fs::remove_file(&script).unwrap();
-    }
-
-    use super::*;
-
-    #[test]
-    fn stat_lines_with_odd_names_parse() {
-        let line = "42 (a) b (c)) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
-        assert_eq!(stat_fields(line), Some(('S', 987_654)));
-        assert_eq!(stat_fields("garbage"), None);
     }
 }

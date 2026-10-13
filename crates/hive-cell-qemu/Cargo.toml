@@ -1,6 +1,6 @@
 [package]
 name = "hive-cell-qemu"
-description = "The tier 3 hivebox driver, running full QEMU guests over QMP."
+description = "The tier 3 hivebox driver, running full QEMU virtual machines."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,13 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 publish.workspace = true
+
+[dependencies]
+futures.workspace = true
+hive-cell.workspace = true
+hive-types.workspace = true
+rustix = { workspace = true, features = ["fs", "mount", "pipe", "process", "thread"] }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

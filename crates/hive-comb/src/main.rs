@@ -306,6 +306,36 @@ async fn drivers(cfg: &hive_comb::Config) -> hive_cell::DriverRegistry {
             Err(e) => eprintln!("hive-comb: no wasm cells: {e}"),
         }
     }
+    if cfg.fullvm.enabled {
+        let v = &cfg.fullvm;
+        let qemu = hive_cell_qemu::Config {
+            qemu: v.qemu.clone(),
+            kernel: v.kernel.clone(),
+            bios: v.bios.clone(),
+            firmware_dir: v.firmware_dir.clone(),
+            modules: v.modules.clone(),
+            drone: cfg.container.drone.clone(),
+            machine: v.machine.clone(),
+            accel: v.accel.clone(),
+            state_dir: v.state_dir.clone(),
+            uid_base: cfg.container.uid_base,
+            uid_count: cfg.container.uid_count,
+            vmm_uid_base: v.vmm_uid_base,
+            cid_base: v.cid_base,
+            max_vms: v.max_vms,
+            ..hive_cell_qemu::Config::default()
+        };
+        match hive_cell_qemu::QemuDriver::new(qemu) {
+            Ok(d) => match d.probe().await {
+                Ok(fit) if fit.ready => drivers.add(std::sync::Arc::new(d)),
+                Ok(fit) => {
+                    eprintln!("hive-comb: no virtual machine cells: {}", fit.notes.join(", "))
+                }
+                Err(e) => eprintln!("hive-comb: no virtual machine cells: {e}"),
+            },
+            Err(e) => eprintln!("hive-comb: no virtual machine cells: {e}"),
+        }
+    }
     for socket in &cfg.plugins {
         let Some(d) = connect(socket).await else { continue };
         let backend = d.backend();

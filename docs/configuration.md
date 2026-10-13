@@ -111,6 +111,25 @@ With no file at all, the comb runs on every default below. The only key with a r
 
 `[backends.fncall.mounts]` maps guest paths to host directories every wasm cell sees read only, as `"/data" = "/srv/data"`. Both must be absolute, and the guest path cannot be `/`.
 
+### [backends.fullvm]
+
+Full virtual machines on QEMU. Each one boots the container backend's `drone` as its init, so it uses the same images and the same `uid_base` and `uid_count`. The node also needs `/dev/vhost-vsock`, and `/dev/kvm` unless `accel` is `tcg`.
+
+| key | default | meaning |
+|---|---|---|
+| `enabled` | false | turns the backend on |
+| `qemu` | `/usr/bin/qemu-system-x86_64` | the QEMU binary |
+| `kernel` | `/usr/lib/hivebox/vmlinuz` | the guest kernel. It needs 9p, virtio and vsock, built in or listed in `modules` |
+| `bios` | none | the firmware file. None uses QEMU's own |
+| `firmware_dir` | none | where QEMU looks for firmware and option ROMs, as its `-L` |
+| `modules` | `[]` | kernel modules the guest loads in this order before it mounts its root. Ones ending in `.zst`, `.xz` or `.gz` need a kernel that can decompress modules |
+| `machine` | `microvm` | the QEMU machine type. Any other type puts the devices on PCI |
+| `accel` | `kvm` | `kvm`, or `tcg` on a node without KVM, which is many times slower |
+| `state_dir` | `/run/hivebox/qemu` | each cell's root filesystem mount and console log |
+| `vmm_uid_base` | 2000000 | the host uid the first QEMU runs as. Each running VM gets its own, so none may be in the cells' range |
+| `cid_base` | 100000 | the vsock context id of the first VM |
+| `max_vms` | 4096 | how many VMs can run at once. Must not be 0 |
+
 ### [images]
 
 | key | default | meaning |

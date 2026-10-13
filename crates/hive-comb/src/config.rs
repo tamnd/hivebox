@@ -114,6 +114,8 @@ pub struct Config {
     pub container: ContainerBackend,
     /// The wasm backend.
     pub fncall: FncallBackend,
+    /// The virtual machine backend.
+    pub fullvm: FullvmBackend,
     /// The Unix sockets of driver plugins to run cells through, each serving one backend, which
     /// takes the place of a built in one for the same backend. `[backends] plugins`.
     pub plugins: Vec<PathBuf>,
@@ -330,6 +332,55 @@ impl Default for FncallBackend {
     }
 }
 
+/// How the comb runs virtual machine cells, each a QEMU guest with the container backend's drone
+/// as its init and the same images as containers, with the container backend's ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FullvmBackend {
+    /// On adds the backend where the node can run it. It is off by default.
+    pub enabled: bool,
+    /// The QEMU binary, `qemu-system-x86_64`.
+    pub qemu: PathBuf,
+    /// The guest kernel. It needs 9p, virtio and vsock, built in or in `modules`.
+    pub kernel: PathBuf,
+    /// The firmware, or `None` for QEMU's own.
+    pub bios: Option<PathBuf>,
+    /// Where QEMU finds its firmware and option ROMs, or `None` for where it was built to look.
+    pub firmware_dir: Option<PathBuf>,
+    /// Kernel modules the guest loads in this order before it mounts its root filesystem.
+    pub modules: Vec<PathBuf>,
+    /// QEMU's machine type, `microvm` by default. Any other type gets its devices on PCI.
+    pub machine: String,
+    /// `kvm`, or `tcg` on a node without KVM, which is many times slower.
+    pub accel: String,
+    /// Where each virtual machine gets its root filesystem's mount and its console log.
+    pub state_dir: PathBuf,
+    /// The host uid the first virtual machine's QEMU runs as, outside the cells' ids.
+    pub vmm_uid_base: u32,
+    /// The vsock context id of the first virtual machine.
+    pub cid_base: u32,
+    /// How many virtual machines can run at once.
+    pub max_vms: u32,
+}
+
+impl Default for FullvmBackend {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            qemu: PathBuf::from("/usr/bin/qemu-system-x86_64"),
+            kernel: PathBuf::from("/usr/lib/hivebox/vmlinuz"),
+            bios: None,
+            firmware_dir: None,
+            modules: Vec::new(),
+            machine: "microvm".into(),
+            accel: "kvm".into(),
+            state_dir: PathBuf::from("/run/hivebox/qemu"),
+            vmm_uid_base: 2_000_000,
+            cid_base: 100_000,
+            max_vms: 4096,
+        }
+    }
+}
+
 /// The files a verification leaves out of the diff by default: what pytest reads before it runs a
 /// test, and what pip installed. `pyproject.toml` is not one, since fixes change it too.
 pub(crate) const PROTECTED_PATHS: [&str; 7] = [
@@ -391,6 +442,7 @@ impl Default for Config {
             policy_mem_mib: 64,
             container: ContainerBackend::default(),
             fncall: FncallBackend::default(),
+            fullvm: FullvmBackend::default(),
             plugins: Vec::new(),
             images: Images::default(),
             network: Network::default(),
@@ -459,6 +511,11 @@ impl Config {
     ///
     /// [backends]
     /// plugins = ["/run/hivebox/plugins/qemu.sock"]
+    ///
+    /// [backends.fullvm]
+    /// enabled = true
+    /// kernel = "/usr/lib/hivebox/vmlinuz"
+    /// accel = "kvm"
     ///
     /// [backends.fncall]
     /// enabled = true
@@ -672,6 +729,26 @@ impl Config {
         }
         if !(1..=4096).contains(&b.max_mem_mib) {
             return Err("backends.fncall.max_mem_mib has to be from 1 to 4096".into());
+        }
+        let k = file.backends.fullvm;
+        let b = &mut c.fullvm;
+        set(&mut b.enabled, k.enabled);
+        set(&mut b.qemu, k.qemu);
+        set(&mut b.kernel, k.kernel);
+        b.bios = k.bios.or(b.bios.take());
+        b.firmware_dir = k.firmware_dir.or(b.firmware_dir.take());
+        set(&mut b.modules, k.modules);
+        set(&mut b.machine, k.machine);
+        set(&mut b.accel, k.accel);
+        set(&mut b.state_dir, k.state_dir);
+        set(&mut b.vmm_uid_base, k.vmm_uid_base);
+        set(&mut b.cid_base, k.cid_base);
+        set(&mut b.max_vms, k.max_vms);
+        if !["kvm", "tcg"].contains(&b.accel.as_str()) {
+            return Err(format!("backends.fullvm.accel = {:?} is not kvm or tcg", b.accel));
+        }
+        if b.max_vms == 0 || b.vmm_uid_base.checked_add(b.max_vms).is_none() {
+            return Err("backends.fullvm ids run past the last uid".into());
         }
         let i = file.images;
         if let Some(store) = i.store {
@@ -954,6 +1031,24 @@ struct BackendsFile {
     plugins: Vec<PathBuf>,
     container: ContainerFile,
     fncall: FncallFile,
+    fullvm: FullvmFile,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FullvmFile {
+    enabled: Option<bool>,
+    qemu: Option<PathBuf>,
+    kernel: Option<PathBuf>,
+    bios: Option<PathBuf>,
+    firmware_dir: Option<PathBuf>,
+    modules: Option<Vec<PathBuf>>,
+    machine: Option<String>,
+    accel: Option<String>,
+    state_dir: Option<PathBuf>,
+    vmm_uid_base: Option<u32>,
+    cid_base: Option<u32>,
+    max_vms: Option<u32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1238,6 +1333,14 @@ mod tests {
     fn wasm_cells_are_off_until_asked_for_and_their_programs_follow_the_data_dir() {
         let c = Config::from_toml("").unwrap();
         assert_eq!(c.fncall, FncallBackend::default());
+        assert_eq!(c.fullvm, FullvmBackend::default());
+        let c = Config::from_toml(
+            "[backends.fullvm]\nenabled = true\naccel = \"tcg\"\nmachine = \"q35\"\nmodules = [\"/m/9p.ko\"]",
+        )
+        .unwrap();
+        assert!(c.fullvm.enabled);
+        assert_eq!((c.fullvm.accel.as_str(), c.fullvm.machine.as_str()), ("tcg", "q35"));
+        assert_eq!(c.fullvm.modules, [PathBuf::from("/m/9p.ko")]);
         let c = Config::from_toml(
             "[node]\ndata_dir = \"/srv/hive\"\n[backends.fncall]\nenabled = true\nmax_mem_mib = 512\n\
              [backends.fncall.mounts]\n\"/usr/lib/python\" = \"/opt/py\"",
@@ -1293,6 +1396,8 @@ mod tests {
         assert!(Config::from_toml("[network.profiles.x]\ndomains = [\"a.*.com\"]").is_err());
         assert!(Config::from_toml("[network.profiles.x]\ndomain = [\"a.com\"]").is_err());
         assert!(Config::from_toml("[backends.container]\nworkers = 0").is_err());
+        assert!(Config::from_toml("[backends.fullvm]\naccel = \"hvf\"").is_err());
+        assert!(Config::from_toml("[backends.fullvm]\nmax_vms = 0").is_err());
         assert!(Config::from_toml("[backends.container]\nuid_base = 4294967295").is_err());
     }
 }

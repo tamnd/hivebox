@@ -123,6 +123,12 @@ message Vsock {
   uint32 port = 2;
 }
 
+// A guest behind the host's vhost-vsock device, reached by its context id.
+message VsockCid {
+  uint32 cid = 1;
+  uint32 port = 2;
+}
+
 message Handle {
   string cell_id = 1;
   hivebox.v1.Backend backend = 2;
@@ -132,6 +138,7 @@ message Handle {
   oneof channel {
     string unix = 4;
     Vsock vsock = 5;
+    VsockCid vsock_cid = 9;
   }
   string cgroup = 6;
   string netns = 7;
