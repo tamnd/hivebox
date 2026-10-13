@@ -4,7 +4,7 @@
 
 // The drone only ever runs inside a Linux cell, and it leans on openat2, inotify and /proc.
 #![cfg(target_os = "linux")]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod archive;
 mod client;
@@ -17,6 +17,10 @@ mod process;
 mod ring;
 mod server;
 mod session;
+// Binding and connecting a vsock socket takes a raw sockaddr_vm, which nothing safe wraps.
+pub mod vm;
+#[allow(unsafe_code)]
+pub mod vsock;
 mod watch;
 
 pub use client::{

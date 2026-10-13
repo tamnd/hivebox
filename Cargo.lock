@@ -1596,6 +1596,13 @@ version = "0.0.43"
 [[package]]
 name = "hive-cell-qemu"
 version = "0.0.43"
+dependencies = [
+ "futures",
+ "hive-cell",
+ "hive-types",
+ "rustix 1.1.5",
+ "tokio",
+]
 
 [[package]]
 name = "hive-cell-wasm"
@@ -1623,6 +1630,7 @@ dependencies = [
  "hive-cell",
  "hive-cell-oci",
  "hive-cell-plugin",
+ "hive-cell-qemu",
  "hive-cell-wasm",
  "hive-drone",
  "hive-guard",

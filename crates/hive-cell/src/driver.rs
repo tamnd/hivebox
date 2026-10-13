@@ -111,6 +111,14 @@ pub enum GuestChannel {
         /// The guest port.
         port: u32,
     },
+    /// A guest behind the host's vhost-vsock device, as QEMU makes: connect straight to `port`
+    /// on context id `cid`.
+    VsockCid {
+        /// The guest's context id.
+        cid: u32,
+        /// The guest port.
+        port: u32,
+    },
 }
 
 /// A cell the driver made, as plain data. The node agent writes it to its WAL, so after a restart

@@ -25,7 +25,7 @@ hive-types.workspace = true
 landlock.workspace = true
 libc.workspace = true
 prost.workspace = true
-rustix = { workspace = true, features = ["fs", "pipe", "process"] }
+rustix = { workspace = true, features = ["fs", "mount", "net", "pipe", "process", "stdio", "system"] }
 seccompiler.workspace = true
 tar.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

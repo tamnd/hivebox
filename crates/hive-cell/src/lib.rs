@@ -14,6 +14,8 @@ mod driver;
 #[cfg(target_os = "linux")]
 pub mod netns;
 #[cfg(target_os = "linux")]
+pub mod pid;
+#[cfg(target_os = "linux")]
 pub mod quota;
 #[cfg(target_os = "linux")]
 pub mod tree;

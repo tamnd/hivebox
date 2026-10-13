@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The fullvm backend. `hive-cell-qemu` runs each fullvm cell as a QEMU guest that boots straight into the drone from an initramfs, with the cell's root filesystem served from the host over 9p and the drone reached over vsock, so fullvm cells use the same images and API as containers. Turn it on with `[backends.fullvm]` in comb.toml. QEMU runs in the cell's cgroup and network namespace under its own seccomp sandbox, as a host uid of its own for each VM with only the file capabilities 9p needs, and with the hivebox state directories hidden. The drone has a `--vm` mode for being a guest's init and listens on `vsock:PORT`, and driver handles and plugins carry a vsock context id. On server3, which has no KVM, a python cell on q35 under TCG at a load of about 80 came up in 23.2 and 24.3 s, ran commands in a median of 1.1 s, wrote and read back 8 MiB in 3.4 s and 1.2 s, paused in 0.09 to 0.36 s and stopped in 0.3 s, three cells booted at once, and what the guest wrote was in the upper owned by the cell's uid. QEMU ran as uid 2000000 with 6 capabilities, no new privileges, a seccomp filter, in the cell's cgroup, and saw an empty `/run/hivebox`. The microvm machine type, the default, hangs at boot under TCG, so it is untested here.
+
 - Operator docs in `docs/`: how to set up one node or a cluster and keep it running (operations.md), every key of comb.toml, gate.toml and keeper.toml with its default (configuration.md), and a runbook for each alert and for the failures that have none (runbooks.md). Each alert in `deploy/prometheus/hivebox-rules.yml` now has a `runbook_url` that links to its runbook.
 
 ## 0.0.43

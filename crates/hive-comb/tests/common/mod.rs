@@ -99,7 +99,9 @@ impl Fake {
 pub fn socket(h: &CellHandle) -> PathBuf {
     match &h.channel {
         GuestChannel::Unix(p) => p.clone(),
-        GuestChannel::Vsock { .. } => unreachable!("the fake driver only makes Unix channels"),
+        GuestChannel::Vsock { .. } | GuestChannel::VsockCid { .. } => {
+            unreachable!("the fake driver only makes Unix channels")
+        }
     }
 }
 

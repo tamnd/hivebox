@@ -125,6 +125,9 @@ pub(crate) fn handle_to(h: &CellHandle) -> Result<wire::Handle> {
         GuestChannel::Vsock { uds, port } => {
             wire::handle::Channel::Vsock(wire::Vsock { uds: path(uds)?, port: *port })
         }
+        GuestChannel::VsockCid { cid, port } => {
+            wire::handle::Channel::VsockCid(wire::VsockCid { cid: *cid, port: *port })
+        }
     };
     Ok(wire::Handle {
         cell_id: h.id.to_string(),
@@ -143,6 +146,9 @@ pub(crate) fn handle_from(h: wire::Handle) -> Result<CellHandle> {
         Some(wire::handle::Channel::Unix(p)) => GuestChannel::Unix(p.into()),
         Some(wire::handle::Channel::Vsock(v)) => {
             GuestChannel::Vsock { uds: v.uds.into(), port: v.port }
+        }
+        Some(wire::handle::Channel::VsockCid(v)) => {
+            GuestChannel::VsockCid { cid: v.cid, port: v.port }
         }
         None => return Err(bad("the handle has no channel")),
     };
@@ -223,5 +229,31 @@ pub(crate) fn liveness_from(l: wire::Liveness) -> Result<Liveness> {
         State::Paused => Ok(Liveness::Paused),
         State::Gone => Ok(Liveness::Gone(exit_from(l.exit))),
         State::Unspecified => Err(Error::new(Reason::Internal, "the plugin gave no liveness")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hive_types::Backend;
+
+    #[test]
+    fn every_channel_survives_the_wire() {
+        for channel in [
+            GuestChannel::Unix("/d/drone.sock".into()),
+            GuestChannel::Vsock { uds: "/d/v.sock".into(), port: 52 },
+            GuestChannel::VsockCid { cid: 1042, port: 52 },
+        ] {
+            let h = CellHandle {
+                id: CellId::new(1, 7, 2, 99, 12345).unwrap(),
+                backend: Backend::Fullvm,
+                pid: Some(7),
+                channel,
+                cgroup: "/c".into(),
+                netns: None,
+                extra: Default::default(),
+            };
+            assert_eq!(handle_from(handle_to(&h).unwrap()).unwrap(), h);
+        }
     }
 }

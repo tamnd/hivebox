@@ -29,7 +29,8 @@ mod wal;
 pub use cell::{CellInfo, Cutoff, Status};
 pub use comb::{CellEvent, Comb, CreateRequest, Quarantined, Started, WalStats};
 pub use config::{
-    Config, ContainerBackend, FncallBackend, Images, KeeperLink, Llm, Network, ScoutLink, SiemLink,
+    Config, ContainerBackend, FncallBackend, FullvmBackend, Images, KeeperLink, Llm, Network,
+    ScoutLink, SiemLink,
 };
 pub use drain::{DrainOptions, DrainTotals, Drained, How};
 pub use metrics::Metrics;

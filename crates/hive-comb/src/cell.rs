@@ -1294,8 +1294,14 @@ pub(crate) async fn connect(
 }
 
 async fn try_connect(channel: &GuestChannel, secret: &[u8; 32]) -> io::Result<Client> {
+    let nonce = crate::comb::random();
+    let clock = now_ms().saturating_mul(1_000_000);
     let stream = match channel {
         GuestChannel::Unix(path) => UnixStream::connect(path).await?,
+        GuestChannel::VsockCid { cid, port } => {
+            let s = hive_drone::vsock::VsockStream::connect(*cid, *port).await?;
+            return Client::connect(s, secret, clock, nonce).await;
+        }
         GuestChannel::Vsock { uds, port } => {
             // Firecracker's host side of vsock: say which port, then read its OK line.
             let mut s = UnixStream::connect(uds).await?;
@@ -1309,8 +1315,6 @@ async fn try_connect(channel: &GuestChannel, secret: &[u8; 32]) -> io::Result<Cl
             reader.into_inner()
         }
     };
-    let nonce = crate::comb::random();
-    let clock = now_ms().saturating_mul(1_000_000);
     Client::connect(stream, secret, clock, nonce).await
 }
 

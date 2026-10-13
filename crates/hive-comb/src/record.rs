@@ -61,6 +61,9 @@ pub(crate) struct Handle {
     pub(crate) extra: BTreeMap<String, String>,
     #[prost(string, tag = "7")]
     pub(crate) netns: String,
+    /// A guest's vsock context id, set only for [`GuestChannel::VsockCid`].
+    #[prost(uint32, tag = "8")]
+    pub(crate) vsock_cid: u32,
 }
 
 /// The WAL key that holds the next free sequence number. Real cell ids never have every bit set,
@@ -113,15 +116,17 @@ impl Record {
 
 impl Handle {
     pub(crate) fn from_cell(h: &CellHandle) -> Self {
-        let (unix, vsock, vsock_port) = match &h.channel {
-            GuestChannel::Unix(p) => (text(p), String::new(), 0),
-            GuestChannel::Vsock { uds, port } => (String::new(), text(uds), *port),
+        let (unix, vsock, vsock_port, vsock_cid) = match &h.channel {
+            GuestChannel::Unix(p) => (text(p), String::new(), 0, 0),
+            GuestChannel::Vsock { uds, port } => (String::new(), text(uds), *port, 0),
+            GuestChannel::VsockCid { cid, port } => (String::new(), String::new(), *port, *cid),
         };
         Self {
             pid: h.pid,
             unix,
             vsock,
             vsock_port,
+            vsock_cid,
             cgroup: text(&h.cgroup),
             netns: h.netns.as_deref().map(text).unwrap_or_default(),
             extra: h.extra.clone(),
@@ -129,7 +134,10 @@ impl Handle {
     }
 
     fn to_cell(&self, id: CellId, backend: Backend) -> CellHandle {
-        let channel = if self.vsock.is_empty() {
+        // Context ids 0 to 2 are the hypervisor, loopback and the host, so a guest's is never 0.
+        let channel = if self.vsock_cid != 0 {
+            GuestChannel::VsockCid { cid: self.vsock_cid, port: self.vsock_port }
+        } else if self.vsock.is_empty() {
             GuestChannel::Unix(PathBuf::from(&self.unix))
         } else {
             GuestChannel::Vsock { uds: PathBuf::from(&self.vsock), port: self.vsock_port }
@@ -210,6 +218,14 @@ mod tests {
         };
         let stored = Handle::from_cell(&vm);
         assert_eq!(stored.to_cell(id, Backend::Microvm), vm);
+
+        let qemu = CellHandle {
+            backend: Backend::Fullvm,
+            channel: GuestChannel::VsockCid { cid: 1042, port: 52 },
+            ..vm
+        };
+        let stored = Handle::decode(Handle::from_cell(&qemu).encode_to_vec().as_slice()).unwrap();
+        assert_eq!(stored.to_cell(id, Backend::Fullvm), qemu);
     }
 
     #[test]
