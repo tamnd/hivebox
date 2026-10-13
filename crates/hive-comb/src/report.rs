@@ -4,10 +4,10 @@
 //! The comb keeps one stream open to scout and opens a new one when it breaks, waiting a little
 //! longer each time up to [`MAX_BACKOFF`]. The first report on a stream carries the layer filter,
 //! and later ones only when the mounted layers changed. On a cloud node the filter also holds the
-//! names of the images staged in `data_dir/images`, looked at again every [`STAGED_EVERY`].
+//! names of the images staged in `data_dir/images`, looked at again every `STAGED_EVERY`.
 //!
 //! Each report also counts the idle cells, the paused ones and the running ones nothing used for
-//! [`IDLE_AFTER`], and the memory they hold, which is what the rebalancer may move off a hot node.
+//! `IDLE_AFTER`, and the memory they hold, which is what the rebalancer may move off a hot node.
 
 use std::collections::HashMap;
 use std::path::Path;

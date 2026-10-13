@@ -171,12 +171,12 @@ async fn copy(
         out.flush().await?;
         Ok(BlobId::from(hash.finalize()))
     };
-    let id = match written.await {
-        Ok(id) if let Some(r) = from.recipe => {
+    let id = match (written.await, from.recipe) {
+        (Ok(id), Some(r)) => {
             crate::cas::put(store, id, &path, r.cuts(), work).await.map(|p| (id, Some(p.recipe)))
         }
-        Ok(id) => store.put(id, &path).await.map(|_| (id, None)),
-        Err(e) => Err(e),
+        (Ok(id), None) => store.put(id, &path).await.map(|_| (id, None)),
+        (Err(e), _) => Err(e),
     };
     let _ = tokio::fs::remove_file(&path).await;
     id

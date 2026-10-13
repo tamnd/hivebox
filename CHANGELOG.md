@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Every CI step passes on main again, and so the release workflow, which runs them before it builds, can publish binaries. The fixes are a rustfmt pass, four crates moved to the layer their dependencies put them in, hex ids and two netlink names kept out of the spell check, rustdoc code spans where docs linked private items or held a bare URL or angle brackets, a tuple match in place of an `if let` guard that Rust 1.88 does not have, the yanked `yoke-derive` 0.8.3 moved to 0.8.4, MPL-2.0 allowed for pathrs under youki, and the two unmaintained build time macros, paste and proc-macro-error2, noted in deny.toml.
+
 ## 0.0.45
 
 Rollouts that wait for room.

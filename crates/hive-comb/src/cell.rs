@@ -8,11 +8,11 @@
 use crate::admit::Reservation;
 use crate::comb::Inner;
 use crate::record::{Handle, Record, now_ms, time};
+#[cfg(target_os = "linux")]
+use hive_cell::tree::Precopy;
 use hive_cell::{
     CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, RootfsPlan, Slot, cgroup,
 };
-#[cfg(target_os = "linux")]
-use hive_cell::tree::Precopy;
 use hive_drone::Client;
 use hive_guard::wire::Veth;
 use hive_nectar::BlobId;
@@ -232,11 +232,7 @@ impl Cell {
 pub(crate) enum Start {
     /// A new cell. The answer goes to `done` once it is running or has failed.
     /// With a seed, the cell's writable layer starts with what that directory holds.
-    Create {
-        secret: [u8; 32],
-        seed: Option<PathBuf>,
-        done: oneshot::Sender<Result<(), Error>>,
-    },
+    Create { secret: [u8; 32], seed: Option<PathBuf>, done: oneshot::Sender<Result<(), Error>> },
     /// A cell from before a restart, found with this record. `done` is told once the cell is
     /// running again, or has been cleaned up.
     Recover { record: Box<Record>, done: oneshot::Sender<()> },

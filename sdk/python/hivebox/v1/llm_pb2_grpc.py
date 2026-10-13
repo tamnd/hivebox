@@ -28,7 +28,7 @@ if _version_not_supported:
 
 class LlmStub:
     """The LLM gateway each node runs for cells with the `llm` network profile, which reach it at
-    http://llm.hive.internal. It forwards OpenAI and Anthropic style calls to the project's
+    `http://llm.hive.internal`. It forwards OpenAI and Anthropic style calls to the project's
     inference engine with the engine's key, which the cell never sees, and keeps the token ids of
     each call for the trainer.
     """
@@ -58,7 +58,7 @@ class LlmStub:
 
 class LlmServicer:
     """The LLM gateway each node runs for cells with the `llm` network profile, which reach it at
-    http://llm.hive.internal. It forwards OpenAI and Anthropic style calls to the project's
+    `http://llm.hive.internal`. It forwards OpenAI and Anthropic style calls to the project's
     inference engine with the engine's key, which the cell never sees, and keeps the token ids of
     each call for the trainer.
     """
@@ -113,7 +113,7 @@ def add_LlmServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class Llm:
     """The LLM gateway each node runs for cells with the `llm` network profile, which reach it at
-    http://llm.hive.internal. It forwards OpenAI and Anthropic style calls to the project's
+    `http://llm.hive.internal`. It forwards OpenAI and Anthropic style calls to the project's
     inference engine with the engine's key, which the cell never sees, and keeps the token ids of
     each call for the trainer.
     """
