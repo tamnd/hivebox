@@ -73,6 +73,13 @@ impl Client {
         self.channel.is_closed()
     }
 
+    /// Whether a call is still open, such as a command that has not finished or a file that is
+    /// still being read.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.channel.open_streams() > 0
+    }
+
     /// Waits until the connection has gone.
     pub async fn closed(&self) {
         self.channel.closed().await;

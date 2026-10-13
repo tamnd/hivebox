@@ -439,6 +439,73 @@ async fn idle_cells_pause_while_the_node_is_short_of_memory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_cell_in_the_middle_of_a_command_is_not_idle() {
+    let s = Scratch::new();
+    let psi = s.0.join("memory.pressure");
+    let pressure = |avg10: f64| {
+        let text = format!(
+            "some avg10={avg10:.2} avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"
+        );
+        std::fs::write(&psi, text).unwrap();
+    };
+    pressure(0.0);
+    let fake = Arc::new(Fake::default());
+    let cfg = Config {
+        psi_stop_admit: 0.20,
+        psi_source: Some(psi.clone()),
+        pressure_idle: Duration::from_millis(300),
+        trim_idle: Duration::from_millis(300),
+        ..config(&s.0)
+    };
+    let comb = open(cfg, &fake).await;
+    let squeezed = comb.create(request(spec("python"))).await.unwrap().id;
+    let mut stops = spec("python");
+    stops.idle_ttl = Some(Duration::from_millis(300));
+    stops.idle_action = IdleAction::Stop;
+    let stops = comb.create(request(stops)).await.unwrap().id;
+
+    // The comb reads the pressure once a second. Both cells are kept in use until it has, and the
+    // node turning a cell away shows the brake is on.
+    pressure(35.0);
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        echo(&comb, squeezed, "busy").await;
+        echo(&comb, stops, "busy").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let e = comb.create(request(spec("python"))).await.unwrap_err();
+    assert_eq!(e.reason, Reason::CapacityUnavailable);
+
+    // Each command runs for several times every idle timer, and neither cell is paused, stopped
+    // or trimmed under it.
+    let slow = |id| {
+        let (comb, fake) = (&comb, &fake);
+        async move {
+            let drone = comb.drone(id).await.unwrap();
+            let trims = fake.with(id, |g| g.trims);
+            let req = RunRequest {
+                command: Some(Command { shell: "sleep 2; echo done".into(), ..Command::default() }),
+                ..RunRequest::default()
+            };
+            let r = tokio::time::timeout(Duration::from_secs(20), drone.run(&req)).await;
+            let out =
+                String::from_utf8(r.expect("the command never ended").unwrap().stdout.to_vec());
+            assert_eq!(out.unwrap(), "done\n");
+            assert_eq!(comb.get(id).unwrap().status.state, CellState::Running, "{id}");
+            assert!(!fake.with(id, |g| g.paused), "{id}");
+            assert_eq!(fake.with(id, |g| g.trims), trims, "{id}");
+        }
+    };
+    tokio::join!(slow(squeezed), slow(stops));
+
+    // Once the command is done the cells are idle again.
+    reaches(&comb, squeezed, CellState::Paused).await;
+    let stopped = reaches(&comb, stops, CellState::Stopped).await;
+    assert_eq!(stopped.status.cause, Some(Cause::Idle));
+    comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_cells_give_back_their_page_cache() {
     let s = Scratch::new();
     let fake = Arc::new(Fake::default());

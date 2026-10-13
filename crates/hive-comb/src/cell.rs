@@ -214,6 +214,12 @@ impl Cell {
         self.last_active_ms.fetch_max(now_ms(), Ordering::Relaxed);
     }
 
+    /// Whether a call to the guest agent is still open. A cell in the middle of a long command is
+    /// in use however long ago the command started, so none of the idle timers may touch it.
+    pub(crate) fn busy(&self) -> bool {
+        self.drone.read().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(Client::busy)
+    }
+
     /// How long since anything used the cell.
     pub(crate) fn quiet_for(&self) -> Duration {
         Duration::from_millis(now_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed)))
@@ -717,12 +723,22 @@ impl Actor {
                             if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
                                 continue;
                             }
+                            if self.cell.busy() {
+                                self.cell.touch();
+                                continue;
+                            }
                             self.trim().await;
                         }
                         Timer::Squeeze => {
                             if !*self.inner.pressure.borrow()
                                 || self.next_timer().is_some_and(|(at, _)| at > Instant::now())
                             {
+                                continue;
+                            }
+                            // Freezing a cell in the middle of a command would hold the command
+                            // until something resumes the cell, and nothing would.
+                            if self.cell.busy() {
+                                self.cell.touch();
                                 continue;
                             }
                             if self.pause().await.is_ok() {
@@ -739,6 +755,10 @@ impl Actor {
                         Timer::Idle => {
                             // The cell was used while the timer slept, so it is not idle after all.
                             if self.next_timer().is_some_and(|(at, _)| at > Instant::now()) {
+                                continue;
+                            }
+                            if self.cell.busy() {
+                                self.cell.touch();
                                 continue;
                             }
                             if self.cell.spec.idle_action == IdleAction::Pause && self.driver.caps().pause {

@@ -123,6 +123,13 @@ impl Channel {
         let _ = rx.wait_for(|&gone| gone).await;
     }
 
+    /// How many streams are open on the channel, from either end. A stream counts until it has
+    /// ended both ways and been dropped, or was reset.
+    #[must_use]
+    pub fn open_streams(&self) -> usize {
+        self.shared.table().len()
+    }
+
     /// Opens a stream calling `method` with `request`. The request must fit in one frame with
     /// the method name. Anything bigger goes as data on the stream.
     pub async fn open(&self, method: &str, request: Bytes) -> Result<Stream, Error> {
