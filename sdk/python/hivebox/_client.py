@@ -35,6 +35,29 @@ _WRITE_CHUNK = 1 << 20
 _MAX_MESSAGE = 256 << 20
 # Tries for a call that is safe to repeat, when the failure was hivebox's.
 _TRIES = 3
+# The first and the longest pause between tries of a call the node had no room for.
+_ROOM_FIRST, _ROOM_MAX = 0.2, 5.0
+
+
+async def _with_room(call, wait: float):
+    """Awaits `call()` again while the node has no room for it, for up to `wait` seconds. A call
+    turned away for room did nothing on the node, so trying it again is safe, and the room comes
+    back as the caller's other cells end. A verify turned away says so in its `error` rather than
+    raising, and that counts too."""
+    loop = asyncio.get_running_loop()
+    deadline, pause = loop.time() + wait, _ROOM_FIRST
+    while True:
+        try:
+            out = await call()
+            if not isinstance(getattr(out, "error", None), _errors.CapacityUnavailable):
+                return out
+            if loop.time() + pause > deadline:
+                return out
+        except _errors.CapacityUnavailable:
+            if loop.time() + pause > deadline:
+                raise
+        await asyncio.sleep(pause)
+        pause = min(pause * 2, _ROOM_MAX)
 
 
 def _seconds(v: float | str | None) -> duration_pb2.Duration | None:
@@ -340,7 +363,7 @@ class AsyncHive:
                      protected_paths: Iterable[str] = (), files: Mapping[str, bytes | str] | None = None,
                      repeats: int = 1, timeout: float | str | None = None, report: str | None = None,
                      must_pass: Iterable[str] = (), grader: str | None = None, task: bytes | str = b"",
-                     grader_files: Iterable[str] = ()) -> VerifyResult:
+                     grader_files: Iterable[str] = (), capacity_wait: float = 0) -> VerifyResult:
         """Checks the changes `subject` made to the git checkout at `workdir` in a fresh cell
         made from `verifier`, with no network, and runs `argv` there `repeats` times. Changes to
         `protected_paths`, globs like tests/** under `workdir`, are left out and reported in
@@ -352,7 +375,10 @@ class AsyncHive:
         passes on its exit code alone. `grader` names a reward plugin on the node, which is given
         every run's output, `task` and the files in `grader_files` as they were after the last run,
         and whose reward comes back in `reward`. A check that could not be done returns with
-        `error` set rather than raising, unless the request itself was wrong."""
+        `error` set rather than raising, unless the request itself was wrong. With
+        `capacity_wait`, a check the node has no room for is tried again for up to that many
+        seconds before its CAPACITY_UNAVAILABLE comes back, which suits a trainer whose own
+        verifies are what fill the node."""
         if isinstance(argv, str):
             raise _errors.InvalidArgument("argv is a list, like [\"bash\", \"-c\", script]")
         subject_id = subject.id if isinstance(subject, Cell) else (subject or "")
@@ -371,7 +397,11 @@ class AsyncHive:
             task=task.encode() if isinstance(task, str) else task,
             grader_files=list(grader_files),
         )
-        return VerifyResult._from(await self._call(self._verify.Run, req))
+
+        async def run() -> VerifyResult:
+            return VerifyResult._from(await self._call(self._verify.Run, req))
+
+        return await _with_room(run, capacity_wait)
 
     async def snapshot(self, cell: Cell | str, *, scrub: bool = False, allow: Iterable[str] = (),
                        squash_git: Iterable[str] = ()) -> str:
@@ -483,12 +513,19 @@ class Cells:
     def __init__(self, hive: AsyncHive):
         self._hive = hive
 
-    async def create(self, spec: Spec, *, idempotency_key: str = "") -> Cell:
-        """Makes one cell and returns once it is running."""
-        [result] = await self._create(spec, 1, idempotency_key)
-        if isinstance(result, Exception):
-            raise result
-        return result
+    async def create(self, spec: Spec, *, idempotency_key: str = "", capacity_wait: float = 0) -> Cell:
+        """Makes one cell and returns once it is running. With `capacity_wait`, a cell the node
+        has no room for is asked for again for up to that many seconds. A node that turned an
+        idempotency key away for room keeps doing so for a while, so the wait is for cells made
+        without one."""
+
+        async def make() -> Cell:
+            [result] = await self._create(spec, 1, idempotency_key)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return await _with_room(make, capacity_wait)
 
     def create_many(self, spec: Spec, count: int, *, idempotency_key: str = "") -> CellGroup:
         """Makes `count` cells at once. Await it for the cells, or use it as an async context

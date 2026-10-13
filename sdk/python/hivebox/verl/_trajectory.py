@@ -15,6 +15,10 @@ from .._client import AsyncHive, Cell, Session, Spec, VerifyResult
 # How long a cell may outlive the trajectory's budget, for the verifier to take its diff. A
 # cell nobody stops, because the worker died or no loop ran, ends at that point anyway.
 GRACE_S = 900
+# How long a cell or a verify the node has no room for is asked for again, by default. The room
+# is most often taken by the trainer's own samples, which give it back as they end, and a sample
+# masked for it throws away a rollout the trainer already paid for.
+CAPACITY_WAIT_S = 300
 
 # Set by HiveAgentLoop for the trajectory it runs. The tools' calls run in tasks made inside the
 # loop's run, so they see it too.
@@ -86,6 +90,10 @@ class Trajectory:
     def command_timeout(self) -> float:
         return float(self.task.get("limits", {}).get("command_timeout_s", 600))
 
+    @property
+    def capacity_wait(self) -> float:
+        return float(self.task.get("limits", {}).get("capacity_wait_s", CAPACITY_WAIT_S))
+
     async def get_cell(self) -> Cell:
         async with self._lock:
             if self.closed:
@@ -97,7 +105,7 @@ class Trajectory:
                     labels["task"] = str(self.task["task_id"])[:256]
                 s = spec(self.task["image"], self.task.get("cell"), labels=labels,
                          hard_ttl=float(limits.get("max_wall_s", 1800)) + GRACE_S)
-                self.cell = await self.hive.cells.create(s)
+                self.cell = await self.hive.cells.create(s, capacity_wait=self.capacity_wait)
             return self.cell
 
     async def shell(self, command: str, timeout: float) -> tuple[str, int, bool]:
@@ -144,6 +152,7 @@ class Trajectory:
                     grader=v.get("grader"),
                     task=v.get("task", ""),
                     grader_files=v.get("grader_files", ()),
+                    capacity_wait=self.capacity_wait,
                 )
             except _errors.HiveError as e:
                 self.error = e
@@ -184,7 +193,7 @@ class Trajectory:
             "hive_tampered": len(r.tampered) if r else 0,
             "hive_submitted": self.submitted,
             "hive_verify_s": round(self.verify_s, 3),
-            "hive_error": f"{err.reason}: {err}" if err else "",
+            "hive_error": str(err) if err else "",
         }
 
     async def close(self) -> None:

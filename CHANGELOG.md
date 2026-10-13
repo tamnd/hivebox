@@ -4,6 +4,9 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Rollouts wait for room instead of masking the sample. `verify` and `cells.create` in the Python SDK take `capacity_wait`, the seconds to keep asking when the node turns the call away with CAPACITY_UNAVAILABLE, which does nothing on the node. The verl adapter, the slime grader and `hive-pollen` use it for their sample cells and verifies, for up to 300 seconds by default (`limits.capacity_wait_s` in a task, `capacity_wait_s` on `slime.Grader`). On server3 with 16 samples in flight, 512 MiB sample cells and 1 GiB verifiers, the verifiers passed the node's admission ceiling: `hive-pollen` masked 12 of 32 samples without the wait and none with it, and a 16 step GRPO run through the verl adapter masked 80 of 256 without it and none with it, every reward right either way.
+- The verl adapter's `hive_error` no longer names the reason twice.
+
 ## 0.0.44
 
 The fullvm backend on QEMU, and operator docs.

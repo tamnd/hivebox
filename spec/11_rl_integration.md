@@ -41,6 +41,8 @@ On server3 at a load average of 45 to 70, with two tasks of eight samples on the
 
 The verifier is most of each sample's time, and it slows down as more run at once on the 8 core host, so the gain from 4 to 8 is smaller than from 1 to 4.
 
+A sample cell or a verify the node turns away for room, CAPACITY_UNAVAILABLE, is asked for again for up to the task's `limits.capacity_wait_s`, 300 seconds by default, with pauses from 0.2 s doubling to 5 s. A call turned away for room did nothing on the node, and the room is most often taken by the worker's own samples, which give it back as they end, while a masked sample throws away a rollout the trainer already paid for. The verl adapter and the slime grader do the same through `capacity_wait` in the Python SDK. On server3 at load 43 to 54, with two tasks of 16 samples, 16 sample cells in flight and 1 GiB verifiers, which passes the node's admission ceiling: without the wait 12 of the 32 samples were masked and the run took 20.4 s, and with it none were and it took 37.7 s, with the right reward on all 32.
+
 ## 3. Trainer adapters
 
 | Framework | Integration point | Notes |

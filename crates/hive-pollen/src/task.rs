@@ -62,11 +62,14 @@ pub struct Limits {
     pub max_wall_s: u64,
     /// Seconds one command may take.
     pub command_timeout_s: u64,
+    /// Seconds to keep asking for a sample cell or a verify the node has no room for. The room
+    /// is most often taken by the worker's own samples, which give it back as they end.
+    pub capacity_wait_s: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_turns: 50, max_wall_s: 1800, command_timeout_s: 600 }
+        Self { max_turns: 50, max_wall_s: 1800, command_timeout_s: 600, capacity_wait_s: 300 }
     }
 }
 
@@ -77,6 +80,10 @@ impl Limits {
 
     pub(crate) fn command(&self) -> Duration {
         Duration::from_secs(self.command_timeout_s)
+    }
+
+    pub(crate) fn capacity_wait(&self) -> Duration {
+        Duration::from_secs(self.capacity_wait_s)
     }
 }
 

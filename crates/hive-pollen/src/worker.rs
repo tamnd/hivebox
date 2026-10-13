@@ -6,7 +6,7 @@ use crate::task::{Size, Task};
 use crate::trajectory::{self, Report, Timings, Trajectory, Turn};
 use futures::stream::{self, StreamExt};
 use hive_proto::convert;
-use hive_sdk::{Backend, Cell, CellSpec, Client, Command, Error, Resources, Source, v1};
+use hive_sdk::{Backend, Cell, CellSpec, Client, Command, Error, Reason, Resources, Source, v1};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
@@ -14,6 +14,9 @@ use tokio::sync::{Semaphore, mpsc};
 /// How long a sample cell may outlive the agent's budget, for the verifier to take its diff. A
 /// cell the worker could not stop, because the worker died, ends at that point anyway.
 const GRACE: Duration = Duration::from_secs(900);
+/// The first and the longest pause between asks for room the node did not have.
+const ROOM_FIRST: Duration = Duration::from_millis(200);
+const ROOM_MAX: Duration = Duration::from_secs(5);
 
 /// Runs tasks with at most a set number of sample cells alive at once, so a trainer whose
 /// inference is the bottleneck does not leave cells idle. Verifier cells come on top of that, at
@@ -70,12 +73,8 @@ impl Worker {
         permit.forget();
         let queue_ms = ms(start.elapsed());
         let t = Instant::now();
-        let made = self.client.create_many(&sample_spec(task), n, None).await;
+        let cells = self.create(task, n).await;
         let create_ms = ms(t.elapsed());
-        let cells = match made {
-            Ok(cells) => cells,
-            Err(e) => (0..n).map(|_| Err(e.clone())).collect(),
-        };
         stream::iter(cells.into_iter().zip(first..))
             .for_each_concurrent(None, |(cell, i)| async move {
                 let timings = Timings { queue_ms, create_ms, ..Timings::default() };
@@ -88,6 +87,60 @@ impl Worker {
                 let _ = out.send(tr).await;
             })
             .await;
+    }
+
+    /// Makes `n` sample cells, and asks again for those the node had no room for until the
+    /// task's `capacity_wait_s` is up. A cell turned away for room was never made, so asking again
+    /// makes no extra cells.
+    async fn create(&self, task: &Task, n: u32) -> Vec<Result<Cell, Error>> {
+        let spec = sample_spec(task);
+        let deadline = Instant::now() + task.limits.capacity_wait();
+        let mut pause = ROOM_FIRST;
+        let mut cells: Vec<Result<Cell, Error>> = Vec::new();
+        let mut want: Vec<usize> = (0..n as usize).collect();
+        loop {
+            let count = u32::try_from(want.len()).unwrap_or(u32::MAX);
+            let made = match self.client.create_many(&spec, count, None).await {
+                Ok(made) => made,
+                Err(e) => want.iter().map(|_| Err(e.clone())).collect(),
+            };
+            if cells.is_empty() {
+                cells = made;
+            } else {
+                for (i, c) in want.iter().zip(made) {
+                    cells[*i] = c;
+                }
+            }
+            want = (0..cells.len()).filter(|i| no_room(&cells[*i])).collect();
+            if want.is_empty() || Instant::now() + pause > deadline {
+                return cells;
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(ROOM_MAX);
+        }
+    }
+
+    /// Verifies the sample in `cell`, and asks again while the node has no room for the
+    /// verifier until the task's `capacity_wait_s` is up. The subject's diff is only read, so
+    /// a verify turned away for room changed nothing.
+    async fn verify(&self, task: &Task, cell: &Cell) -> Result<v1::VerifyResult, Error> {
+        let deadline = Instant::now() + task.limits.capacity_wait();
+        let mut pause = ROOM_FIRST;
+        loop {
+            let out = self.client.verify(verify_request(task, cell.id())).await;
+            let refused = match &out {
+                Ok(r) => r
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.reason == Reason::CapacityUnavailable.as_str()),
+                Err(e) => e.reason == Reason::CapacityUnavailable,
+            };
+            if !refused || Instant::now() + pause > deadline {
+                return out;
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(ROOM_MAX);
+        }
     }
 
     /// Drives the agent in `cell`, verifies what it did and stops the cell.
@@ -143,7 +196,7 @@ impl Worker {
             set_error(&mut tr, &e);
         } else {
             let t = Instant::now();
-            match self.client.verify(verify_request(task, cell.id())).await {
+            match self.verify(task, cell).await {
                 Ok(r) => {
                     if r.error.is_none() {
                         graded = Some(r.reward);
@@ -199,6 +252,10 @@ fn failed(task: &Task, i: u32, e: &Error, timings: Timings) -> Trajectory {
     set_error(&mut tr, e);
     tr.reward = trajectory::reward(tr.is_infra_error, false, false, true);
     tr
+}
+
+fn no_room(c: &Result<Cell, Error>) -> bool {
+    matches!(c, Err(e) if e.reason == Reason::CapacityUnavailable)
 }
 
 fn set_error(tr: &mut Trajectory, e: &Error) {
