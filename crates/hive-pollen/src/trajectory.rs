@@ -73,11 +73,12 @@ pub struct Report {
 pub struct Timings {
     /// Waiting for room under the worker's cell limit.
     pub queue_ms: u64,
-    /// Making the sample cells, for the whole batch the sample was in.
+    /// Making the sample cells, for the whole batch the sample was in, with any wait for the
+    /// node to have room.
     pub create_ms: u64,
     /// The agent's turns.
     pub agent_ms: u64,
-    /// The verifier, from the diff to the last run.
+    /// The verifier, from the diff to the last run, with any wait for the node to have room.
     pub verify_ms: u64,
     /// From the worker taking the task to the trajectory.
     pub total_ms: u64,

@@ -61,13 +61,16 @@ class EvalResult(tuple):
 @dataclass
 class Grader:
     """How the verifier cell is made and how often the tests run. `hive` defaults to a client
-    made from $HIVE_ENDPOINT, $HIVE_TOKEN and $HIVE_PROJECT."""
+    made from $HIVE_ENDPOINT, $HIVE_TOKEN and $HIVE_PROJECT. A grading the node has no room
+    for is asked for again for up to `capacity_wait_s` seconds, as the room is most often taken by
+    the rollout's own sandboxes and comes back as they end."""
 
     hive: AsyncHive | None = None
     backend: str = "container"
     mem_mib: int = 2048
     cpu_milli: int = 2000
     repeats: int = 1
+    capacity_wait_s: float = 300
 
     def __post_init__(self):
         self._clients: dict[int, AsyncHive] = {}
@@ -131,6 +134,7 @@ async def run_evaluation(md: Mapping[str, Any], *, diff_text: str, timeout_sec: 
         files=files,
         repeats=g.repeats,
         timeout=timeout_sec,
+        capacity_wait=g.capacity_wait_s,
     )
     if r.error is not None:
         raise r.error

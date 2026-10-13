@@ -98,3 +98,32 @@ async def test_allowed_paths_need_scrubbing():
     with pytest.raises(hivebox.InvalidArgument):
         await hive.snapshot("c-1", allow=["tests"])
     await hive.close()
+
+
+async def test_a_call_the_node_has_no_room_for_is_asked_again(monkeypatch):
+    from hivebox.v1 import types_pb2, verify_pb2
+
+    monkeypatch.setattr(_client, "_ROOM_FIRST", 0.01)
+    full = _client.VerifyResult._from(verify_pb2.VerifyResult(
+        error=types_pb2.Error(reason="CAPACITY_UNAVAILABLE", message="full", is_infra_error=True)))
+    done = _client.VerifyResult._from(verify_pb2.VerifyResult(passed=True))
+    answers = [full, _errors.make("CAPACITY_UNAVAILABLE", "full"), done]
+    calls = []
+
+    async def call():
+        calls.append(1)
+        a = answers[len(calls) - 1]
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    assert (await _client._with_room(call, 5)) is done and len(calls) == 3
+    # No wait is one call, and the refusal comes back as it was.
+    calls.clear()
+    assert (await _client._with_room(call, 0)) is full and len(calls) == 1
+    # Only a refusal for room is asked again.
+    calls.clear()
+    answers[0] = _errors.make("CELL_LOST", "gone")
+    with pytest.raises(hivebox.CellLost):
+        await _client._with_room(call, 5)
+    assert len(calls) == 1

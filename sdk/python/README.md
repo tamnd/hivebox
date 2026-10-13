@@ -61,7 +61,7 @@ r = await hive.verify(["python", "solve.py"], verifier=Spec(image="python"), wor
                       grader="oj-checker", task=expected_output, grader_files=["answer.txt"])
 ```
 
-Every failure raises a subclass of `HiveError` named after its reason, like `CellNotFound`, with `is_infra_error` set when the failure was hivebox's and not the command's. A file that is missing raises `FileError`, which is also a `FileNotFoundError`, and the same goes for the other common errno values. Calls that are safe to repeat are tried up to three times when the failure was hivebox's.
+Every failure raises a subclass of `HiveError` named after its reason, like `CellNotFound`, with `is_infra_error` set when the failure was hivebox's and not the command's. A file that is missing raises `FileError`, which is also a `FileNotFoundError`, and the same goes for the other common errno values. Calls that are safe to repeat are tried up to three times when the failure was hivebox's. `verify` and `cells.create` also take `capacity_wait`, the seconds to keep asking when the node has no room, which is CAPACITY_UNAVAILABLE and does nothing on the node. A trainer whose own samples fill the node wants this, since the room comes back as they end.
 
 ## verl
 
@@ -97,7 +97,7 @@ tools:
 
 Set `agent_name` to `hive_agent` in the dataset, or `actor_rollout_ref.rollout.agent.default_agent_loop` to `hive_agent`. The `task` in the tool config holds the defaults, and a row's `extra_info["hive"]` goes on top of them, so a row only carries what differs, such as `task_id`, `image` or `verify.files` with its hidden tests. The task has the same shape as a `hive-pollen` task. The token comes from `$HIVE_TOKEN`.
 
-The three tools share the trajectory's cell, made on the first tool call, and `bash` keeps one shell, so `cd` and `export` carry over between calls. `submit` checks the changes with `Verify.Run` and only tells the model they were submitted. When the loop ends, `HiveAgentLoop` checks a trajectory that never called `submit` (set `verify_unsubmitted: false` in the task to give it 0 instead), sets `reward_score` to 1 or 0, stops the cell and adds `hive_cell`, `hive_passed`, `hive_infra_error`, `hive_tampered`, `hive_submitted`, `hive_verify_s` and `hive_error` to the sample's extra fields. A sample hivebox failed gets 0 with `hive_infra_error` set, so the trainer can mask it.
+The three tools share the trajectory's cell, made on the first tool call, and `bash` keeps one shell, so `cd` and `export` carry over between calls. `submit` checks the changes with `Verify.Run` and only tells the model they were submitted. When the loop ends, `HiveAgentLoop` checks a trajectory that never called `submit` (set `verify_unsubmitted: false` in the task to give it 0 instead), sets `reward_score` to 1 or 0, stops the cell and adds `hive_cell`, `hive_passed`, `hive_infra_error`, `hive_tampered`, `hive_submitted`, `hive_verify_s` and `hive_error` to the sample's extra fields. A sample hivebox failed gets 0 with `hive_infra_error` set, so the trainer can mask it. A cell or a verify the node has no room for is asked for again for up to `limits.capacity_wait_s` seconds, 300 by default, before the sample is failed, since masking it would throw away a rollout the trainer already paid for.
 
 The tools also work in verl's plain `tool_agent` loop. There they find the trajectory by verl's request id, `submit` stops the cell, and the reward is the `submit` call's tool reward. A trajectory that never submits is not checked, and its cell ends at its hard TTL, the task's `max_wall_s` plus 15 minutes.
 
@@ -112,7 +112,7 @@ from hivebox import slime
 slime.install(swe, slime.Grader(mem_mib=2048, cpu_milli=2000, repeats=1))
 ```
 
-`install` swaps `swe.run_evaluation`, which `generate.py` calls, and keeps slime's grader for swepro and SWE-bench tasks. The client comes from `$HIVE_ENDPOINT` and `$HIVE_TOKEN`. When hivebox cannot do the check, `run_evaluation` raises `HiveError`, and `generate` aborts the sample so it is left out of training. The result is still `(reward, applied_cleanly)`, with the verdict in `.verdict` for the test counts and timings. One difference: slime runs the tests as its `agent` user, and the verifier runs them as the cell's default user.
+`install` swaps `swe.run_evaluation`, which `generate.py` calls, and keeps slime's grader for swepro and SWE-bench tasks. The client comes from `$HIVE_ENDPOINT` and `$HIVE_TOKEN`. When hivebox cannot do the check, `run_evaluation` raises `HiveError`, and `generate` aborts the sample so it is left out of training. A check the node has no room for is asked for again for up to the grader's `capacity_wait_s`, 300 seconds by default, before that. The result is still `(reward, applied_cleanly)`, with the verdict in `.verdict` for the test counts and timings. One difference: slime runs the tests as its `agent` user, and the verifier runs them as the cell's default user.
 
 ## SWE-ReX
 
