@@ -73,15 +73,21 @@ jobs:
           - name: linux x86-64, debug
             os: ubuntu-24.04
             profile: dev
+            packages: --workspace
           - name: linux x86-64, release
             os: ubuntu-24.04
             profile: release
+            packages: --workspace
           - name: linux arm64
             os: ubuntu-24.04-arm
             profile: dev
+            packages: --workspace
+          # The node side needs Linux (Landlock, seccomp, cgroups, eBPF), so on macOS only the
+          # client crates are built, the same ones the release builds for it.
           - name: macos arm64
             os: macos-26
             profile: dev
+            packages: -p hivectl -p hive-sdk -p hive-proto -p hive-types -p hive-telemetry
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,11 +99,11 @@ jobs:
         with:
           tool: cargo-nextest
       - name: cargo nextest
-        run: cargo nextest run --workspace --all-features --cargo-profile ${{ matrix.profile }}
+        run: cargo nextest run ${{ matrix.packages }} --all-features --cargo-profile ${{ matrix.profile }}
       # nextest does not run doctests, and an example in the docs that does not compile is a
       # broken promise on the first page anybody reads.
       - name: doctests
-        run: cargo test --workspace --all-features --doc --profile ${{ matrix.profile }}
+        run: cargo test ${{ matrix.packages }} --all-features --doc --profile ${{ matrix.profile }}
 
   docs:
     name: documentation

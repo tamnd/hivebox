@@ -861,7 +861,17 @@ mod tests {
         assert_eq!(lazy.read_at(0, 10).await.unwrap(), bytes[..10]);
         assert_eq!(lazy.read_at(8 * CHUNK, 10).await.unwrap(), bytes[8 * c..8 * c + 10]);
         assert_eq!(lazy.progress().have, 2 * DEMAND);
-        tokio::time::sleep(FLUSH_AFTER * 4).await;
+        // The flush syncs the part file before it writes the map, and on a slow disk that takes
+        // longer than FLUSH_AFTER, so wait for the map on disk to have both reads in it.
+        let map = dir.join("l1").join(format!("{blob}.map"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let flushed = || {
+            std::fs::read(&map).unwrap()[4..].iter().map(|b| u64::from(b.count_ones())).sum::<u64>()
+        };
+        while flushed() < 2 * DEMAND {
+            assert!(std::time::Instant::now() < deadline, "the map was never flushed");
+            tokio::time::sleep(FLUSH_AFTER).await;
+        }
         drop(lazy);
         drop(cache);
 
