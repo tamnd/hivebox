@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- A wasm run waits for an instance when every one in the engine's pool is in use, instead of failing with exit 126 because the program could not start. The wait counts against the run's timeout, and a run still waiting when its cell stops gets CELL_NOT_RUNNING as before. The size of the pool is `instances` in the wasm backend's config. Found by the CI test that runs 64 commands at once on a pool of 32.
+
 - A cell in the middle of a long command is no longer idle. The pressure brake paused any cell that had not been called for 30 s, so a test run of several minutes was frozen halfway and its command never came back, and the idle TTL and the page cache trim had the same blind spot. Each now passes over a cell while a call to its guest agent is still open. Found on the first SWE-bench Verified run on a node, where one pytest run sat frozen for five hours.
 
 ## 0.0.46

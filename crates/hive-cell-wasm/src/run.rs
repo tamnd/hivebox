@@ -19,7 +19,7 @@ use hive_drone::{Ring, Runner};
 use hive_proto::drone::api::{RunRequest, RunResult};
 use hive_types::{Error, Reason};
 use tokio::io::AsyncWrite;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::{OnceCell, Semaphore, watch};
 use wasmtime::{Engine, InstancePre, Linker, Module, ResourceLimiter, Store, Trap};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::p2::pipe::MemoryInputPipe;
@@ -45,6 +45,9 @@ pub(crate) struct Shared {
     pub(crate) modules: PathBuf,
     pub(crate) mounts: Vec<(String, PathBuf)>,
     programs: Mutex<HashMap<String, Arc<Entry>>>,
+    // One for each instance the engine's pool has room for, held by a run from before it makes
+    // its instance until its store is gone.
+    slots: Semaphore,
 }
 
 impl fmt::Debug for Shared {
@@ -79,8 +82,16 @@ impl Shared {
         linker: Linker<Ctx>,
         modules: PathBuf,
         mounts: Vec<(String, PathBuf)>,
+        instances: usize,
     ) -> Self {
-        Self { engine, linker, modules, mounts, programs: Mutex::new(HashMap::new()) }
+        Self {
+            engine,
+            linker,
+            modules,
+            mounts,
+            programs: Mutex::new(HashMap::new()),
+            slots: Semaphore::new(instances),
+        }
     }
 
     /// The program called `name`, from `name.wasm` in the modules directory. The first cell to
@@ -350,6 +361,25 @@ impl CellInner {
         } else {
             Duration::from_millis(c.timeout_ms)
         };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut stopped = self.stopped.clone();
+        // With every instance of the pool in use, a run waits for one to come back rather than
+        // failing to start, and the wait counts against its timeout.
+        let slot = tokio::select! {
+            s = tokio::time::timeout_at(deadline, self.shared.slots.acquire()) => s,
+            _ = stopped.wait_for(|s| *s) => {
+                return Err(Error::new(Reason::CellNotRunning, "the cell stopped"));
+            }
+        };
+        let Ok(Ok(_slot)) = slot else {
+            return Ok(RunResult {
+                exit_code: -1,
+                signal: SIGKILL,
+                timed_out: true,
+                wall_nanos: started.elapsed().as_nanos() as u64,
+                ..RunResult::default()
+            });
+        };
         let (out, err) = (Capture::new(limit), Capture::new(limit));
         let wasi = {
             let mut b = WasiCtxBuilder::new();
@@ -376,7 +406,6 @@ impl CellInner {
         // and can be cut off at its timeout or when its cell stops.
         store.epoch_deadline_async_yield_and_update(1);
         let _running = Running::new(&self.usage);
-        let mut stopped = self.stopped.clone();
         let call = Metered {
             inner: Box::pin(async {
                 let instance = match program.pre.instantiate_async(&mut store).await {
@@ -400,7 +429,7 @@ impl CellInner {
             usage: &self.usage,
         };
         let ended = tokio::select! {
-            r = tokio::time::timeout(timeout, call) => r.map_err(|_| Cut::TimedOut),
+            r = tokio::time::timeout_at(deadline, call) => r.map_err(|_| Cut::TimedOut),
             _ = stopped.wait_for(|s| *s) => Err(Cut::Stopped),
         };
         drop(store);

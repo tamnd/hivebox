@@ -360,5 +360,11 @@ async fn many_cells_run_at_once() {
         .flat_map(|c| (0..8).map(move |_| async move { c.run(&shell("hello")).await }));
     let results = futures::future::join_all(runs).await;
     assert_eq!(results.len(), 64);
-    assert!(results.iter().all(|r| r.as_ref().is_ok_and(|r| r.exit_code == 0)));
+    // There are more runs than the pool has instances, so some of them wait for a slot.
+    let failed: Vec<_> = results
+        .iter()
+        .filter(|r| !r.as_ref().is_ok_and(|r| r.exit_code == 0))
+        .map(|r| r.as_ref().map(|r| String::from_utf8_lossy(&r.stderr).into_owned()))
+        .collect();
+    assert!(failed.is_empty(), "{failed:?}");
 }
