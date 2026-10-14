@@ -15,7 +15,10 @@
 //! from stdin. It then hardens itself with seccomp before it serves anything.
 //!
 //! libcontainer clones, so the containers are made by worker processes with one thread each (see
-//! [`worker`]). The driver keeps a few running and gives each a create at a time.
+//! [`worker`]). The driver keeps a few running and gives each a create at a time. A cell's overlay
+//! is never mounted on the host: the driver makes it as a mount attached nowhere, and the worker
+//! attaches it in its own mount namespace only while it makes the container, so the host's mount
+//! table does not grow with the cells.
 
 #![forbid(unsafe_code)]
 

@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Container creates no longer slow down as cells pile up (#183). Each cell's overlay used to be mounted in the host's mount namespace, next to a bind of its network namespace, and every create copied that whole table, under a lock all the workers share. Now the comb makes the overlay as a mount attached nowhere, and hands it and the network namespace to the worker as descriptors. Each worker makes its containers from a private mount namespace of its own, attaches the root there only for the create, and drops the namespace binds it started with, so what a create copies stays the same size however many cells are up. On server3, 2,500 container cells took 170 s to make with the default 30 s create deadline, against 538 s with the deadline raised to 120 s before, and the host mount table grew by one entry a cell, the network namespace, where it used to grow by two. The node needs Linux 5.2 or later for the new mount calls.
 ## 0.0.47
 
 Fixes from the first node run, and the rest of CI.

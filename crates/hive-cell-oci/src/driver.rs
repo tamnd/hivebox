@@ -12,14 +12,17 @@ use hive_cell::{
 use hive_types::{Backend, CellId, CellSpec, Error, Reason};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::IoSlice;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::{AsyncBufReadExt, BufReader, Interest};
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Where cgroup v2 is mounted. A cell's cgroup is given to libcontainer relative to it.
@@ -81,6 +84,9 @@ pub struct OciDriver {
     secrets: Mutex<HashMap<CellId, [u8; 32]>>,
     /// The project id each cell's upper is counted under, with a disk quota.
     projects: Mutex<HashMap<CellId, u32>>,
+    /// Each prepared cell's root filesystem, a mount attached nowhere, until its start hands it
+    /// to a worker.
+    roots: Mutex<HashMap<CellId, OwnedFd>>,
 }
 
 /// The key in a handle's `extra` for its project id.
@@ -95,6 +101,8 @@ const PROJECTS: u32 = 1 << 20;
 #[derive(Debug)]
 struct Job {
     create: Create,
+    /// Sent with the create: the network namespace if it has one, then the root filesystem.
+    fds: Vec<OwnedFd>,
     done: oneshot::Sender<std::result::Result<i32, String>>,
 }
 
@@ -144,7 +152,14 @@ impl OciDriver {
         for _ in 0..cfg.workers.max(1) {
             tokio::spawn(run_worker(cfg.worker.clone(), rx.clone(), exits.clone()));
         }
-        Ok(Self { cfg, jobs, exits, secrets: Mutex::default(), projects: Mutex::default() })
+        Ok(Self {
+            cfg,
+            jobs,
+            exits,
+            secrets: Mutex::default(),
+            projects: Mutex::default(),
+            roots: Mutex::default(),
+        })
     }
 
     fn dir(&self, id: CellId) -> PathBuf {
@@ -187,22 +202,12 @@ impl OciDriver {
             hive_cell::tree::copy(seed, &rootfs.upper)?;
         }
         let lowers: Vec<String> = rootfs.lowers.iter().map(|l| l.display().to_string()).collect();
-        // volatile skips every sync, which a cell's scratch layer never needs.
-        let options = std::ffi::CString::new(format!(
-            "lowerdir={},upperdir={},workdir={},volatile",
-            lowers.join(":"),
-            rootfs.upper.display(),
-            work.display()
-        ))
-        .map_err(std::io::Error::other)?;
-        rustix::mount::mount(
-            "overlay",
-            &root,
-            "overlay",
-            rustix::mount::MountFlags::empty(),
-            options.as_c_str(),
-        )
-        .map_err(|e| std::io::Error::other(format!("mounting the root filesystem: {e}")))?;
+        // The root is a mount on a descriptor, attached nowhere on the host. The worker attaches
+        // it in its own mount namespace for the length of the create, and the container's copy
+        // keeps it after that. Attached here, every cell would add a mount to the table that
+        // every create copies.
+        let mounted = overlay(&lowers.join(":"), &rootfs.upper, &work)
+            .map_err(|e| std::io::Error::other(format!("mounting the root filesystem: {e}")))?;
         let cgroup = slot.cgroup.strip_prefix(CGROUP_ROOT).map_err(|_| {
             std::io::Error::other(format!("{} is not under {CGROUP_ROOT}", slot.cgroup.display()))
         })?;
@@ -226,7 +231,7 @@ impl OciDriver {
         };
         let config = spec::config(spec, &host);
         std::fs::write(dir.join("config.json"), serde_json::to_vec(&config)?)?;
-        Ok(CellHandle {
+        let handle = CellHandle {
             id,
             backend: Backend::Container,
             pid: None,
@@ -234,7 +239,9 @@ impl OciDriver {
             cgroup: slot.cgroup.clone(),
             netns: slot.netns.clone(),
             extra,
-        })
+        };
+        self.roots.lock().unwrap_or_else(PoisonError::into_inner).insert(id, mounted);
+        Ok(handle)
     }
 
     /// A project id for `id`'s upper: the first one no other cell has and that holds nothing on
@@ -257,6 +264,7 @@ impl OciDriver {
     async fn clean(&self, id: CellId) {
         self.secrets.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
         self.projects.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        self.roots.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
         let dir = self.dir(id);
         let _ = tokio::task::spawn_blocking(move || {
             let _ = rustix::mount::unmount(dir.join("rootfs"), rustix::mount::UnmountFlags::DETACH);
@@ -266,7 +274,7 @@ impl OciDriver {
     }
 
     async fn wait_gone(&self, pidfd: &OwnedFd, limit: Duration) -> bool {
-        let Ok(fd) = AsyncFd::with_interest(pidfd.as_fd(), tokio::io::Interest::READABLE) else {
+        let Ok(fd) = AsyncFd::with_interest(pidfd.as_fd(), Interest::READABLE) else {
             return false;
         };
         tokio::time::timeout(limit, fd.readable()).await.is_ok_and(|r| r.is_ok())
@@ -375,13 +383,23 @@ impl CellDriver for OciDriver {
             let GuestChannel::Unix(socket) = h.channel.clone() else {
                 return Err(Error::new(Reason::Internal, "a container's channel is a unix socket"));
             };
-            let netns = h.netns.clone();
-            let create = Create { seq: 0, id: h.id.to_string(), dir, socket, netns, secret };
-            let (done, answer) = oneshot::channel();
             let failed =
                 |e: String| Error::new(Reason::Internal, format!("starting the container: {e}"));
+            let root = self.roots.lock().unwrap_or_else(PoisonError::into_inner).remove(&h.id);
+            let root = root.ok_or_else(|| failed("its root filesystem is not mounted".into()))?;
+            let mut fds = Vec::with_capacity(2);
+            let netns = h.netns.clone();
+            if let Some(path) = &netns {
+                let ns = std::fs::File::open(path)
+                    .map_err(|e| failed(format!("opening {}: {e}", path.display())))?;
+                fds.push(ns.into());
+            }
+            fds.push(root);
+            let id = h.id.to_string();
+            let create = Create { seq: 0, id, dir, socket, netns, rootfs: true, secret };
+            let (done, answer) = oneshot::channel();
             self.jobs
-                .send(Job { create, done })
+                .send(Job { create, fds, done })
                 .await
                 .map_err(|_| failed("the workers are gone".into()))?;
             let pid =
@@ -534,7 +552,7 @@ async fn run_worker(
 ) {
     let mut backoff = Duration::from_millis(10);
     loop {
-        let Some((mut child, mut stdin, mut replies)) = spawn_worker(&cmd, exits.clone()) else {
+        let Some((mut child, stream, mut replies)) = spawn_worker(&cmd, exits.clone()) else {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
             continue;
@@ -543,13 +561,13 @@ async fn run_worker(
             let job = jobs.lock().await.recv().await;
             let Some(job) = job else {
                 // The driver is gone, so the worker goes too.
-                drop(stdin);
+                drop(stream);
                 let _ = child.wait().await;
                 return;
             };
             let mut line = serde_json::to_vec(&job.create).expect("a create serializes");
             line.push(b'\n');
-            if stdin.write_all(&line).await.is_err() {
+            if send(&stream, &line, &job.fds).await.is_err() {
                 let _ = job.done.send(Err("the worker ended".into()));
                 break;
             }
@@ -570,16 +588,49 @@ async fn run_worker(
 
 type Replies = mpsc::Receiver<std::result::Result<i32, String>>;
 
-fn spawn_worker(cmd: &[OsString], exits: Arc<Exits>) -> Option<(Child, ChildStdin, Replies)> {
+/// Writes `line` to a worker, with `fds` on its first byte.
+async fn send(stream: &UnixStream, line: &[u8], fds: &[OwnedFd]) -> std::io::Result<()> {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+    let fds: Vec<BorrowedFd<'_>> = fds.iter().map(AsFd::as_fd).collect();
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+    let mut sent = 0;
+    while sent < line.len() {
+        stream.writable().await?;
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        if sent == 0 && !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+            return Err(std::io::Error::other("too many descriptors for one create"));
+        }
+        let wrote = stream.try_io(Interest::WRITABLE, || {
+            let rest = [IoSlice::new(&line[sent..])];
+            Ok(sendmsg(stream, &rest, &mut control, SendFlags::NOSIGNAL)?)
+        });
+        match wrote {
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A worker, with a socket for its stdin, which carries descriptors as well as lines, and its
+/// replies.
+fn spawn_worker(cmd: &[OsString], exits: Arc<Exits>) -> Option<(Child, UnixStream, Replies)> {
     let (program, args) = cmd.split_first()?;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()
+        .and_then(|(ours, theirs)| ours.set_nonblocking(true).map(|()| (ours, theirs)))
+        .map_err(|e| eprintln!("hive-cell-oci: a socket for a worker: {e}"))
+        .ok()?;
+    let stream = UnixStream::from_std(ours)
+        .map_err(|e| eprintln!("hive-cell-oci: a socket for a worker: {e}"))
+        .ok()?;
     let mut child = Command::new(program)
         .args(args)
-        .stdin(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::from(OwnedFd::from(theirs)))
         .stdout(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| eprintln!("hive-cell-oci: starting a worker: {e}"))
         .ok()?;
-    let stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel(1);
     tokio::spawn(async move {
@@ -607,7 +658,23 @@ fn spawn_worker(cmd: &[OsString], exits: Arc<Exits>) -> Option<(Child, ChildStdi
             }
         }
     });
-    Some((child, stdin, rx))
+    Some((child, stream, rx))
+}
+
+/// An overlay of `lowers` under `upper`, as a mount on a descriptor that is attached nowhere.
+fn overlay(lowers: &str, upper: &Path, work: &Path) -> rustix::io::Result<OwnedFd> {
+    use rustix::mount::{
+        FsMountFlags, FsOpenFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag,
+        fsconfig_set_string, fsmount, fsopen,
+    };
+    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
+    fsconfig_set_string(&fs, "lowerdir", lowers)?;
+    fsconfig_set_string(&fs, "upperdir", upper)?;
+    fsconfig_set_string(&fs, "workdir", work)?;
+    // volatile skips every sync, which a cell's scratch layer never needs.
+    fsconfig_set_flag(&fs, "volatile")?;
+    fsconfig_create(&fs)?;
+    fsmount(&fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())
 }
 
 /// Whether `elf` is a 64 bit little endian ELF binary with no program interpreter, so it runs
