@@ -124,7 +124,7 @@ impl WasmDriver {
             .map_err(|e| Error::new(Reason::Internal, format!("the epoch thread: {e}")))?;
         let mounts = cfg.mounts.into_iter().collect();
         Ok(Self {
-            shared: Arc::new(Shared::new(engine, linker, cfg.modules, mounts)),
+            shared: Arc::new(Shared::new(engine, linker, cfg.modules, mounts, n as usize)),
             max_mem_mib: cfg.max_mem_mib,
             cells: Mutex::new(HashMap::new()),
         })
