@@ -9,6 +9,8 @@ use crate::admit::Reservation;
 use crate::comb::Inner;
 use crate::record::{Handle, Record, now_ms, time};
 #[cfg(target_os = "linux")]
+pub(crate) use hive_cell::tree::Copied;
+#[cfg(target_os = "linux")]
 use hive_cell::tree::Precopy;
 use hive_cell::{
     CellDriver, CellHandle, GuestChannel, Liveness, PauseMode, RootfsPlan, Slot, cgroup,
@@ -102,13 +104,16 @@ pub(crate) enum Cmd {
         scrub: Option<Scrub>,
         done: oneshot::Sender<Result<Staged, Error>>,
     },
-    /// Copies what the cell wrote into a new directory for a fork, answered with the cell's spec
-    /// and the id of its image when that is in the store.
+    /// Copies what the cell wrote into a new directory for a fork.
     Fork {
         into: PathBuf,
-        done: oneshot::Sender<Result<(CellSpec, Option<BlobId>), Error>>,
+        done: oneshot::Sender<Result<Forking, Error>>,
     },
 }
+
+/// What a fork has besides its copy: the cell's spec, the id of its image when that is in the
+/// store, and what the copy holds.
+pub(crate) type Forking = (CellSpec, Option<BlobId>, Copied);
 
 /// What a quarantine did to a cell's network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1114,7 +1119,7 @@ impl Actor {
 
     /// Copies what the cell wrote into `into`, for a fork's children to start from. A running cell
     /// is frozen for the copy without telling anyone, the same as for a snapshot.
-    async fn fork(&mut self, into: PathBuf) -> Result<(CellSpec, Option<BlobId>), Error> {
+    async fn fork(&mut self, into: PathBuf) -> Result<Forking, Error> {
         let running = match self.cell.state() {
             CellState::Running => true,
             CellState::Paused => false,
@@ -1127,10 +1132,10 @@ impl Actor {
         let upper = self.inner.cell_dir(self.cell.id).join("upper");
         let started = Instant::now();
         if !running {
-            copy_once(upper, into).await?;
+            let copied = copy_once(upper, into).await?;
             self.inner.metrics.snapshot("fork_copy", started.elapsed());
             self.cell.touch();
-            return Ok((self.cell.spec.clone(), self.record.image()));
+            return Ok((self.cell.spec.clone(), self.record.image(), copied));
         }
         // Most of the copy is made while the cell runs, and it is frozen only to bring the copy
         // up to date, which redoes what changed in the meantime.
@@ -1146,8 +1151,7 @@ impl Actor {
         self.inner.metrics.snapshot("fork_frozen", frozen.elapsed());
         self.inner.metrics.snapshot("fork_copy", started.elapsed());
         self.cell.touch();
-        copied?;
-        Ok((self.cell.spec.clone(), self.record.image()))
+        Ok((self.cell.spec.clone(), self.record.image(), copied?))
     }
 
     /// Stops the cell and records how it ended. Never fails: whatever goes wrong, the cell ends
@@ -1386,10 +1390,10 @@ fn backoff(wait: Duration, base: Duration, given: u64, refaulted: u64) -> Durati
 
 /// Copies the writable layer `upper` of a cell that is not running into the new directory `into`.
 #[cfg(target_os = "linux")]
-async fn copy_once(upper: PathBuf, into: PathBuf) -> Result<(), Error> {
+async fn copy_once(upper: PathBuf, into: PathBuf) -> Result<Copied, Error> {
     blocking(move || {
         std::fs::create_dir_all(&into)?;
-        hive_cell::tree::copy(&upper, &into).map(drop)
+        hive_cell::tree::copy(&upper, &into)
     })
     .await
 }
@@ -1406,8 +1410,8 @@ async fn precopy(upper: PathBuf, into: PathBuf) -> Result<Precopy, Error> {
 }
 
 #[cfg(target_os = "linux")]
-async fn finish(pre: Precopy) -> Result<(), Error> {
-    blocking(move || pre.finish().map(drop)).await
+async fn finish(pre: Precopy) -> Result<Copied, Error> {
+    blocking(move || pre.finish()).await
 }
 
 #[cfg(target_os = "linux")]
@@ -1424,8 +1428,18 @@ async fn blocking<T: Send + 'static>(
 #[derive(Debug)]
 struct Precopy;
 
+/// What a copy holds, as `hive_cell::tree::Copied` says on Linux.
 #[cfg(not(target_os = "linux"))]
-async fn copy_once(_upper: PathBuf, _into: PathBuf) -> Result<(), Error> {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Copied {
+    pub entries: u64,
+    pub bytes: u64,
+    pub reflinked: u64,
+    pub linked: u64,
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn copy_once(_upper: PathBuf, _into: PathBuf) -> Result<Copied, Error> {
     Err(Error::new(Reason::PolicyDenied, "forks need a Linux node"))
 }
 
@@ -1435,7 +1449,7 @@ async fn precopy(_upper: PathBuf, _into: PathBuf) -> Result<Precopy, Error> {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn finish(_pre: Precopy) -> Result<(), Error> {
+async fn finish(_pre: Precopy) -> Result<Copied, Error> {
     Err(Error::new(Reason::PolicyDenied, "forks need a Linux node"))
 }
 

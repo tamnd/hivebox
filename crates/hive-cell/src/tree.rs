@@ -30,6 +30,8 @@ pub struct Copied {
     pub bytes: u64,
     /// The regular files whose data was shared with the source rather than copied.
     pub reflinked: u64,
+    /// The regular files with more than one link, each counted once.
+    pub linked: u64,
 }
 
 /// The most threads one pass uses for what is not a directory.
@@ -221,9 +223,11 @@ impl Pass {
                     continue;
                 }
                 if meta.is_file() {
-                    let key = (meta.dev(), meta.ino());
-                    if meta.nlink() < 2 || self.counted.insert(key) {
+                    if meta.nlink() < 2 {
                         self.done.bytes += meta.len();
+                    } else if self.counted.insert((meta.dev(), meta.ino())) {
+                        self.done.bytes += meta.len();
+                        self.done.linked += 1;
                     }
                 }
                 if fresh {
@@ -580,6 +584,7 @@ mod tests {
         assert_eq!(done.entries, 13 + 600 + 60);
         let want: usize = (0..600).map(|i: usize| i.to_string().len() * i).sum();
         assert_eq!(done.bytes, want as u64);
+        assert_eq!(done.linked, 60);
         for i in (0..600).step_by(10) {
             let f = b.join(format!("d{}", i % 13)).join(format!("f{i}"));
             let (f, l) =
