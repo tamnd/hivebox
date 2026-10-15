@@ -1,7 +1,7 @@
 //! The comb: the table of cells, the way into each cell's actor, and recovery after a restart.
 
 use crate::admit::{self, Admission};
-use crate::cell::{Actor, Cell, CellInfo, Cmd, Cutoff, Start, Status};
+use crate::cell::{Actor, Cell, CellInfo, Cmd, Copied, Cutoff, Start, Status};
 use crate::cgroups::Cgroups;
 use crate::config::Config;
 use crate::core_sched::CoreSched;
@@ -94,10 +94,12 @@ impl Drop for Seed {
 /// Where a fork's children start, from [`Comb::fork`].
 #[derive(Debug)]
 pub struct Forked {
-    /// The parent's spec, with its exact image as the source when that is in the store.
+    /// The parent's spec, with its exact image as the source when that is in the store, or a
+    /// layer of what it wrote on top of that image when the children share one.
     pub spec: CellSpec,
-    /// What the parent wrote, for [`Comb::create_from`].
-    pub seed: Arc<Seed>,
+    /// What the parent wrote, for [`Comb::create_from`] to copy into each child, unless the
+    /// children share it as a layer.
+    pub seed: Option<Arc<Seed>>,
 }
 
 /// What the WAL has done since the comb opened. Writes over syncs is how many transitions each disk flush carried.
@@ -850,10 +852,13 @@ impl Comb {
         Ok(snap)
     }
 
-    /// Copies what a live container cell wrote, for children made from it with
+    /// Copies what a live container cell wrote, for `count` children made from it with
     /// [`Comb::create_from`]. A running cell is frozen for the copy, the same as for a snapshot.
-    /// Only the files come along: the children start processes of their own.
-    pub async fn fork(&self, id: CellId) -> Result<Forked, Error> {
+    /// Only the files come along: the children start processes of their own. When copying it
+    /// into each child would take longer than building it into a layer once, see [`shares`], the
+    /// copy becomes a layer in the store on top of the cell's image, and the children start from
+    /// that.
+    pub async fn fork(&self, id: CellId, count: u32) -> Result<Forked, Error> {
         static FORKS: AtomicU64 = AtomicU64::new(0);
         let cell = self.inner.find(id)?;
         let n = FORKS.fetch_add(1, Ordering::Relaxed);
@@ -863,14 +868,31 @@ impl Comb {
         if !cell.send(Cmd::Fork { into: dir, done }).await {
             return Err(Error::new(Reason::Internal, "the node is shutting down"));
         }
-        let (mut spec, image) = wait
+        let (mut spec, image, copied) = wait
             .await
             .map_err(|_| Error::new(Reason::Internal, "the cell's actor went away"))??;
-        if let Some(image) = image {
-            // The image the parent has, even if its name has moved to another since.
-            spec.source = Source::Snapshot(image.to_string());
+        let Some(image) = image else {
+            return Ok(Forked { spec, seed: Some(seed) });
+        };
+        if self.inner.importer().is_ok() && shares(count, &copied) {
+            let built = Instant::now();
+            let layer = async {
+                let staged = self.inner.stage(&seed.dir, image, None, id.to_string()).await?;
+                self.inner.finish(staged).await
+            }
+            .await;
+            self.inner.metrics.snapshot("fork_build", built.elapsed());
+            match layer {
+                Ok(layer) => {
+                    spec.source = Source::Snapshot(layer.to_string());
+                    return Ok(Forked { spec, seed: None });
+                }
+                Err(e) => eprintln!("hive-comb: the fork of {id} is copied into each child: {e}"),
+            }
         }
-        Ok(Forked { spec, seed })
+        // The image the parent has, even if its name has moved to another since.
+        spec.source = Source::Snapshot(image.to_string());
+        Ok(Forked { spec, seed: Some(seed) })
     }
 
     /// Whether `project` has a live cell made with the idempotency key `key`.
@@ -1285,6 +1307,26 @@ impl Inner {
     }
 }
 
+/// Whether `count` children should share what a fork copied as one layer, rather than each have
+/// it copied into its own writable layer. On server3's ext4, a copy into each child took about
+/// 75 us an entry and 2 ms a MiB, and building the layer once took about 95 us an entry and 43 ms
+/// a MiB, with about 300 ms more for the children's first mount of it. The layer is built only
+/// when the copies would take twice as long, since these are rough and the layer stays in the
+/// store, which has no garbage collection yet. Where the copy shared data with the cell's by
+/// reflink, the children's copies would too, so only their entries count. A copy with hard links
+/// is never shared, since in a layer under the child's own, writing one link would part it from
+/// the others.
+fn shares(count: u32, copied: &Copied) -> bool {
+    if copied.linked > 0 {
+        return false;
+    }
+    let mib = copied.bytes >> 20;
+    let bytes = if copied.reflinked > 0 { 0 } else { 2_000 * mib };
+    let each = 75 * copied.entries + bytes;
+    let once = 95 * copied.entries + 43_000 * mib + 300_000;
+    u64::from(count).saturating_mul(each) > 2 * once
+}
+
 /// Waits for a cell someone else is creating to be running, or to fail.
 async fn wait_started(cell: &Cell) -> Result<CellInfo, Error> {
     let mut rx = cell.status.subscribe();
@@ -1387,5 +1429,26 @@ impl Turned {
         let k = (project.to_owned(), key.to_owned());
         self.new.remove(&k);
         self.old.remove(&k);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_files_are_shared_and_a_few_big_ones_copied() {
+        // 5000 small files in 50 directories. On server3, 16 children copying them took 9.0 to
+        // 15.0 s, and 16 sharing a layer of them 2.9 to 3.4 s.
+        let small = Copied { entries: 5050, bytes: 20 << 20, ..Copied::default() };
+        assert!(!shares(1, &small));
+        assert!(!shares(4, &small));
+        assert!(shares(16, &small));
+        // One file of 64 MiB, which 16 children copied in 2.3 to 2.7 s, and shared in 3.7 to
+        // 4.4 s.
+        let big = Copied { entries: 2, bytes: 64 << 20, ..Copied::default() };
+        assert!(!shares(16, &big));
+        // Hard links are never shared.
+        assert!(!shares(16, &Copied { linked: 1, ..small }));
     }
 }

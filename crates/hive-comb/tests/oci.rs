@@ -659,18 +659,19 @@ async fn a_fork_starts_cells_from_what_the_cell_wrote() {
     };
     let before = used();
     let t = Instant::now();
-    let forked = node.comb.fork(id).await.unwrap();
+    let forked = node.comb.fork(id, 4).await.unwrap();
     let copied = t.elapsed();
+    // Hard links keep it from being shared as a layer.
+    assert!(forked.seed.is_some());
     let disk = (used() - before) / (1 << 20);
     assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Running);
-    let made: Vec<CellId> =
-        futures::future::join_all((0..4).map(|_| {
-            node.comb.create_from(request(forked.spec.clone()), Some(forked.seed.clone()))
-        }))
-        .await
-        .into_iter()
-        .map(|r| r.unwrap().id)
-        .collect();
+    let made: Vec<CellId> = futures::future::join_all(
+        (0..4).map(|_| node.comb.create_from(request(forked.spec.clone()), forked.seed.clone())),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.unwrap().id)
+    .collect();
     let took = t.elapsed();
     drop(forked);
     let text = node.comb.metrics().registry().render();
@@ -707,9 +708,9 @@ async fn a_fork_starts_cells_from_what_the_cell_wrote() {
 
     // A paused cell stays paused.
     node.comb.pause(id).await.unwrap();
-    let again = node.comb.fork(id).await.unwrap();
+    let again = node.comb.fork(id, 1).await.unwrap();
     assert_eq!(node.comb.get(id).unwrap().status.state, CellState::Paused);
-    let late = node.comb.create_from(request(again.spec.clone()), Some(again.seed.clone()));
+    let late = node.comb.create_from(request(again.spec.clone()), again.seed.clone());
     let late = late.await.unwrap().id;
     drop(again);
     assert_eq!(sh(&node.comb, late, "cat /root/note").await, "one\n");
@@ -717,8 +718,64 @@ async fn a_fork_starts_cells_from_what_the_cell_wrote() {
     for c in made.into_iter().chain([id, late]) {
         node.comb.stop(c, None).await.unwrap();
     }
-    let e = node.comb.fork(id).await.unwrap_err();
+    let e = node.comb.fork(id, 1).await.unwrap_err();
     assert_eq!(e.reason, Reason::CellNotRunning, "{e}");
+    node.comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_children_of_a_fork_of_many_files_share_one_layer() {
+    let Some(node) = Node::new(4).await else { return };
+    let id = node.comb.create(request(spec("python"))).await.unwrap().id;
+    // A whiteout, an opaque directory, a set-id file with owners of its own, a symlink and many
+    // small files, but no hard links.
+    let work = "echo one > /root/note && rm /etc/issue && rm -rf /etc/apt && mkdir /etc/apt \
+                && echo new > /etc/apt/only && mkdir /srv/many \
+                && for i in $(seq 3000); do echo $i > /srv/many/$i; done \
+                && chown 1234:5678 /srv/many/7 && chmod 4710 /srv/many/7 \
+                && ln -s /root/note /srv/link";
+    sh(&node.comb, id, work).await;
+
+    let forked = node.comb.fork(id, 16).await.unwrap();
+    assert!(forked.seed.is_none());
+    assert!(matches!(forked.spec.source, Source::Snapshot(_)), "{:?}", forked.spec.source);
+    let made: Vec<CellId> = futures::future::join_all(
+        (0..2).map(|_| node.comb.create_from(request(forked.spec.clone()), None)),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.unwrap().id)
+    .collect();
+    let seen = "cat /root/note; test -e /etc/issue || echo gone; ls /etc/apt; \
+                ls /srv/many | wc -l; stat -c '%u %g %a' /srv/many/7; readlink /srv/link";
+    let want = "one\ngone\nonly\n3000\n1234 5678 4710\n/root/note\n";
+    for &c in &made {
+        assert_eq!(sh(&node.comb, c, seen).await, want);
+    }
+    // Each child writes over the layer on its own.
+    sh(&node.comb, made[0], "echo two > /root/note").await;
+    assert_eq!(sh(&node.comb, made[1], "cat /root/note").await, "one\n");
+    assert_eq!(sh(&node.comb, id, "cat /root/note").await, "one\n");
+    // The copy goes once the layer is built.
+    let forks = node.cfg.data_dir.join("forks");
+    let until = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&forks).unwrap().next().is_some() {
+        assert!(Instant::now() < until, "the fork's copy was left");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A child forks in turn, with the layer under what it wrote.
+    let grand = node.comb.fork(made[0], 1).await.unwrap();
+    assert!(grand.seed.is_some());
+    let g = node.comb.create_from(request(grand.spec.clone()), grand.seed.clone());
+    let g = g.await.unwrap().id;
+    drop(grand);
+    assert_eq!(sh(&node.comb, g, "cat /root/note; ls /srv/many | wc -l").await, "two\n3000\n");
+    let text = node.comb.metrics().registry().render();
+    assert!(text.contains("hive_snapshot_seconds_count{stage=\"fork_build\"} 1"), "{text}");
+
+    for c in made.into_iter().chain([id, g]) {
+        node.comb.stop(c, None).await.unwrap();
+    }
     node.comb.shutdown().await;
 }
 

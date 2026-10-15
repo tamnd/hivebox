@@ -169,8 +169,8 @@ impl Snapshots for Api {
             if keys.iter().all(|k| k.as_ref().is_some_and(|k| self.comb.made(&call.project, k))) {
                 return Ok((parent.spec, None));
             }
-            let forked = self.comb.fork(id).await.map_err(status)?;
-            Ok((forked.spec, Some(forked.seed)))
+            let forked = self.comb.fork(id, count).await.map_err(status)?;
+            Ok((forked.spec, forked.seed))
         }
         .await;
         let (mut spec, seed) = call.check(&r.cell_id, &args, forked)?;
