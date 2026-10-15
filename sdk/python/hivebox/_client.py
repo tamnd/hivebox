@@ -449,6 +449,12 @@ class AsyncHive:
         req = snapshots_pb2.CommitRequest(snapshot=types_pb2.SnapshotRef(id=snapshot), name=name)
         await self._call(self._snapshots.Commit, req)
 
+    async def delete_snapshot(self, snapshot: str) -> None:
+        """Removes a snapshot from the store. Its layers go with the next collection of the store
+        that finds no other image needs them. Refused while a cell on the node runs from it or a
+        name points at it. Deleting one already gone is not an error."""
+        await self._call(self._snapshots.Delete, types_pb2.SnapshotRef(id=snapshot), retry=True)
+
     async def _call(self, method, request, *, retry: bool = False, timeout: float | None = None):
         """One unary call. With `retry`, a failure that was hivebox's is tried again, since
         repeating the call is safe."""

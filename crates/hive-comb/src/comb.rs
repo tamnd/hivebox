@@ -184,6 +184,35 @@ pub(crate) struct Inner {
     started: std::sync::OnceLock<Started>,
 }
 
+/// A name under `data_dir/images` or a project's committed images that holds `id`, if any, as
+/// the path below `data_dir`.
+fn named(data_dir: &Path, id: BlobId) -> Option<String> {
+    let want = id.to_string();
+    let mut dirs = vec![data_dir.join("images")];
+    if let Ok(projects) = std::fs::read_dir(data_dir.join("projects")) {
+        dirs.extend(projects.flatten().map(|p| p.path().join("images")));
+    }
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            let path = e.path();
+            if kind.is_dir() {
+                // An unpacked root filesystem holds no names.
+                if !path.join("etc").is_dir() && !path.join("usr").is_dir() {
+                    dirs.push(path);
+                }
+            } else if kind.is_file()
+                && e.metadata().is_ok_and(|m| m.len() <= 128)
+                && std::fs::read_to_string(&path).is_ok_and(|t| t.trim() == want)
+            {
+                return Some(path.strip_prefix(data_dir).unwrap_or(&path).display().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// The policies `cfg` names, each compiled, so a node does not start with one it cannot run.
 async fn policies(cfg: &Config) -> io::Result<Option<hive_cell_wasm::Policies>> {
     if cfg.policies.is_empty() {
@@ -978,6 +1007,56 @@ impl Comb {
         .await
         .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
         written.map_err(|e| Error::new(Reason::InvalidArgument, format!("committing {name}: {e}")))
+    }
+
+    /// Removes snapshot `snapshot` from the store. Its layers stay until `hive-nectar gc` finds
+    /// that no other image needs them. Refused while a cell on this node runs from it or a name
+    /// here points at it. One already gone is not an error, so a retry passes.
+    pub async fn delete_snapshot(&self, snapshot: BlobId) -> Result<(), Error> {
+        let Some(nectar) = &self.inner.images else {
+            return Err(Error::new(Reason::PolicyDenied, "this node has no image store"));
+        };
+        let m = match load_manifest(&*nectar.store, snapshot).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(Error::new(Reason::Internal, format!("snapshot {snapshot}: {e}")));
+            }
+        };
+        if m.provenance.is_none() {
+            return Err(Error::new(
+                Reason::InvalidArgument,
+                format!("{snapshot} is an imported image, not a snapshot"),
+            ));
+        }
+        let user = self.inner.shards.iter().find_map(|s| {
+            let s = s.read().unwrap_or_else(PoisonError::into_inner);
+            s.values()
+                .find(|c| !c.state().is_terminal() && c.image.get() == Some(&snapshot))
+                .map(|c| c.id)
+        });
+        if let Some(cell) = user {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                format!("cell {cell} runs from snapshot {snapshot}"),
+            ));
+        }
+        let data = self.inner.cfg.data_dir.clone();
+        let named = tokio::task::spawn_blocking(move || named(&data, snapshot))
+            .await
+            .map_err(|e| Error::new(Reason::Internal, e.to_string()))?;
+        if let Some(name) = named {
+            return Err(Error::new(
+                Reason::PolicyDenied,
+                format!("snapshot {snapshot} is committed as {name}"),
+            ));
+        }
+        match nectar.store.delete(snapshot).await {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                Err(Error::new(Reason::Internal, format!("deleting snapshot {snapshot}: {e}")))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The guest agent client for a running cell, for exec and file calls. A paused cell is
