@@ -182,6 +182,10 @@ pub(crate) struct Inner {
     opened: Instant,
     /// The cells it found live in the WAL then, and what became of them.
     started: std::sync::OnceLock<Started>,
+    /// The tasks that keep the cgroup and network namespace pools topped up. Shutdown waits for
+    /// them, since a batch they started goes on making spares on a blocking thread, which a comb
+    /// opened next on the same tree would sweep or collide with.
+    refills: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// A name under `data_dir/images` or a project's committed images that holds `id`, if any, as
@@ -409,6 +413,7 @@ impl Comb {
             cordoning: Mutex::new(()),
             opened: Instant::now(),
             started: std::sync::OnceLock::new(),
+            refills: Mutex::new(Vec::new()),
         });
         inner.metrics.cordoned(cordoned);
         std::fs::create_dir_all(inner.cfg.data_dir.join("cells"))?;
@@ -423,7 +428,7 @@ impl Comb {
             if swept > 0 {
                 eprintln!("hive-comb: removed {swept} network namespaces no cell claims");
             }
-            tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+            comb.refilling(pool.clone().refill(comb.inner.shutdown.clone()));
             if let Some(net) = pool.net() {
                 let (serve, stop) = (net.dns(), comb.inner.shutdown.clone());
                 tokio::spawn(async move {
@@ -449,7 +454,7 @@ impl Comb {
             if swept > 0 {
                 eprintln!("hive-comb: removed {swept} cgroups no cell claims");
             }
-            tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+            comb.refilling(pool.clone().refill(comb.inner.shutdown.clone()));
         }
         if comb.inner.images.as_ref().is_some_and(|n| n.collected) {
             let (keep, stop) = (comb.clone(), comb.inner.shutdown.clone());
@@ -1153,10 +1158,14 @@ impl Comb {
     }
 
     /// Stops every actor and leaves every cell exactly as it is, for the next comb to take over.
-    /// Returns once the WAL is closed, so a new comb can open it straight away.
+    /// Returns once the WAL is closed and the pools have stopped making spares, so a new comb can
+    /// open them straight away.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         self.inner.wal.close().await;
+        let refills =
+            std::mem::take(&mut *self.inner.refills.lock().unwrap_or_else(PoisonError::into_inner));
+        futures::future::join_all(refills).await;
         // Closing the audit log waits for its writer to sync the last batch and go, so the next
         // comb is the only one writing the chain.
         let audit = self.inner.audit.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -1167,6 +1176,12 @@ impl Comb {
         if let Some(s) = self.inner.siem.clone() {
             let _ = tokio::task::spawn_blocking(move || s.flush()).await;
         }
+    }
+
+    /// Runs a pool's refill task, for shutdown to wait on.
+    fn refilling(&self, refill: impl Future<Output = ()> + Send + 'static) {
+        let task = tokio::spawn(refill);
+        self.inner.refills.lock().unwrap_or_else(PoisonError::into_inner).push(task);
     }
 
     /// Where security events go, when anywhere.

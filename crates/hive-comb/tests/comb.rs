@@ -924,6 +924,27 @@ async fn cells_live_in_cgroups_of_their_own() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_comb_makes_no_cgroups_once_it_has_shut_down() {
+    let Some(tree) = Tree::new() else { return };
+    let s = Scratch::new();
+    let fake = Arc::new(Fake::default());
+    // Deep enough that filling the pool takes several batches, so one is under way at shutdown.
+    let cfg = Config { cgroup_root: Some(tree.0.clone()), cgroup_depth: 256, ..config(&s.0) };
+    let count = || {
+        let classes = ["latency", "standard", "besteffort"];
+        let dirs = classes.map(|c| std::fs::read_dir(tree.0.join(format!("{c}.slice"))).unwrap());
+        dirs.into_iter().flatten().filter(|e| e.as_ref().unwrap().path().is_dir()).count()
+    };
+    for _ in 0..5 {
+        let comb = open(cfg.clone(), &fake).await;
+        comb.shutdown().await;
+        let left = count();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(count(), left, "the pool made cgroups after the comb shut down");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_setup_boost_lifts_the_cpu_quota_until_the_cell_is_ready() {
     let Some(tree) = Tree::new() else { return };
     let s = Scratch::new();
