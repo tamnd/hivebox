@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.54
+
+A nightly workflow that passes.
+
 - The nightly workflow passes for the first time. A hive-guard test leaked a tokio socket on purpose to keep a resolver that never answers, which the address sanitizer reported, and it now leaks a plain socket instead. The thread sanitizer runs the library tests only, since the integration tests fork, pass tokio's registrations through epoll and run wasmtime's fibers, which it cannot follow. Miri runs the nine crates whose unit tests it can run, with isolation off so that they may read the clock. Both sanitizer runs go on past a failing test binary, so one night reports every failure.
 
 ## 0.0.53
