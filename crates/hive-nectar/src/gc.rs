@@ -1,5 +1,6 @@
-//! Garbage collection for a [`PosixStore`]. A blob is kept when an image reachable from the roots
-//! names it, or when it was written or used again after the cutoff, and every other blob goes.
+//! Garbage collection for a store that can be listed, a [`PosixStore`] or an [`S3Store`]. A blob
+//! is kept when an image reachable from the roots names it, or when it was written or used again
+//! after the cutoff, and every other blob goes.
 //!
 //! The roots are images by their manifests' names. Several nodes may share one store, so they have
 //! to be every name and every cell's image on all of them. Snapshots that only a client knows of
@@ -12,14 +13,93 @@
 //! keeps every blob that is new or has a new time since the plan, with what it names.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::cas::{self, Recipe};
 use crate::image::Manifest;
 use crate::store::{Listed, blocking};
-use crate::{BlobId, BlobStore, PosixStore};
+use crate::{BlobId, BlobStore, PosixStore, ReadReq, S3Store};
+
+/// A store that can be collected, which lists its blobs with their times.
+pub trait Collect: BlobStore {
+    /// Every blob in the store, with its size and time.
+    fn list(&self) -> BoxFuture<'_, io::Result<Vec<Listed>>>;
+
+    /// What puts left behind before `cutoff`, which no blob is made of.
+    fn leftovers(&self, cutoff: SystemTime) -> BoxFuture<'_, io::Result<Vec<Leftover>>>;
+
+    /// Removes `left`. One that is gone already is fine.
+    fn clear<'a>(&'a self, left: &'a Leftover) -> BoxFuture<'a, io::Result<()>>;
+}
+
+/// Something a put left behind when it died.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Leftover {
+    /// A file in the temporary directory of a store in a directory.
+    File(PathBuf),
+    /// A multipart upload to a bucket that was never finished, which holds its parts.
+    Upload {
+        /// The object it was for.
+        key: String,
+        /// Its upload id.
+        id: String,
+    },
+}
+
+impl Collect for PosixStore {
+    fn list(&self) -> BoxFuture<'_, io::Result<Vec<Listed>>> {
+        Box::pin(PosixStore::list(self))
+    }
+
+    fn leftovers(&self, cutoff: SystemTime) -> BoxFuture<'_, io::Result<Vec<Leftover>>> {
+        let tmp = self.tmp();
+        Box::pin(blocking(move || {
+            let mut stale = Vec::new();
+            for f in std::fs::read_dir(tmp)? {
+                let f = f?;
+                if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff) {
+                    stale.push(Leftover::File(f.path()));
+                }
+            }
+            Ok(stale)
+        }))
+    }
+
+    fn clear<'a>(&'a self, left: &'a Leftover) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let Leftover::File(f) = left else { return Ok(()) };
+            match tokio::fs::remove_file(f).await {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        })
+    }
+}
+
+impl Collect for S3Store {
+    fn list(&self) -> BoxFuture<'_, io::Result<Vec<Listed>>> {
+        Box::pin(self.list_blobs())
+    }
+
+    fn leftovers(&self, cutoff: SystemTime) -> BoxFuture<'_, io::Result<Vec<Leftover>>> {
+        Box::pin(async move {
+            let uploads = self.uploads(cutoff).await?;
+            Ok(uploads.into_iter().map(|(key, id)| Leftover::Upload { key, id }).collect())
+        })
+    }
+
+    fn clear<'a>(&'a self, left: &'a Leftover) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let Leftover::Upload { key, id } = left else { return Ok(()) };
+            self.abort(key, id).await
+        })
+    }
+}
 
 /// What a collection would remove and what it would keep.
 #[derive(Debug)]
@@ -33,8 +113,10 @@ pub struct Plan {
     pub missing: Vec<BlobId>,
     /// How many manifests and recipes it keeps as roots for being younger than the cutoff.
     pub young: u64,
-    /// Files a put left in the store's temporary directory before the cutoff.
-    pub stale: Vec<PathBuf>,
+    /// What puts left behind before the cutoff.
+    pub stale: Vec<Leftover>,
+    /// How many of `remove` are manifests, and how many recipes.
+    phases: [usize; 2],
     /// The blobs as the plan listed them.
     listed: HashMap<BlobId, SystemTime>,
 }
@@ -54,6 +136,9 @@ pub struct Swept {
 /// is under 1 MiB.
 const MANIFEST_MAX: u64 = 16 << 20;
 
+/// Blobs read at once to see what they are, and removed at once by a sweep.
+const IN_FLIGHT: usize = 16;
+
 /// What a blob turned out to be when it was read.
 enum Kind {
     Manifest(Box<Manifest>),
@@ -67,7 +152,7 @@ enum Kind {
 /// # Errors
 ///
 /// The store cannot be listed or read, or a root or a blob it names is not what it should be.
-pub async fn plan(store: &PosixStore, roots: &[BlobId], cutoff: SystemTime) -> io::Result<Plan> {
+pub async fn plan<S: Collect>(store: &S, roots: &[BlobId], cutoff: SystemTime) -> io::Result<Plan> {
     let all = store.list().await?;
     let mut live = HashSet::new();
     let mut missing = Vec::new();
@@ -76,74 +161,66 @@ pub async fn plan(store: &PosixStore, roots: &[BlobId], cutoff: SystemTime) -> i
             missing.push(root);
         }
     }
-    let mut young = 0;
-    for b in &all {
-        if b.modified >= cutoff
-            && !live.contains(&b.blob)
-            && young_root(store, b, &mut live).await?
-        {
-            young += 1;
-        }
-    }
-    let (mut manifests, mut recipes, mut rest, mut kept) =
-        (Vec::new(), Vec::new(), Vec::new(), (0, 0));
+    let fresh: Vec<Listed> =
+        all.iter().filter(|b| b.modified >= cutoff && !live.contains(&b.blob)).copied().collect();
+    let young = young_roots(store, &fresh, &mut live).await?;
+    let mut kept = (0, 0);
+    let mut old = Vec::new();
     for b in &all {
         if live.contains(&b.blob) || b.modified >= cutoff {
             kept = (kept.0 + 1, kept.1 + b.size);
-            continue;
+        } else {
+            old.push(*b);
         }
-        match kind(store, b).await? {
+    }
+    let (mut manifests, mut recipes, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+    for (b, k) in old.iter().zip(kinds(store, &old).await?) {
+        match k {
             Kind::Manifest(_) => manifests.push(*b),
             Kind::Recipe(_) => recipes.push(*b),
             Kind::Other => rest.push(*b),
         }
     }
-    let tmp = store.tmp();
-    let stale = blocking(move || {
-        let mut stale = Vec::new();
-        for f in std::fs::read_dir(tmp)? {
-            let f = f?;
-            if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff) {
-                stale.push(f.path());
-            }
-        }
-        Ok(stale)
-    })
-    .await?;
+    let stale = store.leftovers(cutoff).await?;
+    let phases = [manifests.len(), recipes.len()];
     manifests.extend(recipes);
     manifests.extend(rest);
     let listed = all.iter().map(|b| (b.blob, b.modified)).collect();
-    Ok(Plan { remove: manifests, kept, missing, young, stale, listed })
+    Ok(Plan { remove: manifests, kept, missing, young, stale, phases, listed })
 }
 
-/// Removes what `plan` found, but for blobs written or used since, and what they name.
+/// Removes what `plan` found, but for blobs written or used since, and what they name. Manifests
+/// go before recipes and recipes before the rest, each kind [`IN_FLIGHT`] at a time.
 ///
 /// # Errors
 ///
 /// The store cannot be listed, read or changed. What was removed by then stays removed.
-pub async fn sweep(store: &PosixStore, plan: Plan) -> io::Result<Swept> {
+pub async fn sweep<S: Collect>(store: &S, plan: Plan) -> io::Result<Swept> {
+    let changed: Vec<Listed> = store
+        .list()
+        .await?
+        .into_iter()
+        .filter(|b| plan.listed.get(&b.blob) != Some(&b.modified))
+        .collect();
     let mut live = HashSet::new();
-    for b in store.list().await? {
-        if plan.listed.get(&b.blob) == Some(&b.modified) {
-            continue;
-        }
-        live.insert(b.blob);
-        young_root(store, &b, &mut live).await?;
-    }
+    young_roots(store, &changed, &mut live).await?;
+    live.extend(changed.iter().map(|b| b.blob));
     let mut swept = Swept::default();
-    for b in plan.remove {
-        if live.contains(&b.blob) {
-            swept.spared += 1;
-            continue;
+    let (manifests, rest) = plan.remove.split_at(plan.phases[0]);
+    let (recipes, rest) = rest.split_at(plan.phases[1]);
+    for phase in [manifests, recipes, rest] {
+        let doomed: Vec<&Listed> = phase.iter().filter(|b| !live.contains(&b.blob)).collect();
+        swept.spared += (phase.len() - doomed.len()) as u64;
+        let mut deletes = futures::stream::iter(doomed)
+            .map(|b| async move { store.delete(b.blob).await.map(|()| b.size) })
+            .buffer_unordered(IN_FLIGHT);
+        while let Some(size) = deletes.next().await {
+            swept.removed = (swept.removed.0 + 1, swept.removed.1 + size?);
         }
-        store.delete(b.blob).await?;
-        swept.removed = (swept.removed.0 + 1, swept.removed.1 + b.size);
     }
-    for f in plan.stale {
-        match tokio::fs::remove_file(&f).await {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => swept.stale += 1,
-        }
+    for left in &plan.stale {
+        store.clear(left).await?;
+        swept.stale += 1;
     }
     Ok(swept)
 }
@@ -160,7 +237,7 @@ pub(crate) async fn reuse(store: &dyn BlobStore, manifest: &Manifest) {
 
 /// Adds the manifest `id`, the blobs it names and the chunks of its recipes to `live`. Says
 /// whether the store has it.
-async fn mark(store: &PosixStore, id: BlobId, live: &mut HashSet<BlobId>) -> io::Result<bool> {
+async fn mark(store: &dyn BlobStore, id: BlobId, live: &mut HashSet<BlobId>) -> io::Result<bool> {
     if live.contains(&id) {
         return Ok(true);
     }
@@ -175,7 +252,7 @@ async fn mark(store: &PosixStore, id: BlobId, live: &mut HashSet<BlobId>) -> io:
 }
 
 /// Adds the blobs `m` names and the chunks of its recipes to `live`.
-async fn names(store: &PosixStore, m: &Manifest, live: &mut HashSet<BlobId>) -> io::Result<()> {
+async fn names(store: &dyn BlobStore, m: &Manifest, live: &mut HashSet<BlobId>) -> io::Result<()> {
     for layer in &m.layers {
         live.extend(layer.blobs());
         for recipe in [layer.data_chunks, layer.relaid_chunks].into_iter().flatten() {
@@ -190,51 +267,66 @@ async fn names(store: &PosixStore, m: &Manifest, live: &mut HashSet<BlobId>) -> 
     Ok(())
 }
 
-/// If `b` is a manifest or a recipe, adds what it names to `live` and says so.
-async fn young_root(
-    store: &PosixStore,
-    b: &Listed,
+/// Adds the manifests and recipes among `blobs` to `live`, with what they name, and says how
+/// many there were. They are read [`IN_FLIGHT`] at a time, and one that a manifest or recipe
+/// read before names is not read at all, which after an import is most of its chunks.
+async fn young_roots(
+    store: &dyn BlobStore,
+    blobs: &[Listed],
     live: &mut HashSet<BlobId>,
-) -> io::Result<bool> {
-    match kind(store, b).await? {
-        Kind::Manifest(m) => names(store, &m, live).await?,
-        Kind::Recipe(r) => live.extend(r.chunks()),
-        Kind::Other => return Ok(false),
+) -> io::Result<u64> {
+    let mut found = 0;
+    for batch in blobs.chunks(IN_FLIGHT) {
+        let unread: Vec<Listed> =
+            batch.iter().filter(|b| !live.contains(&b.blob)).copied().collect();
+        for (b, k) in unread.iter().zip(kinds(store, &unread).await?) {
+            match k {
+                Kind::Manifest(m) => names(store, &m, live).await?,
+                Kind::Recipe(r) => live.extend(r.chunks()),
+                Kind::Other => continue,
+            }
+            // One that a manifest read just before it in the batch names is not counted.
+            if live.insert(b.blob) {
+                found += 1;
+            }
+        }
     }
-    live.insert(b.blob);
-    Ok(true)
+    Ok(found)
+}
+
+/// What each of `blobs` is, in order, reading [`IN_FLIGHT`] at a time.
+async fn kinds(store: &dyn BlobStore, blobs: &[Listed]) -> io::Result<Vec<Kind>> {
+    futures::stream::iter(blobs).map(|b| kind(store, b)).buffered(IN_FLIGHT).try_collect().await
 }
 
 /// What `b` is. Only blobs that start as JSON does and are small enough, or have a recipe's
-/// length, are read whole, and one counts as a manifest or a recipe only when it parses as one and hashes to its name.
-async fn kind(store: &PosixStore, b: &Listed) -> io::Result<Kind> {
-    let (path, size) = (store.path(b.blob), b.size);
-    let blob = b.blob;
-    blocking(move || {
-        let mut f = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Kind::Other),
-            Err(e) => return Err(e),
-        };
-        let mut first = [0u8; 1];
-        if f.read(&mut first)? == 0 {
-            return Ok(Kind::Other);
-        }
-        let json = first[0] == b'{';
-        if (json && size > MANIFEST_MAX) || (!json && !Recipe::fits(size)) {
-            return Ok(Kind::Other);
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        bytes.push(first[0]);
-        f.read_to_end(&mut bytes)?;
-        if BlobId::of(&bytes) != blob {
-            return Ok(Kind::Other);
-        }
-        Ok(if json {
-            Manifest::from_bytes(&bytes).map_or(Kind::Other, |m| Kind::Manifest(Box::new(m)))
-        } else {
-            Recipe::from_bytes(&bytes).map_or(Kind::Other, Kind::Recipe)
-        })
+/// length, are read whole, and one counts as a manifest or a recipe only when it parses as one
+/// and hashes to its name. One gone since it was listed counts as neither.
+async fn kind(store: &dyn BlobStore, b: &Listed) -> io::Result<Kind> {
+    let Some(first) = read(store, b.blob, 1).await? else { return Ok(Kind::Other) };
+    let json = first.first() == Some(&b'{');
+    if b.size == 0 || (json && b.size > MANIFEST_MAX) || (!json && !Recipe::fits(b.size)) {
+        return Ok(Kind::Other);
+    }
+    let Some(bytes) = read(store, b.blob, b.size).await? else { return Ok(Kind::Other) };
+    if BlobId::of(&bytes) != b.blob {
+        return Ok(Kind::Other);
+    }
+    Ok(if json {
+        Manifest::from_bytes(&bytes).map_or(Kind::Other, |m| Kind::Manifest(Box::new(m)))
+    } else {
+        Recipe::from_bytes(&bytes).map_or(Kind::Other, Kind::Recipe)
     })
-    .await
+}
+
+/// The first `len` bytes of `blob`, none if it has fewer, or nothing if it is gone.
+async fn read(store: &dyn BlobStore, blob: BlobId, len: u64) -> io::Result<Option<Vec<u8>>> {
+    let buf = vec![0; usize::try_from(len).map_err(io::Error::other)?];
+    match store.read_vectored(blob, vec![ReadReq { offset: 0, buf }]).await {
+        Ok(mut done) => Ok(done.pop().map(|r| r.buf)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        // An empty blob has no first byte.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Some(Vec::new())),
+        Err(e) => Err(e),
+    }
 }

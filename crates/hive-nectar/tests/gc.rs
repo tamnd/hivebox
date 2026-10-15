@@ -138,7 +138,7 @@ async fn only_what_no_root_needs_goes() {
     let recipe = b.manifest.layers[0].data_chunks.unwrap();
     assert_eq!(plan.remove[0].blob, b.id);
     assert_eq!(plan.remove[1].blob, recipe);
-    assert_eq!(plan.stale, std::slice::from_ref(&stale));
+    assert_eq!(plan.stale, [gc::Leftover::File(stale.clone())]);
 
     // A blob used again after the plan stays.
     let meta = b.manifest.layers[0].meta;
@@ -187,6 +187,29 @@ async fn a_young_image_keeps_what_it_names() {
     assert!(!gone.contains(&c));
     gc::sweep(&store, plan).await.unwrap();
     for b in need_a {
+        assert!(store.stat(b).await.is_ok(), "{b} went");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_written_after_the_plan_keeps_what_it_names() {
+    let s = Scratch::new();
+    let store = PosixStore::open(s.0.join("store")).unwrap();
+    let a = import(&s, &store, "a", &[("app/main.py", &noise(7, 2 << 20))]).await;
+    let need_a = needs(&store, &a.manifest).await;
+    age(&s.0.join("store"), 2 * DAY);
+    let plan = gc::plan(&store, &[], SystemTime::now() - DAY).await.unwrap();
+    assert_eq!(plan.remove.len(), need_a.len() + 1);
+    // A new image over a's layers, its manifest put without touching them, as a snapshot written
+    // while the collection runs.
+    let mut c = a.manifest.clone();
+    c.source = Some("c".into());
+    let c = put(&store, &s.0, &c.to_bytes()).await;
+    let swept = gc::sweep(&store, plan).await.unwrap();
+    assert_eq!(swept.removed.0, 1, "only a's manifest goes");
+    assert_eq!(swept.spared, need_a.len() as u64);
+    assert!(store.stat(a.id).await.is_err());
+    for b in need_a.into_iter().chain([c]) {
         assert!(store.stat(b).await.is_ok(), "{b} went");
     }
 }
