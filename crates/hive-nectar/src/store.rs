@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -86,6 +87,13 @@ pub trait BlobStore: Send + Sync + 'static {
     /// What it knows about `blob`, or `NotFound`.
     fn stat(&self, blob: BlobId) -> BoxFuture<'_, io::Result<BlobStat>>;
 
+    /// What [`stat`](Self::stat) says, for a caller about to name `blob` in a new image without
+    /// putting it again. A store that collects garbage counts it as just written, as it does a
+    /// blob that [`put`](Self::put) finds it has, so a collection that starts meanwhile keeps it.
+    fn reuse(&self, blob: BlobId) -> BoxFuture<'_, io::Result<BlobStat>> {
+        self.stat(blob)
+    }
+
     /// Removes `blob`. Removing one that is not there is fine.
     fn delete(&self, blob: BlobId) -> BoxFuture<'_, io::Result<()>>;
 }
@@ -116,6 +124,71 @@ impl PosixStore {
     pub fn path(&self, blob: BlobId) -> PathBuf {
         let name = blob.to_string();
         self.root.join("blobs").join(&name[..2]).join(name)
+    }
+
+    /// Where a put keeps a blob before it has its name.
+    #[must_use]
+    pub fn tmp(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
+    /// Every blob the store has, with its size and when it was last written or put again.
+    /// Files that are not named as blobs are left out.
+    ///
+    /// # Errors
+    ///
+    /// The store's directories cannot be read.
+    pub async fn list(&self) -> io::Result<Vec<Listed>> {
+        let blobs = self.root.join("blobs");
+        blocking(move || {
+            let mut all = Vec::new();
+            for dir in std::fs::read_dir(blobs)? {
+                let dir = dir?;
+                if !dir.file_type()?.is_dir() {
+                    continue;
+                }
+                for f in std::fs::read_dir(dir.path())? {
+                    let f = f?;
+                    let Some(blob) = f.file_name().to_str().and_then(|n| n.parse().ok()) else {
+                        continue;
+                    };
+                    let m = match f.metadata() {
+                        Ok(m) => m,
+                        // Removed since the directory was read.
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    };
+                    all.push(Listed { blob, size: m.len(), modified: m.modified()? });
+                }
+            }
+            Ok(all)
+        })
+        .await
+    }
+}
+
+/// A blob as [`PosixStore::list`] found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Listed {
+    /// Its name.
+    pub blob: BlobId,
+    /// Its size in bytes.
+    pub size: u64,
+    /// When it was written, or last put or reused again.
+    pub modified: SystemTime,
+}
+
+/// How long a blob that is put or reused again keeps its time before it gets a new one. Garbage
+/// collection keeps blobs younger than its cutoff, so the cutoff has to be longer than this and the
+/// longest import together.
+pub const REFRESH: Duration = Duration::from_secs(3600);
+
+/// Gives the blob at `path`, found with `m`, the time now, if its time is older than [`REFRESH`].
+/// A store it cannot change, such as one that is read only, keeps its times.
+fn refresh(path: &Path, m: &std::fs::Metadata) {
+    let now = SystemTime::now();
+    if m.modified().is_ok_and(|t| t + REFRESH < now) {
+        let _ = File::open(path).and_then(|f| f.set_modified(now));
     }
 }
 
@@ -179,6 +252,15 @@ impl BlobStore for PosixStore {
         Box::pin(async move { Ok(BlobStat { size: tokio::fs::metadata(path).await?.len() }) })
     }
 
+    fn reuse(&self, blob: BlobId) -> BoxFuture<'_, io::Result<BlobStat>> {
+        let path = self.path(blob);
+        Box::pin(blocking(move || {
+            let m = std::fs::metadata(&path)?;
+            refresh(&path, &m);
+            Ok(BlobStat { size: m.len() })
+        }))
+    }
+
     fn delete(&self, blob: BlobId) -> BoxFuture<'_, io::Result<()>> {
         let path = self.path(blob);
         Box::pin(async move {
@@ -192,6 +274,7 @@ impl BlobStore for PosixStore {
 
 fn put_file(blob: BlobId, src: &Path, tmp: &Path, path: &Path) -> io::Result<PutReceipt> {
     if let Ok(m) = std::fs::metadata(path) {
+        refresh(path, &m);
         return Ok(PutReceipt { size: m.len(), existed: true });
     }
     let dir = path.parent().expect("blob paths have a parent");
@@ -321,6 +404,7 @@ fn put_all(root: &Path, blobs: &[Put]) -> io::Result<Vec<PutReceipt>> {
 
 fn check(p: &Put, dev: u64) -> io::Result<Checked> {
     if let Ok(m) = std::fs::metadata(&p.path) {
+        refresh(&p.path, &m);
         return Ok(Checked::Existed(m.len()));
     }
     let got = hash_file(&p.src)?;

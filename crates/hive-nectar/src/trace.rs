@@ -70,6 +70,7 @@ pub async fn put(
         (layer.data_relaid, layer.data_order, layer.relaid_chunks) = (None, None, None);
     }
     // The manifest goes last, so an image in the store always has all its traces.
+    crate::gc::reuse(store, &traced).await;
     let id = put_bytes(store, &traced.to_bytes(), work).await?;
     Ok((id, traced))
 }

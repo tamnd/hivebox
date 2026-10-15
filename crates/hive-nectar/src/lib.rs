@@ -28,6 +28,7 @@ mod blob;
 pub mod cache;
 pub mod cas;
 pub mod erofs;
+pub mod gc;
 pub mod image;
 pub mod lazy;
 pub mod leaves;
@@ -47,7 +48,7 @@ pub use image::{ImageConfig, LayerRef, Manifest, Provenance};
 pub use lazy::{Lazy, Relaid};
 pub use leaves::Leaves;
 pub use s3::{S3Config, S3Store};
-pub use store::{BlobCaps, BlobStat, BlobStore, PosixStore, PutReceipt, ReadReq};
+pub use store::{BlobCaps, BlobStat, BlobStore, Listed, PosixStore, PutReceipt, ReadReq};
 
 #[cfg(test)]
 mod tests {

@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `hive-nectar gc` collects a store in a directory. It keeps every blob the given images need, and every blob written or used again in the last `--keep-hours`, and removes the rest, manifests first and chunks last, so a collection cut short leaves no image that looks whole but is not. A put of a blob the store already has, a layer the importer reuses, and a manifest written over blobs stored before all give those blobs a new time, at most once an hour, and a sweep lists the store again just before it removes anything, so imports and snapshots made during a collection keep what they use. Without `--sweep on` it only says what it would remove. On server3 at a load of 42 to 52, a copy of the comb test node's store, 7,593 blobs in 679 MiB with every time set three days back, kept with 31 of the 61 images in it as roots kept 6,639 blobs, 597.8 MiB, and removed 954, 64.8 MiB, in 0.77 s. All 31 images fetched whole afterwards and none of the other 30 manifests was left. With only the node's one named image as a root, it removed 7,589 blobs, 541.8 MiB, in 3.66 s, and that image still fetched whole.
+
 ## 0.0.50
 
 Forks that share one layer, and snapshots that restore again.

@@ -338,10 +338,10 @@ impl Importer {
         if let Some(memo) = &memo
             && let Ok(bytes) = tokio::fs::read(memo).await
             && let Ok(layer) = serde_json::from_slice::<LayerRef>(&bytes)
-            && store.stat(layer.meta).await.is_ok()
-            && store.stat(layer.data_chunks.unwrap_or(layer.data)).await.is_ok()
+            && store.reuse(layer.meta).await.is_ok()
+            && store.reuse(layer.data_chunks.unwrap_or(layer.data)).await.is_ok()
             && let Some(leaves) = layer.data_leaves
-            && store.stat(leaves).await.is_ok()
+            && store.reuse(leaves).await.is_ok()
         {
             return Ok((layer, false, 0));
         }
@@ -418,6 +418,7 @@ impl Importer {
     }
 
     async fn put_manifest(&self, store: &dyn BlobStore, manifest: &Manifest) -> io::Result<BlobId> {
+        crate::gc::reuse(store, manifest).await;
         let bytes = manifest.to_bytes();
         let id = BlobId::of(&bytes);
         let path = self.work.join("build").join(format!(
