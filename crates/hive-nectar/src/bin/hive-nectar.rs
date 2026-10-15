@@ -10,7 +10,7 @@
 //! hive-nectar relayout IMAGE --store DIR [--work DIR]
 //! hive-nectar run IMAGE --store DIR --cache DIR --work DIR --cmd CMD [--mode MODE]
 //! hive-nectar commit UPPER --base IMAGE --store DIR [--uid-base N] [--scrub on|off] [--allow PATHS]
-//! hive-nectar gc ROOTS --store DIR [--keep-hours N] [--sweep on]
+//! hive-nectar gc ROOTS --store DIR | --s3 URL [--keep-hours N] [--sweep on]
 //! ```
 //!
 //! `run` mounts the image as a cell would get it and runs `CMD` with `sh -c` chrooted into it,
@@ -36,6 +36,8 @@
 //! comma separated list of image ids, files of ids one to a line, and directories of image names
 //! as a node keeps them. A store several nodes share needs the names on all of them, and the ids
 //! of their cells' images, and a snapshot only a client knows of lasts as long as `--keep-hours`.
+//! It also removes what puts that died left behind: temporary files in a directory, and
+//! unfinished multipart uploads in a bucket.
 //!
 //! `commit` writes an overlay upper directory as a layer on top of the image `--base`, as the
 //! comb does for a cell, and prints the name of the new image. `--uid-base` is the host id of the
@@ -56,6 +58,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use hive_nectar::cas::{self, Chunked, Cuts};
 use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
+use hive_nectar::gc::Collect;
 use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store, gc};
 
@@ -228,47 +231,25 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
             Ok(())
         }
         "gc" => {
-            let from = PosixStore::open(
-                store_dir.ok_or("gc needs --store DIR, since a bucket cannot be listed yet")?,
-            )
-            .map_err(|e| e.to_string())?;
             let hours = number("keep-hours", 24)?;
             if hours < 2 {
                 return Err("--keep-hours takes 2 or more, since a blob put again keeps its time for an hour".into());
             }
             let roots = roots(what)?;
-            let cutoff = SystemTime::now() - Duration::from_secs(hours * 3600);
-            let started = Instant::now();
-            let plan = gc::plan(&from, &roots, cutoff).await.map_err(|e| format!("gc: {e}"))?;
-            for r in &plan.missing {
-                eprintln!("root {r} is not in this store");
+            let sweep = flags.get("sweep").map(String::as_str) == Some("on");
+            match (store_dir, flags.get("s3")) {
+                (Some(dir), _) => {
+                    let store = PosixStore::open(dir).map_err(|e| e.to_string())?;
+                    collect(&store, &roots, hours, sweep).await
+                }
+                (None, Some(url)) => {
+                    let store = S3Config::from_url_and_env(url)
+                        .and_then(S3Store::new)
+                        .map_err(|e| e.to_string())?;
+                    collect(&store, &roots, hours, sweep).await
+                }
+                (None, None) => Err("one of --store or --s3 is needed".into()),
             }
-            eprintln!(
-                "{} roots, {} manifests and recipes kept for being younger than {hours} h; {} blobs kept, {}; {} to remove, {}; {} stale temporary files; planned in {:.2?}",
-                roots.len(),
-                plan.young,
-                plan.kept.0,
-                mib(plan.kept.1),
-                plan.remove.len(),
-                mib(plan.remove.iter().map(|b| b.size).sum()),
-                plan.stale.len(),
-                started.elapsed()
-            );
-            if flags.get("sweep").map(String::as_str) != Some("on") {
-                eprintln!("nothing removed: pass --sweep on to remove them");
-                return Ok(());
-            }
-            let started = Instant::now();
-            let swept = gc::sweep(&from, plan).await.map_err(|e| format!("gc: {e}"))?;
-            eprintln!(
-                "removed {} blobs, {}, and {} temporary files in {:.2?}; {} kept for being used since the plan",
-                swept.removed.0,
-                mib(swept.removed.1),
-                swept.stale,
-                started.elapsed(),
-                swept.spared
-            );
-            Ok(())
         }
         "relayout" => {
             let id: BlobId = what.parse().map_err(|e| format!("{what}: {e}"))?;
@@ -480,6 +461,48 @@ impl Drop for Overlay {
             let _ = std::fs::remove_dir_all(self.work.join(d));
         }
     }
+}
+
+/// Says what a collection of `store` would remove, keeping what `roots` reach and what was used
+/// in the last `hours`, and with `sweep` removes it.
+async fn collect<S: Collect>(
+    store: &S,
+    roots: &[BlobId],
+    hours: u64,
+    sweep: bool,
+) -> Result<(), String> {
+    let cutoff = SystemTime::now() - Duration::from_secs(hours * 3600);
+    let started = Instant::now();
+    let plan = gc::plan(store, roots, cutoff).await.map_err(|e| format!("gc: {e}"))?;
+    for r in &plan.missing {
+        eprintln!("root {r} is not in this store");
+    }
+    eprintln!(
+        "{} roots, {} manifests and recipes kept for being younger than {hours} h; {} blobs kept, {}; {} to remove, {}; {} left by puts that died; planned in {:.2?}",
+        roots.len(),
+        plan.young,
+        plan.kept.0,
+        mib(plan.kept.1),
+        plan.remove.len(),
+        mib(plan.remove.iter().map(|b| b.size).sum()),
+        plan.stale.len(),
+        started.elapsed()
+    );
+    if !sweep {
+        eprintln!("nothing removed: pass --sweep on to remove them");
+        return Ok(());
+    }
+    let started = Instant::now();
+    let swept = gc::sweep(store, plan).await.map_err(|e| format!("gc: {e}"))?;
+    eprintln!(
+        "removed {} blobs, {}, and {} left by puts in {:.2?}; {} kept for being used since the plan",
+        swept.removed.0,
+        mib(swept.removed.1),
+        swept.stale,
+        started.elapsed(),
+        swept.spared
+    );
+    Ok(())
 }
 
 /// The roots `what` names, a comma separated list of image ids, files of ids one to a line, and

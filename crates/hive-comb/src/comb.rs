@@ -243,8 +243,6 @@ fn at(what: &str, path: &Path) -> impl FnOnce(io::Error) -> io::Error {
 /// the layers of snapshots.
 struct Nectar {
     store: Arc<dyn BlobStore>,
-    /// The store is a directory, which `hive-nectar gc` collects.
-    collected: bool,
     layers: Layers,
     importer: Option<Importer>,
 }
@@ -290,7 +288,7 @@ impl Nectar {
             .map(|i| i.chunked(Cuts::default()))
             .map_err(|e| eprintln!("hive-comb: snapshots are off: {e}"))
             .ok();
-        Ok(Some(Self { store, collected: bucket.is_none(), layers, importer }))
+        Ok(Some(Self { store, layers, importer }))
     }
 }
 
@@ -456,7 +454,7 @@ impl Comb {
             }
             comb.refilling(pool.clone().refill(comb.inner.shutdown.clone()));
         }
-        if comb.inner.images.as_ref().is_some_and(|n| n.collected) {
+        if comb.inner.images.is_some() {
             let (keep, stop) = (comb.clone(), comb.inner.shutdown.clone());
             tokio::spawn(async move {
                 let mut every = tokio::time::interval(KEEP_IMAGES);
@@ -1373,11 +1371,11 @@ impl Inner {
         Ok((RootfsPlan { lowers, upper, seed: None }, Some((id, lease))))
     }
 
-    /// Gives the manifest of image `id` a new time in the store, if the store is collected, so a
-    /// collection keeps it and everything it names. A manifest with no name, like a snapshot's,
+    /// Gives the manifest of image `id` a new time in the store, so a collection keeps it and
+    /// everything it names. A manifest with no name, like a snapshot's,
     /// is kept this way for as long as a cell runs from it.
     pub(crate) async fn keep_image(&self, id: BlobId) {
-        if let Some(nectar) = self.images.as_ref().filter(|n| n.collected) {
+        if let Some(nectar) = &self.images {
             // One the store lacks fails where the cell loads it.
             let _ = nectar.store.reuse(id).await;
         }
