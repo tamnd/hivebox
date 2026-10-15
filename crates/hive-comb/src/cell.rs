@@ -339,7 +339,9 @@ impl Actor {
     }
 
     /// Writes the new state to the WAL, then shows it. Nothing is done about the new state until
-    /// this returns.
+    /// this returns. A wasm cell's state does not wait for the sync: the cell lives in the comb,
+    /// so a restart finds it gone with or without its record, and a create would otherwise spend
+    /// most of its time on two syncs.
     async fn commit(
         &mut self,
         state: CellState,
@@ -355,7 +357,13 @@ impl Actor {
         message.clone_into(&mut self.record.message);
         self.record.handle = self.handle.as_ref().map(Handle::from_cell);
         let bytes = self.record.encode_to_vec().into();
-        self.inner.wal.put(self.id(), bytes).await.map_err(|e| wal_error(&e))?;
+        let wal = &self.inner.wal;
+        let written = if self.cell.spec.backend == Backend::Fncall {
+            wal.put_nowait(self.id(), bytes).await
+        } else {
+            wal.put(self.id(), bytes).await
+        };
+        written.map_err(|e| wal_error(&e))?;
         self.show(state, cause, message);
         Ok(())
     }

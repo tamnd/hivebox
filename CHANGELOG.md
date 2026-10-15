@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Wasm creates no longer wait for the WAL to sync. A wasm cell lives in the comb, so a restart finds it gone with or without its record, and two syncs were most of what a create cost. Its records are still written, in order, and the next write that waits finds them on disk. On server3 at a load of 13 to 39, a create storm of wasm cells at 25 a second went from a median of 14.8 and 19.3 ms to 2.4 and 2.5 ms over two runs each, and the comb's own mean time for a create from 171 and 281 ms to 51 and 133 ms over the whole storm.
+
 ## 0.0.48
 
 Container creates that stay fast with thousands of cells up.
