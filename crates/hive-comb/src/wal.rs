@@ -118,6 +118,19 @@ impl Wal {
         self.send(key, Some(value)).await
     }
 
+    /// Sets the record for `key` like [`Wal::put`], but returns once the writer has it, without
+    /// waiting for its sync. Writes keep their order, so a later write that waits finds this one
+    /// on disk too. A crash before the next sync loses it, and a failed write shows up on the next
+    /// write that waits.
+    pub(crate) async fn put_nowait(&self, key: u128, value: Bytes) -> io::Result<()> {
+        if value.len() > MAX_RECORD - KEY {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "record too large"));
+        }
+        let (done, _) = oneshot::channel();
+        let op = Op { key, value: Some(value), last: false, done };
+        self.tx.send(op).await.map_err(|_| io::Error::other("the WAL writer has stopped"))
+    }
+
     /// Removes the record for `key`. Returns once that is on disk.
     pub(crate) async fn delete(&self, key: u128) -> io::Result<()> {
         self.send(key, None).await
@@ -416,6 +429,23 @@ mod tests {
         for k in (0..512).filter(|k| k % 3 != 0) {
             assert_eq!(replay.records[&k], value(k, 3));
         }
+    }
+
+    #[tokio::test]
+    async fn writes_that_do_not_wait_are_on_disk_once_a_later_one_is() {
+        let s = Scratch::new();
+        let (wal, _) = Wal::open(&s.0).unwrap();
+        for k in 0..100u128 {
+            wal.put_nowait(k, value(k, 0)).await.unwrap();
+        }
+        wal.put_nowait(7, value(7, 1)).await.unwrap();
+        wal.put(100, value(100, 0)).await.unwrap();
+        drop(wal);
+
+        let (_, replay) = Wal::open(&s.0).unwrap();
+        assert_eq!(replay.records.len(), 101);
+        assert_eq!(replay.records[&7], value(7, 1));
+        assert_eq!(replay.records[&99], value(99, 0));
     }
 
     #[tokio::test]
