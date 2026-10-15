@@ -908,7 +908,7 @@ impl Comb {
     /// Copies what a live container cell wrote, for `count` children made from it with
     /// [`Comb::create_from`]. A running cell is frozen for the copy, the same as for a snapshot.
     /// Only the files come along: the children start processes of their own. When copying it
-    /// into each child would take longer than building it into a layer once, see [`shares`], the
+    /// into each child would take longer than building it into a layer once, see `shares`, the
     /// copy becomes a layer in the store on top of the cell's image, and the children start from
     /// that.
     pub async fn fork(&self, id: CellId, count: u32) -> Result<Forked, Error> {
