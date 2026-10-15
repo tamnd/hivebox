@@ -560,8 +560,9 @@ mod tests {
             Profile(16),
             Policy::new(&["pypi.org", "*.pythonhosted.org"]).unwrap(),
         )]);
-        // The first resolver never answers, so every lookup also shows the fallback working.
-        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The first resolver never answers, so every lookup also shows the fallback working. It is
+        // a plain socket that nothing reads, so leaking it leaks a descriptor and no runtime state.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let hosts = vec![Host {
             name: "svc.hive.internal".into(),
             ip: Ipv4Addr::new(169, 254, 77, 81),
