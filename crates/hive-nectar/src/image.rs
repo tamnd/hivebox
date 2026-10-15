@@ -51,6 +51,24 @@ pub struct LayerRef {
 }
 
 impl LayerRef {
+    /// Every blob the layer names: its metadata and data, its leaves, trace and order, its relaid
+    /// copy, and the recipes either is kept as. Where data is kept as a recipe the store may not
+    /// have the data blob itself. The recipes' chunks are not among these.
+    pub fn blobs(&self) -> impl Iterator<Item = BlobId> + use<> {
+        [
+            Some(self.meta),
+            Some(self.data),
+            self.data_leaves,
+            self.data_trace,
+            self.data_relaid,
+            self.data_order,
+            self.data_chunks,
+            self.relaid_chunks,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     /// The name a layer made of these two blobs has.
     #[must_use]
     pub fn digest_of(meta: BlobId, data: BlobId) -> BlobId {

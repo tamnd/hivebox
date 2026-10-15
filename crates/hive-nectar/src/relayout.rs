@@ -100,6 +100,7 @@ pub async fn put(store: &dyn BlobStore, image: &Manifest, work: &Path) -> io::Re
         runs_in += runs(&order[..moved]);
     }
     // The manifest goes last, so an image in the store always has all its copies.
+    crate::gc::reuse(store, &relaid).await;
     let id = put_bytes(store, &relaid.to_bytes(), work).await?;
     Ok(Relaidout { id, manifest: relaid, layers, traced, runs: runs_in })
 }

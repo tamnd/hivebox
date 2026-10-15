@@ -10,6 +10,7 @@
 //! hive-nectar relayout IMAGE --store DIR [--work DIR]
 //! hive-nectar run IMAGE --store DIR --cache DIR --work DIR --cmd CMD [--mode MODE]
 //! hive-nectar commit UPPER --base IMAGE --store DIR [--uid-base N] [--scrub on|off] [--allow PATHS]
+//! hive-nectar gc ROOTS --store DIR [--keep-hours N] [--sweep on]
 //! ```
 //!
 //! `run` mounts the image as a cell would get it and runs `CMD` with `sh -c` chrooted into it,
@@ -30,6 +31,12 @@
 //!
 //! `run --commit on` commits what the command wrote as `commit` does.
 //!
+//! `gc` says which blobs no image reachable from `ROOTS` needs and that were last written or used
+//! more than `--keep-hours` ago, 24 by default, and with `--sweep on` removes them. `ROOTS` is a
+//! comma separated list of image ids, files of ids one to a line, and directories of image names
+//! as a node keeps them. A store several nodes share needs the names on all of them, and the ids
+//! of their cells' images, and a snapshot only a client knows of lasts as long as `--keep-hours`.
+//!
 //! `commit` writes an overlay upper directory as a layer on top of the image `--base`, as the
 //! comb does for a cell, and prints the name of the new image. `--uid-base` is the host id of the
 //! cells' root, which owners are shifted back from. It scrubs by default, and `--allow` takes a
@@ -45,16 +52,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use hive_nectar::cas::{self, Chunked, Cuts};
 use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer};
 use hive_nectar::oci::{Importer, Platform, load_manifest};
-use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store};
+use hive_nectar::{BlobId, BlobStore, Cache, PosixStore, S3Config, S3Store, gc};
 
 const USAGE: &str = "usage: hive-nectar import-oci LAYOUT | import-tar TAR | show IMAGE | fetch IMAGE \
-                     | copy IMAGE | relayout IMAGE | run IMAGE | commit UPPER --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] [--dedup chunks [--cas-avg BYTES]] \
-                     [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace] [--commit on] [--base IMAGE] [--uid-base N] [--scrub on|off] [--allow PATHS]";
+                     | copy IMAGE | relayout IMAGE | run IMAGE | commit UPPER | gc ROOTS --store DIR | --s3 URL [--work DIR] [--mkfs PATH] [--chunk BYTES] [--dedup chunks [--cas-avg BYTES]] \
+                     [--cache DIR] [--capacity BYTES] [--to-s3 URL] [--cmd CMD] [--mode whole|lazy|trace] [--commit on] [--base IMAGE] [--uid-base N] [--scrub on|off] [--allow PATHS] [--keep-hours N] [--sweep on]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -217,6 +224,49 @@ async fn run(cmd: &str, what: &str, flags: &HashMap<String, String>) -> Result<(
                 "{} sent in {took:.2?}, {:.0} MiB/s",
                 mib(sent),
                 sent as f64 / (1 << 20) as f64 / took.as_secs_f64()
+            );
+            Ok(())
+        }
+        "gc" => {
+            let from = PosixStore::open(
+                store_dir.ok_or("gc needs --store DIR, since a bucket cannot be listed yet")?,
+            )
+            .map_err(|e| e.to_string())?;
+            let hours = number("keep-hours", 24)?;
+            if hours < 2 {
+                return Err("--keep-hours takes 2 or more, since a blob put again keeps its time for an hour".into());
+            }
+            let roots = roots(what)?;
+            let cutoff = SystemTime::now() - Duration::from_secs(hours * 3600);
+            let started = Instant::now();
+            let plan = gc::plan(&from, &roots, cutoff).await.map_err(|e| format!("gc: {e}"))?;
+            for r in &plan.missing {
+                eprintln!("root {r} is not in this store");
+            }
+            eprintln!(
+                "{} roots, {} manifests and recipes kept for being younger than {hours} h; {} blobs kept, {}; {} to remove, {}; {} stale temporary files; planned in {:.2?}",
+                roots.len(),
+                plan.young,
+                plan.kept.0,
+                mib(plan.kept.1),
+                plan.remove.len(),
+                mib(plan.remove.iter().map(|b| b.size).sum()),
+                plan.stale.len(),
+                started.elapsed()
+            );
+            if flags.get("sweep").map(String::as_str) != Some("on") {
+                eprintln!("nothing removed: pass --sweep on to remove them");
+                return Ok(());
+            }
+            let started = Instant::now();
+            let swept = gc::sweep(&from, plan).await.map_err(|e| format!("gc: {e}"))?;
+            eprintln!(
+                "removed {} blobs, {}, and {} temporary files in {:.2?}; {} kept for being used since the plan",
+                swept.removed.0,
+                mib(swept.removed.1),
+                swept.stale,
+                started.elapsed(),
+                swept.spared
             );
             Ok(())
         }
@@ -430,6 +480,50 @@ impl Drop for Overlay {
             let _ = std::fs::remove_dir_all(self.work.join(d));
         }
     }
+}
+
+/// The roots `what` names, a comma separated list of image ids, files of ids one to a line, and
+/// directories of names as a node keeps them, such as `DATA_DIR/images` and `DATA_DIR/projects`,
+/// where every small file that holds an id is one. Unpacked root filesystems there are skipped.
+fn roots(what: &str) -> Result<Vec<BlobId>, String> {
+    let mut roots = Vec::new();
+    for part in what.split(',').filter(|p| !p.is_empty()) {
+        if let Ok(id) = part.parse() {
+            roots.push(id);
+            continue;
+        }
+        let path = Path::new(part);
+        let m = std::fs::metadata(path).map_err(|e| format!("{part}: {e}"))?;
+        if m.is_file() {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{part}: {e}"))?;
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                roots.push(line.parse().map_err(|e| format!("{part}: {line}: {e}"))?);
+            }
+            continue;
+        }
+        let mut dirs = vec![path.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+                let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+                let kind = e.file_type().map_err(|err| format!("{}: {err}", e.path().display()))?;
+                if kind.is_dir() {
+                    // An unpacked root filesystem, which the comb uses as it is.
+                    let p = e.path();
+                    if !p.join("etc").is_dir() && !p.join("usr").is_dir() {
+                        dirs.push(p);
+                    }
+                } else if kind.is_file()
+                    && e.metadata().is_ok_and(|m| m.len() <= 128)
+                    && let Ok(text) = std::fs::read_to_string(e.path())
+                    && let Ok(id) = text.trim().parse()
+                {
+                    roots.push(id);
+                }
+            }
+        }
+    }
+    Ok(roots)
 }
 
 fn mib(bytes: u64) -> String {

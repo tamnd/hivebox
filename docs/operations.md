@@ -39,6 +39,17 @@ hive-nectar import-oci ./python-layout --store /var/lib/hivebox/store > /var/lib
 
 `import-oci` takes an OCI image layout directory and `import-tar` a tar of one, and both print the image's id. Point `images.store` at the same directory, or use `--s3 URL` in place of `--store` with a bucket every node shares, so an image imported once runs anywhere. Keep `backends.container.uid_base` the same on every node, since images are made for one base.
 
+## Cleaning the store
+
+The store keeps every blob it is given until it is collected. `hive-nectar gc` takes the images to keep, as ids, files of ids or directories of name files, and removes every blob none of them needs that was written or last used more than `--keep-hours` ago (24 by default):
+
+```
+hive-nectar gc /var/lib/hivebox/images,/var/lib/hivebox/projects --store /var/lib/hivebox/store
+hive-nectar gc /var/lib/hivebox/images,/var/lib/hivebox/projects --store /var/lib/hivebox/store --sweep on
+```
+
+The first prints what it would remove, and the second removes it. Imports and snapshots made while it runs are kept. When nodes share a store, pass the image directories of all of them. A snapshot, a fork or a cell made from one has no name file, so it is kept only while it is younger than `--keep-hours`. Set it longer than such cells live, or put their ids in a file and pass that too. Only a store in a directory can be collected for now, since a bucket cannot be listed yet.
+
 ## A cluster
 
 Start the services in this order, since each one looks for the ones before it.

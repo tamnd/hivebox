@@ -172,6 +172,12 @@ impl Recipe {
         self.ends.last().copied().unwrap_or(0)
     }
 
+    /// Whether a blob of `size` bytes has the length of a recipe.
+    #[must_use]
+    pub const fn fits(size: u64) -> bool {
+        size >= HEAD as u64 && (size - HEAD as u64).is_multiple_of(ENTRY as u64)
+    }
+
     /// The chunks, in order. A chunk that comes up more than once is listed each time.
     #[must_use]
     pub fn chunks(&self) -> &[BlobId] {
@@ -351,7 +357,7 @@ pub async fn put(
             let (file, start) = (file.clone(), recipe.start(i));
             let len = recipe.ends[i] - start;
             async move {
-                if store.stat(chunk).await.is_ok() {
+                if store.reuse(chunk).await.is_ok() {
                     return Ok(None);
                 }
                 let tmp = work.join(format!(
