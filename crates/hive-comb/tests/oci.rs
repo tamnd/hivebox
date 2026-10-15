@@ -441,9 +441,6 @@ async fn idle_cells_give_back_their_cold_page_cache() {
     let work = "find /usr/local/lib -type f -exec cat {} + > /dev/null; \
                 head -c 32M /dev/urandom > /tmp/blob && cat /tmp/blob > /dev/null; \
                 python3 -c 'import time; x = bytearray(32 << 20); time.sleep(3600)' >/dev/null 2>&1 &";
-    for &id in ids.iter().chain([&warm]) {
-        sh(&node.comb, id, work).await;
-    }
     let start = "python3 -c 'import asyncio, json, sqlite3, ssl, decimal, email.parser'";
     let timed = |id| {
         let comb = &node.comb;
@@ -453,14 +450,31 @@ async fn idle_cells_give_back_their_cold_page_cache() {
             t.elapsed()
         }
     };
-    for &id in ids.iter().chain([&warm]) {
-        sh(&node.comb, id, start).await;
-    }
+    let trimmed = || {
+        let text = node.comb.metrics().registry().render();
+        let line = text.lines().find(|l| l.starts_with("hive_memory_trimmed_bytes_total "));
+        line.and_then(|l| l.rsplit(' ').next()?.parse::<u64>().ok()).unwrap_or(0)
+    };
+    // The standard cells all at once, so on a busy host none of them sits idle for `trim_idle`
+    // while the others work, and gets trimmed before it is measured. The latency cell goes last,
+    // finding the library read in already.
+    let setup = Instant::now();
+    let ready = |id| {
+        let comb = &node.comb;
+        async move {
+            sh(comb, id, work).await;
+            sh(comb, id, start).await;
+        }
+    };
+    futures::future::join_all(ids.iter().map(|&id| ready(id))).await;
+    ready(warm).await;
+    let setup = setup.elapsed();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (standard, latency) =
         (node.tree.0.join("standard.slice"), node.tree.0.join("latency.slice"));
     assert_eq!(leaves(&standard).len(), CELLS);
     let before = (memory(&standard), memory(&latency));
+    let early = trimmed();
     let mut warm_starts = Vec::new();
     for &id in &ids {
         warm_starts.push(timed(id).await);
@@ -468,11 +482,6 @@ async fn idle_cells_give_back_their_cold_page_cache() {
     let warm_start = (median(warm_starts), timed(warm).await);
 
     // Every standard cell gets trimmed once it has been idle long enough.
-    let trimmed = || {
-        let text = node.comb.metrics().registry().render();
-        let line = text.lines().find(|l| l.starts_with("hive_memory_trimmed_bytes_total "));
-        line.and_then(|l| l.rsplit(' ').next()?.parse::<u64>().ok()).unwrap_or(0)
-    };
     tokio::time::sleep(Duration::from_secs(13)).await;
     let after = (memory(&standard), memory(&latency));
     // The first start reads the library back in, and it is shared, so the others find most of it.
@@ -483,8 +492,9 @@ async fn idle_cells_give_back_their_cold_page_cache() {
     }
     let cold_start = (first, median(rest), timed(warm).await);
     println!(
-        "{CELLS} standard cells: {} MiB ({} file, {} anon) before, {} MiB ({} file, {} anon) once \
-         trimmed, {} MiB counted; latency cell: {} MiB before, {} MiB after",
+        "{CELLS} standard cells, ready in {setup:.2?}: {} MiB ({} file, {} anon) before, {} MiB \
+         ({} file, {} anon) once trimmed, {} MiB counted, {} MiB of it before; latency cell: {} MiB \
+         before, {} MiB after",
         before.0.0,
         before.0.1,
         before.0.2,
@@ -492,6 +502,7 @@ async fn idle_cells_give_back_their_cold_page_cache() {
         after.0.1,
         after.0.2,
         trimmed() >> 20,
+        early >> 20,
         before.1.0,
         after.1.0,
     );

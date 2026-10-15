@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- `Comb::shutdown` now waits for the cgroup and network namespace pools to stop making spares. Before, a refill batch already under way went on after shutdown returned, so a comb opened right away on the same tree could sweep leaves while they were being made, or make leaves under names already taken. It then failed to open with "File exists" or EBUSY. On server3 at a load of 50 to 60, with main, a tree that had 1 to 3 leaves right after shutdown had 35 to 87 leaves 200 ms later, in three runs out of three. With this change no leaf was made after shutdown in three runs of five opens and shutdowns each.
+
 ## 0.0.51
 
 Collecting the store, and deleting snapshots.
