@@ -636,6 +636,43 @@ async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_stays_young_in_the_store_while_a_cell_runs_from_it() {
+    if std::env::var_os("HIVE_NECTAR_STORE").is_none() {
+        eprintln!("skipped: set HIVE_NECTAR_STORE to run it");
+        return;
+    }
+    let Some(node) = Node::new(4).await else { return };
+    let store = hive_nectar::PosixStore::open(node.cfg.images.store.clone().unwrap()).unwrap();
+    let id = node.comb.create(request(spec("python"))).await.unwrap().id;
+    sh(&node.comb, id, "echo kept > /root/note").await;
+    let snap = node.comb.snapshot(id, None).await.unwrap();
+    // `hive-nectar gc` keeps a manifest younger than its cutoff, and everything it names.
+    let path = store.path(snap);
+    let age = || {
+        let then = std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        std::fs::File::open(&path).unwrap().set_modified(then).unwrap();
+    };
+    let young = || {
+        let t = std::fs::metadata(&path).unwrap().modified().unwrap();
+        t.elapsed().unwrap_or_default() < Duration::from_secs(600)
+    };
+
+    age();
+    let copy = restore(&node.comb, snap).await;
+    assert!(young(), "a cell made from the snapshot gives it a new time");
+    assert_eq!(sh(&node.comb, copy, "cat /root/note").await, "kept\n");
+    age();
+    assert_eq!(node.comb.keep_images().await, 2);
+    assert!(young(), "a cell running from it gives it a new time every half hour");
+    node.comb.stop(copy, None).await.unwrap();
+    age();
+    assert_eq!(node.comb.keep_images().await, 1);
+    assert!(!young(), "with no cell running from it, it ages");
+    node.comb.stop(id, None).await.unwrap();
+    node.comb.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_fork_starts_cells_from_what_the_cell_wrote() {
     let Some(node) = Node::new(4).await else { return };
     let id = node.comb.create(request(spec("python"))).await.unwrap().id;

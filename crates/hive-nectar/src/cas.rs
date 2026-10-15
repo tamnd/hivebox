@@ -504,6 +504,13 @@ impl BlobStore for Chunked {
         }
     }
 
+    fn reuse(&self, blob: BlobId) -> BoxFuture<'_, io::Result<BlobStat>> {
+        match self.recipes.get(&blob) {
+            Some(_) => self.stat(blob),
+            None => self.inner.reuse(blob),
+        }
+    }
+
     fn delete(&self, blob: BlobId) -> BoxFuture<'_, io::Result<()>> {
         self.inner.delete(blob)
     }
