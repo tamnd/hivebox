@@ -19,6 +19,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -27,6 +29,7 @@ use hyper::{Method, Request, StatusCode, Uri, http};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use md5::Md5;
 use sha2::{Digest, Sha256};
 
 use crate::BlobId;
@@ -51,6 +54,13 @@ const MAX_COPY: u64 = 5 << 30;
 
 /// The size of each part of a copy in parts.
 const COPY_PART: u64 = 1 << 30;
+
+/// The most objects one DeleteObjects request may name.
+const DELETE_MAX: usize = 1000;
+
+/// DeleteObjects requests in flight at once. A store may remove the objects one request names one
+/// after another, so a sweep splits what it removes into at least this many requests.
+const DELETES_IN_FLIGHT: usize = 16;
 
 /// The longest one request may take, body included, before it is tried again.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -335,6 +345,52 @@ impl S3Store {
         }
         let body = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
         Err(failure(&call, status, &body))
+    }
+
+    /// Removes `blobs` in [`DELETES_IN_FLIGHT`] requests or more, at most [`DELETE_MAX`] to a
+    /// request. One that is gone already is fine.
+    pub(crate) async fn delete_many(&self, blobs: &[BlobId]) -> io::Result<()> {
+        let per = blobs.len().div_ceil(DELETES_IN_FLIGHT).clamp(1, DELETE_MAX);
+        let mut batches = blobs.chunks(per);
+        let mut running = futures::stream::FuturesUnordered::new();
+        loop {
+            while running.len() < DELETES_IN_FLIGHT {
+                let Some(batch) = batches.next() else { break };
+                running.push(self.delete_batch(batch));
+            }
+            match running.next().await {
+                Some(done) => done?,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Removes `blobs` with one DeleteObjects request.
+    async fn delete_batch(&self, blobs: &[BlobId]) -> io::Result<()> {
+        let mut xml = String::from("<Delete><Quiet>true</Quiet>");
+        for b in blobs {
+            let key = escape(&format!("{}{b}", self.cfg.prefix));
+            let _ = write!(xml, "<Object><Key>{key}</Key></Object>");
+        }
+        xml.push_str("</Delete>");
+        let mut call = Call::new(Method::POST, self.bucket_path());
+        call.query = vec![("delete".into(), String::new())];
+        call.headers = vec![("content-md5", BASE64.encode(Md5::digest(&xml)))];
+        call.body = Payload::Signed(Bytes::from(xml));
+        let (_, body) = self.ok(&call).await?;
+        // Quiet, the store names only the objects it failed to remove.
+        let body = std::str::from_utf8(&body).map_err(io::Error::other)?;
+        for e in elements(body, "Error") {
+            if field(e, "Code") != Some("NoSuchKey") {
+                let key = field(e, "Key").map(unescape).unwrap_or_default();
+                let code = field(e, "Code").unwrap_or_default();
+                return Err(io::Error::other(format!(
+                    "{} {}: {key} {code}",
+                    call.method, call.path
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Begins a multipart upload to `path` and returns its id.
@@ -736,6 +792,11 @@ fn field<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     elements(xml, name).next()
 }
 
+/// `text` with the characters XML takes as markup escaped.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// `text` with the five XML escapes undone, and the numeric ones MinIO uses for quotes.
 fn unescape(text: &str) -> String {
     if !text.contains('&') {
@@ -1069,6 +1130,34 @@ mod tests {
         store.abort(&key, &id).await.unwrap();
         assert!(store.uploads(soon).await.unwrap().is_empty());
         store.abort(&other, &other_id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_blobs_go_in_few_requests() {
+        let Some(store) = bucket("deletes") else { return };
+        let dir = crate::tests::scratch();
+        // More than one request takes, and one blob that stays.
+        let blobs: Vec<BlobId> = futures::stream::iter(0..=DELETE_MAX + 2)
+            .map(|i| {
+                let (store, path) = (&store, dir.join(i.to_string()));
+                async move {
+                    std::fs::write(&path, i.to_string()).unwrap();
+                    let blob = BlobId::of(i.to_string().as_bytes());
+                    store.put(blob, &path).await.unwrap();
+                    blob
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        let (kept, gone) = blobs.split_last().unwrap();
+        let mut doomed = gone.to_vec();
+        doomed.push(BlobId::of(b"never stored"));
+        store.delete_many(&doomed).await.unwrap();
+        let listed: Vec<BlobId> =
+            store.list_blobs().await.unwrap().iter().map(|b| b.blob).collect();
+        assert_eq!(listed, [*kept]);
+        store.delete(*kept).await.unwrap();
     }
 
     #[test]
