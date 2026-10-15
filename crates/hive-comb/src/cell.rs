@@ -26,7 +26,7 @@ use prost::Message;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -156,6 +156,8 @@ pub(crate) struct Cell {
     pub(crate) spec: CellSpec,
     pub(crate) created: SystemTime,
     pub(crate) status: watch::Sender<Status>,
+    /// The image in the store it runs from, once it has its root filesystem.
+    pub(crate) image: OnceLock<BlobId>,
     drone: RwLock<Option<Client>>,
     last_active_ms: AtomicU64,
     ttls: RwLock<Ttls>,
@@ -178,6 +180,7 @@ impl Cell {
             idem_key,
             created,
             status: watch::Sender::new(status),
+            image: OnceLock::new(),
             drone: RwLock::new(None),
             last_active_ms: AtomicU64::new(now_ms()),
             ttls: RwLock::new(Ttls { hard: spec.hard_ttl, idle: spec.idle_ttl }),
@@ -461,6 +464,9 @@ impl Actor {
         };
         rootfs.seed = seed;
         self.record.image = image.as_ref().map(|(i, _)| i.as_bytes().to_vec()).unwrap_or_default();
+        if let Some((i, _)) = &image {
+            let _ = self.cell.image.set(*i);
+        }
         self.layers = image.map(|(_, lease)| lease);
         lap("rootfs");
         let handle = self.driver.prepare(self.cell.id, &self.cell.spec, &rootfs, &slot).await?;
@@ -563,6 +569,10 @@ impl Actor {
         if state.is_terminal() {
             // Already over and cleaned up. It only stays for others to see how it ended.
             return false;
+        }
+        if let Some(i) = self.record.image() {
+            self.inner.keep_image(i).await;
+            let _ = self.cell.image.set(i);
         }
         let Some(handle) = self.handle.clone() else {
             // It never got as far as the driver, so there is nothing to find or undo.

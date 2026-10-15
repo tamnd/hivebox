@@ -48,7 +48,7 @@ hive-nectar gc /var/lib/hivebox/images,/var/lib/hivebox/projects --store /var/li
 hive-nectar gc /var/lib/hivebox/images,/var/lib/hivebox/projects --store /var/lib/hivebox/store --sweep on
 ```
 
-The first prints what it would remove, and the second removes it. Imports and snapshots made while it runs are kept. When nodes share a store, pass the image directories of all of them. A snapshot, a fork or a cell made from one has no name file, so it is kept only while it is younger than `--keep-hours`. Set it longer than such cells live, or put their ids in a file and pass that too. Only a store in a directory can be collected for now, since a bucket cannot be listed yet.
+The first prints what it would remove, and the second removes it. Imports and snapshots made while it runs are kept. When nodes share a store, pass the image directories of all of them. A comb whose store is a directory gives the image of each of its cells a new time when the cell starts and every half hour after that, so the image a cell runs from is kept while the cell lives, even a snapshot with no name. A snapshot no cell runs from is kept only while it is younger than `--keep-hours`, so set that longer than clients hold on to snapshot ids, or put the ids in a file and pass that too. Only a store in a directory can be collected for now, since a bucket cannot be listed yet.
 
 ## A cluster
 

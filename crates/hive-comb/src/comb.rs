@@ -56,6 +56,10 @@ const CORDON_FILE: &str = "cordoned";
 const SEQ_BLOCK: u64 = 4096;
 /// A key turned away for room is turned away again for between half this and this.
 const TURNED_FOR: Duration = Duration::from_secs(600);
+
+/// How often the images live cells run from get a new time in the store, half the time a blob in
+/// use keeps its time, so `hive-nectar gc` never finds one older than an hour and a half.
+const KEEP_IMAGES: Duration = Duration::from_secs(hive_nectar::store::REFRESH.as_secs() / 2);
 /// The most keys `Turned` holds in one generation.
 const TURNED_MAX: usize = 65_536;
 
@@ -206,6 +210,8 @@ fn at(what: &str, path: &Path) -> impl FnOnce(io::Error) -> io::Error {
 /// the layers of snapshots.
 struct Nectar {
     store: Arc<dyn BlobStore>,
+    /// The store is a directory, which `hive-nectar gc` collects.
+    collected: bool,
     layers: Layers,
     importer: Option<Importer>,
 }
@@ -219,7 +225,8 @@ impl std::fmt::Debug for Nectar {
 impl Nectar {
     fn open(cfg: &Config) -> io::Result<Option<Self>> {
         let Some(dir) = &cfg.images.store else { return Ok(None) };
-        let store: Arc<dyn BlobStore> = match dir.to_str().filter(|d| d.starts_with("http://")) {
+        let bucket = dir.to_str().filter(|d| d.starts_with("http://"));
+        let store: Arc<dyn BlobStore> = match bucket {
             Some(url) => Arc::new(
                 S3Config::from_url_and_env(url)
                     .and_then(S3Store::new)
@@ -250,7 +257,7 @@ impl Nectar {
             .map(|i| i.chunked(Cuts::default()))
             .map_err(|e| eprintln!("hive-comb: snapshots are off: {e}"))
             .ok();
-        Ok(Some(Self { store, layers, importer }))
+        Ok(Some(Self { store, collected: bucket.is_none(), layers, importer }))
     }
 }
 
@@ -414,6 +421,20 @@ impl Comb {
                 eprintln!("hive-comb: removed {swept} cgroups no cell claims");
             }
             tokio::spawn(pool.clone().refill(comb.inner.shutdown.clone()));
+        }
+        if comb.inner.images.as_ref().is_some_and(|n| n.collected) {
+            let (keep, stop) = (comb.clone(), comb.inner.shutdown.clone());
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(KEEP_IMAGES);
+                every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = every.tick() => {}
+                        () = stop.cancelled() => return,
+                    }
+                    keep.keep_images().await;
+                }
+            });
         }
         let inner = &comb.inner;
         if inner.cfg.psi_stop_admit > 0.0 {
@@ -995,6 +1016,27 @@ impl Comb {
         self.inner.admission.committed()
     }
 
+    /// Gives the image of every cell that has not ended a new time in the store, as the comb does
+    /// every half hour by itself, and returns how many images that was.
+    pub async fn keep_images(&self) -> usize {
+        let images: HashSet<BlobId> = self
+            .inner
+            .shards
+            .iter()
+            .flat_map(|s| {
+                let s = s.read().unwrap_or_else(PoisonError::into_inner);
+                s.values()
+                    .filter(|c| !c.state().is_terminal())
+                    .filter_map(|c| c.image.get().copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for &id in &images {
+            self.inner.keep_image(id).await;
+        }
+        images.len()
+    }
+
     /// The comb's metrics, for the `/metrics` endpoint.
     #[must_use]
     pub fn metrics(&self) -> &Metrics {
@@ -1218,6 +1260,7 @@ impl Inner {
                 (format!("image {name}"), id)
             }
         };
+        self.keep_image(id).await;
         let Some(nectar) = &self.images else {
             return Err(Error::new(
                 Reason::ImageUnavailable,
@@ -1234,6 +1277,16 @@ impl Inner {
             .map_err(|e| unavailable(e.to_string()))?;
         let lowers = lease.lowers().to_vec();
         Ok((RootfsPlan { lowers, upper, seed: None }, Some((id, lease))))
+    }
+
+    /// Gives the manifest of image `id` a new time in the store, if the store is collected, so a
+    /// collection keeps it and everything it names. A manifest with no name, like a snapshot's,
+    /// is kept this way for as long as a cell runs from it.
+    pub(crate) async fn keep_image(&self, id: BlobId) {
+        if let Some(nectar) = self.images.as_ref().filter(|n| n.collected) {
+            // One the store lacks fails where the cell loads it.
+            let _ = nectar.store.reuse(id).await;
+        }
     }
 
     /// Where `project` keeps the ids of the images it committed, one file for each name.
