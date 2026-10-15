@@ -1750,6 +1750,7 @@ dependencies = [
 name = "hive-nectar"
 version = "0.0.52"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "flate2",

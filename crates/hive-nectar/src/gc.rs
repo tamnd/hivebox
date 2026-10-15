@@ -33,6 +33,9 @@ pub trait Collect: BlobStore {
     /// What puts left behind before `cutoff`, which no blob is made of.
     fn leftovers(&self, cutoff: SystemTime) -> BoxFuture<'_, io::Result<Vec<Leftover>>>;
 
+    /// Removes `blobs`. One that is gone already is fine.
+    fn remove<'a>(&'a self, blobs: &'a [BlobId]) -> BoxFuture<'a, io::Result<()>>;
+
     /// Removes `left`. One that is gone already is fine.
     fn clear<'a>(&'a self, left: &'a Leftover) -> BoxFuture<'a, io::Result<()>>;
 }
@@ -70,6 +73,11 @@ impl Collect for PosixStore {
         }))
     }
 
+    fn remove<'a>(&'a self, blobs: &'a [BlobId]) -> BoxFuture<'a, io::Result<()>> {
+        let deletes = blobs.iter().map(|b| self.delete(*b));
+        Box::pin(futures::stream::iter(deletes).buffer_unordered(IN_FLIGHT).try_collect())
+    }
+
     fn clear<'a>(&'a self, left: &'a Leftover) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let Leftover::File(f) = left else { return Ok(()) };
@@ -91,6 +99,10 @@ impl Collect for S3Store {
             let uploads = self.uploads(cutoff).await?;
             Ok(uploads.into_iter().map(|(key, id)| Leftover::Upload { key, id }).collect())
         })
+    }
+
+    fn remove<'a>(&'a self, blobs: &'a [BlobId]) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(self.delete_many(blobs))
     }
 
     fn clear<'a>(&'a self, left: &'a Leftover) -> BoxFuture<'a, io::Result<()>> {
@@ -190,7 +202,7 @@ pub async fn plan<S: Collect>(store: &S, roots: &[BlobId], cutoff: SystemTime) -
 }
 
 /// Removes what `plan` found, but for blobs written or used since, and what they name. Manifests
-/// go before recipes and recipes before the rest, each kind [`IN_FLIGHT`] at a time.
+/// go before recipes and recipes before the rest.
 ///
 /// # Errors
 ///
@@ -211,12 +223,10 @@ pub async fn sweep<S: Collect>(store: &S, plan: Plan) -> io::Result<Swept> {
     for phase in [manifests, recipes, rest] {
         let doomed: Vec<&Listed> = phase.iter().filter(|b| !live.contains(&b.blob)).collect();
         swept.spared += (phase.len() - doomed.len()) as u64;
-        let mut deletes = futures::stream::iter(doomed)
-            .map(|b| async move { store.delete(b.blob).await.map(|()| b.size) })
-            .buffer_unordered(IN_FLIGHT);
-        while let Some(size) = deletes.next().await {
-            swept.removed = (swept.removed.0 + 1, swept.removed.1 + size?);
-        }
+        let ids: Vec<BlobId> = doomed.iter().map(|b| b.blob).collect();
+        store.remove(&ids).await?;
+        let bytes: u64 = doomed.iter().map(|b| b.size).sum();
+        swept.removed = (swept.removed.0 + ids.len() as u64, swept.removed.1 + bytes);
     }
     for left in &plan.stale {
         store.clear(left).await?;

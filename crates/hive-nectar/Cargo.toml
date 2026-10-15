@@ -17,6 +17,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 flate2.workspace = true
