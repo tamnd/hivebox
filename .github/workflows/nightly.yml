@@ -38,12 +38,17 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: miri
-      # Library unit tests only. The daemons talk to the kernel and Miri cannot. The unsafe this job
-      # is for is in the WAL record codec, the guest protocol framing and the page server's
-      # bookkeeping, and those are libraries.
-      - run: cargo +nightly miri test --workspace --lib
+      # Library unit tests of the crates Miri can run. The rest call what Miri does not emulate
+      # (unshare, open_tree, posix_spawn, vsock and unix sockets, userfaultfd, fsync on a pipe) or
+      # take longer than ten minutes under it (hive-keeper, hive-nectar, hive-scout). hive-auth is
+      # out because biscuit gives a check one millisecond, which no check makes under Miri.
+      # Isolation is off so that tests may read the clock and the scratch directory.
+      - run: >-
+          cargo +nightly miri test --lib
+          -p hive-proto -p hive-types -p hive-gate -p hive-pollen -p hive-waggle -p hivectl
+          -p hive-cell-qemu -p hive-cell-wasm -p hive-cell-plugin
         env:
-          MIRIFLAGS: -Zmiri-strict-provenance
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-disable-isolation
 
   sanitizers:
     name: ${{ matrix.san }} sanitizer
@@ -62,12 +67,17 @@ jobs:
         with:
           key: san-${{ matrix.san }}
       # The thread sanitizer is here for the node agent's cell table and the page server, which are
-      # shared across threads by design and where a data race is a cell answering for another.
+      # shared across threads by design and where a data race is a cell answering for another. It
+      # runs the library tests only. The integration tests fork processes, hand tokio's registrations
+      # to the kernel through epoll and run wasmtime's fibers and signal handlers, none of which
+      # the sanitizer can follow, and the false reports there would bury a real one.
       - name: cargo test under the sanitizer
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.san }}
           RUSTDOCFLAGS: -Zsanitizer=${{ matrix.san }}
-        run: cargo +nightly test --workspace --all-features -Zbuild-std --target x86_64-unknown-linux-gnu
+        run: >-
+          cargo +nightly test --workspace --all-features -Zbuild-std --target x86_64-unknown-linux-gnu
+          --no-fail-fast ${{ matrix.san == 'thread' && '--lib' || '' }}
 
   advisories:
     name: advisories
