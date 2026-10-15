@@ -197,13 +197,13 @@ impl Snapshots for Api {
     async fn delete(&self, req: Request<v1::SnapshotRef>) -> Result<Response<v1::Empty>, Status> {
         let call = Call::new(self, &req, "snapshot.delete")?;
         let args = Args::default().str(&req.get_ref().id);
-        call.check(
-            "",
-            &args,
-            Err(Status::unimplemented(
-                "snapshots are images in the store, which has no garbage collection yet",
-            )),
-        )
+        let deleted = async {
+            let id = snapshot_id(Some(req.into_inner()))?;
+            self.comb.delete_snapshot(id).await.map_err(status)
+        }
+        .await;
+        call.done("", &args, &deleted);
+        deleted.map(|()| Response::new(v1::Empty {}))
     }
 }
 

@@ -528,6 +528,13 @@ async fn restore(comb: &Comb, snap: hive_nectar::BlobId) -> CellId {
     comb.create(request(s)).await.unwrap().id
 }
 
+/// Why a cell cannot be made from snapshot `snap`.
+async fn restore_err(comb: &Comb, snap: hive_nectar::BlobId) -> Error {
+    let mut s = spec("python");
+    s.source = Source::Snapshot(snap.to_string());
+    comb.create(request(s)).await.unwrap_err()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
     if std::env::var_os("HIVE_NECTAR_STORE").is_none() {
@@ -623,6 +630,9 @@ async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
     let e = node.comb.commit("p", clean, "../mine").await.unwrap_err();
     assert_eq!(e.reason, Reason::InvalidArgument, "{e}");
     node.comb.commit("p", clean, "mine").await.unwrap();
+    let e = node.comb.delete_snapshot(clean).await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied, "{e}");
+    assert!(e.message.ends_with("/images/mine"), "{e}");
     let named = node.comb.create(request(spec("mine"))).await.unwrap().id;
     let seen = "cat /root/note; test -e /root/.bash_history || echo gone; head -c 14 /srv/app/tests/key.pem";
     assert_eq!(sh(&node.comb, named, seen).await, "one\ngone\n-----BEGIN RSA");
@@ -636,7 +646,7 @@ async fn a_snapshot_restores_and_commits_what_the_cell_wrote() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_snapshot_stays_young_in_the_store_while_a_cell_runs_from_it() {
+async fn a_snapshot_stays_in_the_store_while_a_cell_runs_from_it() {
     if std::env::var_os("HIVE_NECTAR_STORE").is_none() {
         eprintln!("skipped: set HIVE_NECTAR_STORE to run it");
         return;
@@ -664,10 +674,25 @@ async fn a_snapshot_stays_young_in_the_store_while_a_cell_runs_from_it() {
     age();
     assert_eq!(node.comb.keep_images().await, 2);
     assert!(young(), "a cell running from it gives it a new time every half hour");
+    let e = node.comb.delete_snapshot(snap).await.unwrap_err();
+    assert_eq!(e.reason, Reason::PolicyDenied, "{e}");
+    assert!(e.message.contains(&copy.to_string()), "{e}");
+    let image = std::env::var("HIVE_NECTAR_IMAGE").unwrap().parse().unwrap();
+    let e = node.comb.delete_snapshot(image).await.unwrap_err();
+    assert_eq!(e.reason, Reason::InvalidArgument, "{e}");
     node.comb.stop(copy, None).await.unwrap();
     age();
     assert_eq!(node.comb.keep_images().await, 1);
     assert!(!young(), "with no cell running from it, it ages");
+
+    // Deleted, it is gone from the store, while the layers it shares stay for the collector.
+    let m = hive_nectar::oci::load_manifest(&store, snap).await.unwrap();
+    node.comb.delete_snapshot(snap).await.unwrap();
+    assert!(!path.exists());
+    assert!(store.path(m.layers.last().unwrap().meta).exists());
+    node.comb.delete_snapshot(snap).await.unwrap();
+    let e = restore_err(&node.comb, snap).await;
+    assert_eq!(e.reason, Reason::ImageUnavailable, "{e}");
     node.comb.stop(id, None).await.unwrap();
     node.comb.shutdown().await;
 }
