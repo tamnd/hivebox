@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The nightly workflow runs 20,000 simulation seeds: seeds 1 to 10,000, which the M1 exit criterion names, and 10,000 more starting from the day's number times 10,000, so each night adds seeds no night has run. They go in eight shards. On a GitHub runner the seeds took 146 s and the job about 4 minutes, and on server3 at a load of 43 to 48 they took 1,014 s. Both machines gave the same cells, late creates and events for every shard.
+
 ## 0.0.54
 
 A nightly workflow that passes.
