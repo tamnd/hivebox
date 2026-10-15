@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.50
+
+Forks that share one layer, and snapshots that restore again.
+
 - A fork into many children of a cell with many small files builds what the fork copied into one layer in the store, which all the children share, instead of copying it into each child's own writable layer. The comb weighs the two from what the copy held, its entries and bytes, and how many children there are, and builds the layer only when the copies would take about twice as long. A copy that holds hard links is always copied into each child, since a write to one link in a shared layer would part it from the others. On server3 at a load of 45 to 60, a fork into 16 children of a cell that wrote 5,000 small files took 8.2 to 10.2 s on 0.0.49 and 3.3 to 4.4 s now, over three runs each, while the same fork into 1 or 4 children, and a fork into 16 of a cell that wrote one 64 MiB file, still copy, at about the same times as before. The time the cell is frozen does not change. The new stage `fork_build` of `hive_snapshot_seconds` times building the layer. The store has no garbage collection yet, so these layers stay in it.
 - A cell made from a snapshot of an image with several layers starts again. Since 0.0.48 the oci driver gave the kernel all of a cell's layers as one string, which the kernel takes only up to 256 bytes, so the python image with a snapshot on top failed with EINVAL mounting its root. The layers now go one at a time on Linux 6.8 and later, and by their descriptors on older kernels. Found by the comb's snapshot test on server3.
 
