@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.53
+
+Batched deletes from a bucket, and wasmtime 36.0.18 for two advisories.
+
 - wasmtime and wasmtime-wasi are updated from 36.0.17 to 36.0.18, which fixes RUSTSEC-2026-0352, where a guest could rename a symlink with a trailing slash to reach outside its preopened directories, and RUSTSEC-2026-0363, where the component model capped the size of handle tables only per instance.
 - A sweep of a bucket removes objects with DeleteObjects, splitting them over 16 requests in flight, with at most 1,000 objects to a request, where it sent one DELETE per object. On server3 at a load of 68 to 89, sweeping the comb test node's store from SeaweedFS 4.48, 9,428 objects in 671 MiB with one image kept, took 10.2 and 10.4 s in 16 requests, where main took 10.9, 11.4 and 22.7 s in 9,428. Sending 1,000 objects to a request with 4 in flight was slower, 14.6 and 16.0 s, since the store removes the objects one request names one after another.
 
