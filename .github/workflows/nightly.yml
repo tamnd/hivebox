@@ -94,6 +94,34 @@ jobs:
       # already deployed.
       - run: cargo deny --all-features check advisories bans
 
+  # The M1 exit criterion is 10,000 seeds clean, and seeds 1 to 10,000 are those. A second 10,000
+  # starting from the day's number times 10,000 adds seeds no night has run before. hive-sim is one
+  # thread, so the 20,000 go in eight shards over the runner's cores. A seed that breaks an
+  # invariant prints its number, and `hive-sim --seed N --trace` replays it.
+  simulation:
+    name: 20K simulation seeds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: sim
+      - run: cargo build --release --locked -p hive-sim --bin hive-sim
+      - name: the seeds
+        run: |
+          day=$(( $(date -u +%s) / 86400 * 10000 ))
+          rc=0
+          pids=()
+          for from in 1 2501 5001 7501 $day $(( day + 2500 )) $(( day + 5000 )) $(( day + 7500 )); do
+            target/release/hive-sim --seeds 2500 --from "$from" > "sim-$from.txt" &
+            pids+=($!)
+          done
+          for p in "${pids[@]}"; do wait "$p" || rc=1; done
+          cat sim-*.txt
+          exit $rc
+
   # Named so the gap is visible rather than implicit. Each line becomes a real job at the milestone
   # that makes it possible, per spec/13_observability_testing_bench.md and spec/14_roadmap.md.
   planned:
@@ -105,7 +133,6 @@ jobs:
           cat <<'LIST'
           the driver conformance suite on a KVM capable self-hosted runner         M0
           SWE-bench Verified gold patches through the container tier               M0
-          10K deterministic simulation seeds over the control plane                M1
           E2B compatibility suite, slime SWE unmodified                            M1
           fuzzing the guest protocol, the WAL codec and the image parsers          M1
           the escape corpus against every tier and network profile                 M3
