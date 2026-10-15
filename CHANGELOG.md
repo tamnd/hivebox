@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.49
+
+Wasm creates that do not wait on the disk.
+
 - Wasm creates no longer wait for the WAL to sync. A wasm cell lives in the comb, so a restart finds it gone with or without its record, and two syncs were most of what a create cost. Its records are still written, in order, and the next write that waits finds them on disk. On server3 at a load of 13 to 39, a create storm of wasm cells at 25 a second went from a median of 14.8 and 19.3 ms to 2.4 and 2.5 ms over two runs each, and the comb's own mean time for a create from 171 and 281 ms to 51 and 133 ms over the whole storm.
 
 ## 0.0.48
@@ -11,6 +15,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 Container creates that stay fast with thousands of cells up.
 
 - Container creates no longer slow down as cells pile up (#183). Each cell's overlay used to be mounted in the host's mount namespace, next to a bind of its network namespace, and every create copied that whole table, under a lock all the workers share. Now the comb makes the overlay as a mount attached nowhere, and hands it and the network namespace to the worker as descriptors. Each worker makes its containers from a private mount namespace of its own, attaches the root there only for the create, and drops the namespace binds it started with, so what a create copies stays the same size however many cells are up. On server3, 2,500 container cells took 170 s to make with the default 30 s create deadline, against 538 s with the deadline raised to 120 s before, and the host mount table grew by one entry a cell, the network namespace, where it used to grow by two. The node needs Linux 5.2 or later for the new mount calls.
+
 ## 0.0.47
 
 Fixes from the first node run, and the rest of CI.
