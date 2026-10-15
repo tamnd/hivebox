@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -201,12 +201,11 @@ impl OciDriver {
             // After the tag, so all that is copied in is the cell's and counts against its quota.
             hive_cell::tree::copy(seed, &rootfs.upper)?;
         }
-        let lowers: Vec<String> = rootfs.lowers.iter().map(|l| l.display().to_string()).collect();
         // The root is a mount on a descriptor, attached nowhere on the host. The worker attaches
         // it in its own mount namespace for the length of the create, and the container's copy
         // keeps it after that. Attached here, every cell would add a mount to the table that
         // every create copies.
-        let mounted = overlay(&lowers.join(":"), &rootfs.upper, &work)
+        let mounted = overlay(&rootfs.lowers, &rootfs.upper, &work)
             .map_err(|e| std::io::Error::other(format!("mounting the root filesystem: {e}")))?;
         let cgroup = slot.cgroup.strip_prefix(CGROUP_ROOT).map_err(|_| {
             std::io::Error::other(format!("{} is not under {CGROUP_ROOT}", slot.cgroup.display()))
@@ -662,13 +661,28 @@ fn spawn_worker(cmd: &[OsString], exits: Arc<Exits>) -> Option<(Child, UnixStrea
 }
 
 /// An overlay of `lowers` under `upper`, as a mount on a descriptor that is attached nowhere.
-fn overlay(lowers: &str, upper: &Path, work: &Path) -> rustix::io::Result<OwnedFd> {
+fn overlay(lowers: &[PathBuf], upper: &Path, work: &Path) -> rustix::io::Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
     use rustix::mount::{
         FsMountFlags, FsOpenFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag,
         fsconfig_set_string, fsmount, fsopen,
     };
-    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
-    fsconfig_set_string(&fs, "lowerdir", lowers)?;
+    // The kernel takes at most 256 bytes in one string here, which an image of five layers and a
+    // snapshot already passes. Linux 6.8 and later take the layers one at a time.
+    let mut fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
+    let mut held = Vec::new();
+    if lowers.iter().try_for_each(|l| fsconfig_set_string(&fs, "lowerdir+", l)).is_err() {
+        // Older ones take them only as one string, so the layers go by their descriptors, which
+        // stay open until the mount is made.
+        fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
+        for l in lowers {
+            let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            held.push(rustix::fs::open(l, flags, Mode::empty())?);
+        }
+        let paths: Vec<String> =
+            held.iter().map(|d| format!("/proc/self/fd/{}", d.as_raw_fd())).collect();
+        fsconfig_set_string(&fs, "lowerdir", paths.join(":"))?;
+    }
     fsconfig_set_string(&fs, "upperdir", upper)?;
     fsconfig_set_string(&fs, "workdir", work)?;
     // volatile skips every sync, which a cell's scratch layer never needs.
@@ -721,5 +735,42 @@ mod tests {
         let e = OciDriver::new(cfg).err().unwrap();
         assert!(e.to_string().contains("not a static ELF"), "{e}");
         std::fs::remove_file(&script).unwrap();
+    }
+
+    #[test]
+    fn an_overlay_takes_more_layers_than_fit_in_one_string() {
+        let dir = std::env::temp_dir().join(format!("hive-overlay-{}", std::process::id()));
+        let lowers: Vec<PathBuf> = (0..8)
+            .map(|i| dir.join(format!("layers/caeaacaabaaaagacb74iigrroxy{i}/mnt")))
+            .collect();
+        for (i, l) in lowers.iter().enumerate() {
+            std::fs::create_dir_all(l).unwrap();
+            std::fs::write(l.join("which"), format!("{i}\n")).unwrap();
+            std::fs::write(l.join(format!("only{i}")), "").unwrap();
+        }
+        let (upper, work) = (dir.join("upper"), dir.join("work"));
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        assert!(lowers.iter().map(|l| l.as_os_str().len() + 1).sum::<usize>() > 256);
+        let root = match overlay(&lowers, &upper, &work) {
+            Err(e) if e == rustix::io::Errno::PERM => {
+                eprintln!("skipped: making a mount needs root");
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+            r => r.unwrap(),
+        };
+        let read = |name: &str| {
+            let flags = rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC;
+            let fd = rustix::fs::openat(&root, name, flags, rustix::fs::Mode::empty()).unwrap();
+            std::io::read_to_string(std::fs::File::from(fd)).unwrap()
+        };
+        // The first layer is the top one, and every layer shows through.
+        assert_eq!(read("which"), "0\n");
+        for i in 0..8 {
+            assert_eq!(read(&format!("only{i}")), "");
+        }
+        drop(root);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
