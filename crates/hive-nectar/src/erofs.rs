@@ -13,8 +13,10 @@
 //! maps them with an idmapped mount instead.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -267,11 +269,12 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
     let mut tee = Tee { from: &mut plain, to, at: 0, skip: Vec::new() };
     let mut dirs = Dirs::new();
     let mut end = 0;
+    let mut path = Vec::new();
     {
         let mut archive = tar::Archive::new(&mut tee);
         for entry in archive.entries_with_seek()? {
             let mut entry = entry?;
-            let path = clean(&entry.path()?);
+            clean(&entry.path_bytes(), &mut path);
             // Every directory above a path is listed in full, so a long one costs the square of
             // its length. No path the kernel takes is this long.
             if path.len() >= PATH_MAX {
@@ -279,7 +282,7 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
                     io::ErrorKind::InvalidData,
                     format!(
                         "{}... is a path of 4 KiB or more",
-                        path.chars().take(64).collect::<String>()
+                        String::from_utf8_lossy(&path[..64])
                     ),
                 ));
             }
@@ -315,23 +318,26 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
         h.set_gid(0);
         h.set_mtime(0);
         h.set_size(0);
-        b.append_data(&mut h, name, io::empty())
+        b.append_data(&mut h, Path::new(OsStr::from_bytes(name)), io::empty())
     })?;
     let mut out = b.into_inner()?;
     out.flush()?;
     Ok(out)
 }
 
-/// A path in a tar as `a/b/c`, with no leading `./` or `/` and no trailing `/`.
-fn clean(path: &Path) -> String {
-    let parts: Vec<_> = path
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(p) => Some(p.to_string_lossy()),
-            _ => None,
-        })
-        .collect();
-    parts.join("/")
+/// A path in a tar as `a/b/c` into `out`, with no leading `./` or `/`, no trailing `/` and no
+/// `.` or `..`. It stays bytes, as two names that are not UTF-8 are two names to `mkfs.erofs`.
+fn clean(path: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    for part in path.split(|&b| b == b'/') {
+        if matches!(part, b"" | b"." | b"..") {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
 }
 
 /// The longest path [`prepare`] takes, less one, as with the kernel's `PATH_MAX`.
@@ -362,11 +368,16 @@ impl Kind {
 /// Those are kept apart from the tree, so a directory of one file does not cost a node of a map.
 struct Dirs {
     nodes: Vec<Dir>,
-    others: HashSet<(usize, Box<str>)>,
+    others: HashSet<(usize, Box<[u8]>)>,
+    /// The last path added, with a `/` after it.
+    last: Vec<u8>,
+    /// The directories it walked through, as where each ends in it and its node, so that the
+    /// next path, which in a tar is mostly in the same directory, starts where they part.
+    chain: Vec<(usize, usize)>,
 }
 
 struct Dir {
-    children: BTreeMap<String, usize>,
+    children: BTreeMap<Box<[u8]>, usize>,
     listed: bool,
     implied: bool,
 }
@@ -379,7 +390,12 @@ impl Dir {
 
 impl Dirs {
     fn new() -> Self {
-        Self { nodes: vec![Dir::new()], others: HashSet::new() }
+        Self {
+            nodes: vec![Dir::new()],
+            others: HashSet::new(),
+            last: Vec::new(),
+            chain: Vec::new(),
+        }
     }
 
     /// Notes an entry at `path`, as [`clean`] has it. A later entry replaces an earlier one, as
@@ -390,22 +406,37 @@ impl Dirs {
     ///
     /// `InvalidData` if the path is under something not a directory, which `mkfs.erofs` fails on
     /// only after it has made a meta file of 2 TiB, or the entry is a whiteout of no name.
-    fn add(&mut self, path: &str, kind: Kind) -> io::Result<()> {
-        let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{path} {what}"));
-        let mut at = 0;
+    fn add(&mut self, path: &[u8], kind: Kind) -> io::Result<()> {
+        let bad = |what: &str| {
+            let path = String::from_utf8_lossy(path);
+            io::Error::new(io::ErrorKind::InvalidData, format!("{path} {what}"))
+        };
+        // Every directory in the chain is still in the tree, as a later entry only replaces what
+        // is at its own path, and the chain is cut back to what is above that first.
+        let same = path.iter().zip(&self.last).take_while(|(a, b)| a == b).count();
+        self.chain.truncate(self.chain.partition_point(|&(end, _)| end < same));
+        let (mut at, mut start) = self.chain.last().map_or((0, 0), |&(end, at)| (at, end + 1));
+        self.last.clear();
+        self.last.extend_from_slice(path);
+        self.last.push(b'/');
+        self.nodes[0].implied = true;
         self.nodes[at].implied = true;
-        let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_some() {
+        while start < path.len() {
+            let end =
+                path[start..].iter().position(|&b| b == b'/').map_or(path.len(), |i| start + i);
+            let part = &path[start..end];
+            if end < path.len() {
                 at = self
                     .dir(at, part, false)
                     .ok_or_else(|| bad("is under something not a directory"))?;
                 self.nodes[at].implied = true;
+                self.chain.push((end, at));
+                start = end + 1;
                 continue;
             }
-            let (name, kind) = match part.strip_prefix(".wh.") {
-                _ if kind == Kind::Skipped || part == ".wh..wh..opq" => return Ok(()),
-                Some("") => return Err(bad("is a whiteout of no name")),
+            let (name, kind) = match part.strip_prefix(b".wh.") {
+                _ if kind == Kind::Skipped || part == b".wh..wh..opq" => return Ok(()),
+                Some(b"") => return Err(bad("is a whiteout of no name")),
                 Some(name) => (name, Kind::NotDir),
                 None => (part, kind),
             };
@@ -415,6 +446,8 @@ impl Dirs {
                 return Ok(());
             }
             at = self.dir(at, name, true).expect("a directory takes the place of anything");
+            self.chain.push((end, at));
+            break;
         }
         if kind == Kind::Dir {
             self.nodes[at].listed = true;
@@ -424,11 +457,11 @@ impl Dirs {
 
     /// The directory `name` in `at`, made if there is none. Where something else is, it is
     /// `None`, unless `replace` says a new directory takes its place.
-    fn dir(&mut self, at: usize, name: &str, replace: bool) -> Option<usize> {
+    fn dir(&mut self, at: usize, name: &[u8], replace: bool) -> Option<usize> {
         if let Some(&next) = self.nodes[at].children.get(name) {
             return Some(next);
         }
-        let key = (at, Box::<str>::from(name));
+        let key = (at, Box::<[u8]>::from(name));
         if self.others.contains(&key) {
             if !replace {
                 return None;
@@ -437,19 +470,19 @@ impl Dirs {
         }
         let next = self.nodes.len();
         self.nodes.push(Dir::new());
-        self.nodes[at].children.insert(key.1.into_string(), next);
+        self.nodes[at].children.insert(key.1, next);
         Some(next)
     }
 
     /// Calls `f` with each directory something is in that the tar does not list, as `./` for the
-    /// root and `a/b/` below it, in the order of their paths as strings. That puts `a-c` before
+    /// root and `a/b/` below it, in the order of their paths as bytes. That puts `a-c` before
     /// `a/b`, and `mkfs.erofs` builds a different layer from the same directories in another order.
-    fn missing(&self, mut f: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+    fn missing(&self, mut f: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
         let root = &self.nodes[0];
         if root.implied && !root.listed {
-            f("./")?;
+            f(b"./")?;
         }
-        let mut path = String::new();
+        let mut path = Vec::new();
         let mut stack = vec![(self.under(0), 0, 0)];
         while let Some((items, i, len)) = stack.last_mut() {
             let Some(&(name, next, descend)) = items.get(*i) else {
@@ -458,8 +491,8 @@ impl Dirs {
             };
             *i += 1;
             path.truncate(*len);
-            path.push_str(name);
-            path.push('/');
+            path.extend_from_slice(name);
+            path.push(b'/');
             if descend {
                 let len = path.len();
                 stack.push((self.under(next), 0, len));
@@ -472,21 +505,21 @@ impl Dirs {
 
     /// What [`Dirs::missing`] walks in `dir`, in order: each child to list, sorted by its name,
     /// and each child to walk into, sorted by its name and a `/`.
-    fn under(&self, dir: usize) -> Vec<(&str, usize, bool)> {
+    fn under(&self, dir: usize) -> Vec<(&[u8], usize, bool)> {
         let mut items = Vec::new();
         for (name, &child) in &self.nodes[dir].children {
             let d = &self.nodes[child];
             if d.implied && !d.listed {
-                items.push((name.as_str(), child, false));
+                items.push((&name[..], child, false));
             }
             if !d.children.is_empty() {
-                items.push((name.as_str(), child, true));
+                items.push((&name[..], child, true));
             }
         }
         fn key<'a>(
-            &(name, _, descend): &(&'a str, usize, bool),
+            &(name, _, descend): &(&'a [u8], usize, bool),
         ) -> impl Iterator<Item = u8> + use<'a> {
-            name.bytes().chain(descend.then_some(b'/'))
+            name.iter().copied().chain(descend.then_some(b'/'))
         }
         items.sort_by(|a, b| key(a).cmp(key(b)));
         items
@@ -824,6 +857,9 @@ mod tests {
         // A directory where a file was is a new one.
         let got = added(&[("a/b", b'0'), ("a/b/", b'5'), ("a/b/c/d", b'0')]).unwrap();
         assert_eq!(got, ["./", "a/", "a/b/c/"]);
+        // Also right after a path that went through the old one.
+        let got = added(&[("a/b/c/d", b'0'), ("a/b", b'0'), ("a/b/", b'5'), ("a/b/c/e", b'0')]);
+        assert_eq!(got.unwrap(), ["./", "a/", "a/b/c/"]);
         // A type mkfs.erofs skips, the old one for a file among them, takes nothing.
         let got = added(&[("a/b/c", b'0'), ("a/b", b'\0'), ("a/.wh..wh..opq", b'0')]).unwrap();
         assert_eq!(got, ["./", "a/", "a/b/"]);
@@ -835,12 +871,37 @@ mod tests {
             let e = added(&[("a/b", ty), ("a/b/c", b'0')]).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidData, "type {}", ty as char);
         }
+        // Also right after a path that went through what the file took the place of.
+        let e = added(&[("a/b/c/d", b'0'), ("a/b", b'0'), ("a/b/c/e", b'0')]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         let e = added(&[("a/.wh.b", b'0'), ("a/b/c/", b'5')]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         let e = added(&[("a/.wh.", b'0')]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         // Once a directory is there again, what is under it is fine.
         assert!(added(&[("a/b", b'0'), ("a/b/", b'5'), ("a/b/c", b'0')]).is_ok());
+    }
+
+    #[test]
+    fn prepare_keeps_names_that_are_not_utf8_apart() {
+        let mut b = tar::Builder::new(Vec::new());
+        for name in [&b"\xff/x"[..], b"\xfe/y", b"\xef\xbf\xbd/z"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_mode(0o644);
+            h.set_size(0);
+            b.append_data(&mut h, Path::new(OsStr::from_bytes(name)), io::empty()).unwrap();
+        }
+        let out = prepare(&b.into_inner().unwrap()[..], Vec::new()).unwrap();
+        let mut archive = tar::Archive::new(&out[..]);
+        let names: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .skip(3)
+            .map(|e| e.unwrap().path_bytes().into_owned())
+            .collect();
+        // The last is U+FFFD, which is what the first two would be as strings.
+        assert_eq!(names, [&b"./"[..], b"\xef\xbf\xbd/", b"\xfe/", b"\xff/"]);
     }
 
     #[test]
