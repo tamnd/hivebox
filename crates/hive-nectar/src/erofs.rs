@@ -12,7 +12,7 @@
 //! `mkfs.erofs` to invent with the time of the build. Owners stay as the image has them, and the node
 //! maps them with an idmapped mount instead.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -251,7 +251,8 @@ fn feed(child: &mut Child, fifo: &Path, src: impl Read) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// `src` is not a tar, it has more than a MiB of padding after its end, or `out` fails.
+/// `src` is not a tar, it has a path of 4 KiB or more, it has more than a MiB of padding after its
+/// end, or `out` fails.
 pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
     let mut src = io::BufReader::with_capacity(1 << 20, src);
     let gzipped = src.fill_buf()?.starts_with(&[0x1f, 0x8b]);
@@ -263,14 +264,24 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
     // The end of the tar is only known once the parser has read past it, so the copy runs a MiB
     // behind the parser and the end-of-archive blocks are never sent.
     let mut tee = Tee { from: &mut plain, to: Lagged { out, buf: Vec::new(), sent: 0 } };
-    let mut seen = BTreeSet::new();
-    let mut implied = BTreeSet::new();
+    let mut dirs = Dirs::new();
     let mut end = 0;
     {
         let mut archive = tar::Archive::new(&mut tee);
         for entry in archive.entries()? {
             let mut entry = entry?;
             let path = clean(&entry.path()?);
+            // Every directory above a path is listed in full, so a long one costs the square of
+            // its length. No path the kernel takes is this long.
+            if path.len() >= PATH_MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}... is a path of 4 KiB or more",
+                        path.chars().take(64).collect::<String>()
+                    ),
+                ));
+            }
             // What the entry takes in the stream, which a PAX size overrides. It is not
             // `size()`, which for a sparse file is the size it unpacks to.
             let mut stored = entry.header().entry_size()?;
@@ -285,15 +296,7 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
                 }
             }
             end = entry.raw_file_position() + stored.div_ceil(512) * 512;
-            let mut parent = path.as_str();
-            while let Some((up, _)) = parent.rsplit_once('/') {
-                implied.insert(up.to_owned());
-                parent = up;
-            }
-            implied.insert(String::new());
-            if entry.header().entry_type().is_dir() {
-                seen.insert(path);
-            }
+            dirs.add(&path, entry.header().entry_type().is_dir());
         }
     }
     // Whoever hashes `src` needs all of it, padding and anything after the gzip stream too.
@@ -302,7 +305,7 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
     drop(plain);
     io::copy(&mut src, &mut io::sink())?;
     let mut b = tar::Builder::new(lagged.finish(end)?);
-    for dir in implied.difference(&seen) {
+    dirs.missing(|name| {
         let mut h = tar::Header::new_ustar();
         h.set_entry_type(tar::EntryType::Directory);
         h.set_mode(0o755);
@@ -310,9 +313,8 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
         h.set_gid(0);
         h.set_mtime(0);
         h.set_size(0);
-        let name = if dir.is_empty() { "./".to_owned() } else { format!("{dir}/") };
-        b.append_data(&mut h, name, io::empty())?;
-    }
+        b.append_data(&mut h, name, io::empty())
+    })?;
     let mut out = b.into_inner()?;
     out.flush()?;
     Ok(out)
@@ -328,6 +330,112 @@ fn clean(path: &Path) -> String {
         })
         .collect();
     parts.join("/")
+}
+
+/// The longest path [`prepare`] takes, less one, as with the kernel's `PATH_MAX`.
+const PATH_MAX: usize = 4096;
+
+/// The directories in a tar, as a tree of names, with whether the tar lists each one and whether
+/// it has anything in it.
+struct Dirs {
+    nodes: Vec<Dir>,
+}
+
+struct Dir {
+    children: BTreeMap<String, usize>,
+    listed: bool,
+    implied: bool,
+}
+
+impl Dir {
+    const fn new() -> Self {
+        Self { children: BTreeMap::new(), listed: false, implied: false }
+    }
+}
+
+impl Dirs {
+    fn new() -> Self {
+        Self { nodes: vec![Dir::new()] }
+    }
+
+    /// Notes an entry at `path`, as [`clean`] has it.
+    fn add(&mut self, path: &str, is_dir: bool) {
+        let mut at = 0;
+        self.nodes[at].implied = true;
+        let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
+        while let Some(part) = parts.next() {
+            let last = parts.peek().is_none();
+            if last && !is_dir {
+                break;
+            }
+            at = match self.nodes[at].children.get(part) {
+                Some(&next) => next,
+                None => {
+                    let next = self.nodes.len();
+                    self.nodes.push(Dir::new());
+                    self.nodes[at].children.insert(part.to_owned(), next);
+                    next
+                }
+            };
+            if !last {
+                self.nodes[at].implied = true;
+            }
+        }
+        if is_dir {
+            self.nodes[at].listed = true;
+        }
+    }
+
+    /// Calls `f` with each directory something is in that the tar does not list, as `./` for the
+    /// root and `a/b/` below it, in the order of their paths as strings. That puts `a-c` before
+    /// `a/b`, and `mkfs.erofs` builds a different layer from the same directories in another order.
+    fn missing(&self, mut f: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+        let root = &self.nodes[0];
+        if root.implied && !root.listed {
+            f("./")?;
+        }
+        let mut path = String::new();
+        let mut stack = vec![(self.under(0), 0, 0)];
+        while let Some((items, i, len)) = stack.last_mut() {
+            let Some(&(name, next, descend)) = items.get(*i) else {
+                stack.pop();
+                continue;
+            };
+            *i += 1;
+            path.truncate(*len);
+            path.push_str(name);
+            path.push('/');
+            if descend {
+                let len = path.len();
+                stack.push((self.under(next), 0, len));
+            } else {
+                f(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What [`Dirs::missing`] walks in `dir`, in order: each child to list, sorted by its name,
+    /// and each child to walk into, sorted by its name and a `/`.
+    fn under(&self, dir: usize) -> Vec<(&str, usize, bool)> {
+        let mut items = Vec::new();
+        for (name, &child) in &self.nodes[dir].children {
+            let d = &self.nodes[child];
+            if d.implied && !d.listed {
+                items.push((name.as_str(), child, false));
+            }
+            if !d.children.is_empty() {
+                items.push((name.as_str(), child, true));
+            }
+        }
+        fn key<'a>(
+            &(name, _, descend): &(&'a str, usize, bool),
+        ) -> impl Iterator<Item = u8> + use<'a> {
+            name.bytes().chain(descend.then_some(b'/'))
+        }
+        items.sort_by(|a, b| key(a).cmp(key(b)));
+        items
+    }
 }
 
 /// Passes reads through and writes a copy of them.
@@ -551,6 +659,56 @@ mod tests {
                 (format!("usr/lib/{x}/"), 0, 0),
             ]
         );
+    }
+
+    #[test]
+    fn prepare_takes_a_path_under_4_kib_and_refuses_one_over() {
+        let tar_of = |path: &str| {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_mode(0o644);
+            h.set_size(1);
+            b.append_data(&mut h, path, &b"x"[..]).unwrap();
+            b.into_inner().unwrap()
+        };
+        // 2,047 directories, each listed by its whole path.
+        let deep = format!("{}f", "a/".repeat(PATH_MAX / 2 - 1));
+        assert_eq!(deep.len(), PATH_MAX - 1);
+        let out = prepare(&tar_of(&deep)[..], Vec::new()).unwrap();
+        let entries = tar::Archive::new(&out[..]).entries().unwrap().count();
+        assert_eq!(entries, 1 + 1 + PATH_MAX / 2 - 1);
+        let e = prepare(&tar_of(&format!("a{deep}"))[..], io::sink()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn prepare_lists_missing_directories_in_the_order_of_their_paths() {
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, kind) in [
+            ("a-c/x", tar::EntryType::Regular),
+            ("./", tar::EntryType::Directory),
+            ("a/b/c/", tar::EntryType::Directory),
+            ("a/b/f", tar::EntryType::Regular),
+            ("a.b/d/e", tar::EntryType::Regular),
+            ("a/b", tar::EntryType::Regular),
+            ("z/", tar::EntryType::Directory),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_mode(0o644);
+            h.set_size(0);
+            b.append_data(&mut h, name, io::empty()).unwrap();
+        }
+        let out = prepare(&b.into_inner().unwrap()[..], Vec::new()).unwrap();
+        let mut archive = tar::Archive::new(&out[..]);
+        let names: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .skip(7)
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["a/", "a-c/", "a.b/", "a.b/d/", "a/b/"]);
     }
 
     #[test]

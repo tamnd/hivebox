@@ -4,6 +4,8 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- Rewriting a tar for `mkfs.erofs` refuses a path of 4 KiB or more, which the kernel would not take anyway. Every directory above a path was listed in full, so one long path cost the square of its length: on server3 a single path of 16 KiB took 2.3 to 2.7 s, 32 KiB took 17 s and 64 KiB took 40 to 64 s with 1.05 GB resident, all from a tar of a few kilobytes. A 4 KiB path now takes 160 to 360 ms and a 64 KiB one is refused in under 50 ms. The directories the tar only implies are kept as a tree and listed in the same order as before, so the layers built from a small image, a 200,000 file image and a tar of awkward names hash the same as on 0.0.56.
+
 ## 0.0.56
 
 The handshake under the fuzzer, and an OCI index read once.
