@@ -96,11 +96,12 @@ impl Leaves {
     /// Whether `data` is chunk `chunk` of the blob.
     #[must_use]
     pub fn check(&self, chunk: u64, data: &[u8]) -> bool {
-        let start = chunk * CHUNK;
-        let want = CHUNK.min(self.size.saturating_sub(start));
+        // Bounds first: a chunk past the end could overflow the multiplication below.
         let Some(cv) = self.cvs.get(usize::try_from(chunk).unwrap_or(usize::MAX)) else {
             return false;
         };
+        let start = chunk * CHUNK;
+        let want = CHUNK.min(self.size.saturating_sub(start));
         if data.len() as u64 != want {
             return false;
         }
@@ -180,6 +181,7 @@ mod tests {
                 assert!(!leaves.check(i as u64, &bad), "len {len} chunk {i} flipped");
             }
             assert!(!leaves.check(leaves.chunks(), &[]));
+            assert!(!leaves.check(u64::MAX, &[]));
             if leaves.chunks() > 1 {
                 let mut wrong = leaves.to_bytes();
                 wrong[5] ^= 1;

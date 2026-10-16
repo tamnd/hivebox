@@ -4,6 +4,7 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+- The nightly workflow fuzzes what a guest, a torn disk or a bad image can hand the node, with five libFuzzer targets in `fuzz/`: the guest frame codec, the node end of the guest channel, WAL replay, the blobs nectar stores (chunk recipes, page traces, manifests and BLAKE3 leaves) and the tar to EROFS writer. Each runs ten minutes under the address sanitizer with debug assertions on, five at once, and the corpus carries over from night to night. The first run found that `Leaves::check` multiplied the chunk number before checking it was in range, which panics on a huge chunk number in a build with overflow checks, and it now checks the range first. Release builds wrapped and still returned false, and every caller passes a chunk in range. On a GitHub runner the build took 8 m 29 s, and in ten minutes each the targets ran 3,885,213 frame inputs, 2,077,542 channel inputs, 1,337,118 WAL logs, 27,640,365 blobs and 621,334 tars, with nothing found.
 - The nightly workflow runs 20,000 simulation seeds: seeds 1 to 10,000, which the M1 exit criterion names, and 10,000 more starting from the day's number times 10,000, so each night adds seeds no night has run. They go in eight shards. On a GitHub runner the seeds took 146 s and the job about 4 minutes, and on server3 at a load of 43 to 48 they took 1,014 s. Both machines gave the same cells, late creates and events for every shard.
 
 ## 0.0.54
