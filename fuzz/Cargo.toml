@@ -19,12 +19,20 @@ hive-comb = { path = "../crates/hive-comb" }
 hive-nectar = { path = "../crates/hive-nectar" }
 hive-proto = { path = "../crates/hive-proto" }
 libfuzzer-sys = "0.4"
+prost = "0.14"
 tokio = { version = "1.53", default-features = false, features = ["io-util", "macros", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
 [[bin]]
 name = "frame"
 path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
 test = false
 doc = false
 bench = false

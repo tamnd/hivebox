@@ -1231,6 +1231,7 @@ dependencies = [
  "hive-nectar",
  "hive-proto",
  "libfuzzer-sys",
+ "prost",
  "tokio",
  "tokio-util",
 ]

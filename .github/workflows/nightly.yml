@@ -123,10 +123,11 @@ jobs:
           exit $rc
 
   # libFuzzer on what a hostile guest, a torn disk or a bad image can hand the node: the guest frame
-  # codec and the node end of the channel, WAL replay, the blobs nectar stores and the tar to EROFS
-  # writer. The targets are in fuzz/. Each runs ten minutes, five at once on the runner's four
-  # cores, and the corpus carries over from night to night so each night starts where the last one
-  # stopped. An input that fails is uploaded, and `cargo +nightly fuzz run -a TARGET FILE` replays it.
+  # codec, the handshake and the node end of the channel, WAL replay, the blobs nectar stores and
+  # the tar to EROFS writer. The targets are in fuzz/. Each runs ten minutes, six at once on the
+  # runner's four cores, and the corpus carries over from night to night so each night starts where
+  # the last one stopped. An input that fails is uploaded, and `cargo +nightly fuzz run -a TARGET
+  # FILE` replays it.
   fuzz:
     name: fuzzing
     runs-on: ubuntu-24.04
@@ -156,14 +157,14 @@ jobs:
         working-directory: fuzz
         run: |
           declare -A pid
-          for t in frame channel wal blobs erofs; do
+          for t in frame handshake channel wal blobs erofs; do
             cargo +nightly fuzz run -a --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=600 -rss_limit_mb=2048 -timeout=30 > "$t.log" 2>&1 &
             pid[$t]=$!
           done
           # A clean target shows its last lines. One that failed shows its whole log but the
           # progress lines, so the panic and the input that caused it are both there.
           rc=0
-          for t in frame channel wal blobs erofs; do
+          for t in frame handshake channel wal blobs erofs; do
             if wait "${pid[$t]}"; then
               echo "$t, clean, $(ls "corpus/$t" | wc -l) inputs in the corpus:"
               tail -n 3 "$t.log"
