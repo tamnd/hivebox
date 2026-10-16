@@ -272,7 +272,7 @@ fn checksum(frame: &[u8]) -> [u8; SUM] {
     out
 }
 
-fn encode(buf: &mut Vec<u8>, key: u128, value: Option<&[u8]>) {
+pub(crate) fn encode(buf: &mut Vec<u8>, key: u128, value: Option<&[u8]>) {
     let start = buf.len();
     let body = value.unwrap_or_default();
     let len = u32::try_from(KEY + body.len()).expect("records are capped well below 4 GiB");
@@ -285,7 +285,7 @@ fn encode(buf: &mut Vec<u8>, key: u128, value: Option<&[u8]>) {
 }
 
 /// Applies every whole frame in `raw` and returns the live records and how many bytes were good.
-fn replay(raw: &[u8]) -> (HashMap<u128, Bytes>, usize) {
+pub(crate) fn replay(raw: &[u8]) -> (HashMap<u128, Bytes>, usize) {
     let mut live = HashMap::new();
     let mut at = 0;
     while let Some(rest) = raw.get(at..)

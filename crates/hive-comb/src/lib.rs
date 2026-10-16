@@ -34,3 +34,25 @@ pub use config::{
 };
 pub use drain::{DrainOptions, DrainTotals, Drained, How};
 pub use metrics::Metrics;
+
+/// Entry points for the fuzz targets in `fuzz/`. `cargo fuzz` builds with `--cfg fuzzing`, and nothing else sees these.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz {
+    use bytes::Bytes;
+    use std::collections::HashMap;
+
+    /// The largest record the WAL takes.
+    pub const WAL_MAX_RECORD: usize = crate::wal::MAX_RECORD;
+
+    /// Appends one WAL frame to `buf`, a put if `value` is some and a delete if not.
+    pub fn wal_encode(buf: &mut Vec<u8>, key: u128, value: Option<&[u8]>) {
+        crate::wal::encode(buf, key, value);
+    }
+
+    /// Replays WAL bytes into the live records and how many bytes were good.
+    #[must_use]
+    pub fn wal_replay(raw: &[u8]) -> (HashMap<u128, Bytes>, usize) {
+        crate::wal::replay(raw)
+    }
+}

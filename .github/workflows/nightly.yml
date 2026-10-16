@@ -122,6 +122,64 @@ jobs:
           cat sim-*.txt
           exit $rc
 
+  # libFuzzer on what a hostile guest, a torn disk or a bad image can hand the node: the guest frame
+  # codec and the node end of the channel, WAL replay, the blobs nectar stores and the tar to EROFS
+  # writer. The targets are in fuzz/. Each runs ten minutes, five at once on the runner's four
+  # cores, and the corpus carries over from night to night so each night starts where the last one
+  # stopped. An input that fails is uploaded, and `cargo +nightly fuzz run -a TARGET FILE` replays it.
+  fuzz:
+    name: fuzzing
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fuzz
+          workspaces: fuzz
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      # The cargo-fuzz this installs is a musl build, which would build the targets for musl too,
+      # where the address sanitizer cannot run. So the target is named.
+      - run: cargo +nightly fuzz build -a --target x86_64-unknown-linux-gnu
+        working-directory: fuzz
+      - name: the targets
+        working-directory: fuzz
+        run: |
+          declare -A pid
+          for t in frame channel wal blobs erofs; do
+            cargo +nightly fuzz run -a --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=600 -rss_limit_mb=2048 -timeout=30 > "$t.log" 2>&1 &
+            pid[$t]=$!
+          done
+          # A clean target shows its last lines. One that failed shows its whole log but the
+          # progress lines, so the panic and the input that caused it are both there.
+          rc=0
+          for t in frame channel wal blobs erofs; do
+            if wait "${pid[$t]}"; then
+              echo "$t, clean, $(ls "corpus/$t" | wc -l) inputs in the corpus:"
+              tail -n 3 "$t.log"
+            else
+              rc=1
+              echo "$t failed:"
+              grep -v -E '^#[0-9]+\s+(INITED|NEW|REDUCE|pulse)' "$t.log"
+            fi
+          done
+          exit $rc
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
   # Named so the gap is visible rather than implicit. Each line becomes a real job at the milestone
   # that makes it possible, per spec/13_observability_testing_bench.md and spec/14_roadmap.md.
   planned:
@@ -134,6 +192,5 @@ jobs:
           the driver conformance suite on a KVM capable self-hosted runner         M0
           SWE-bench Verified gold patches through the container tier               M0
           E2B compatibility suite, slime SWE unmodified                            M1
-          fuzzing the guest protocol, the WAL codec and the image parsers          M1
           the escape corpus against every tier and network profile                 M3
           LIST

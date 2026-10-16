@@ -109,6 +109,8 @@ missing_docs = "warn"
 rust_2018_idioms = "warn"
 unreachable_pub = "warn"
 unused_qualifications = "warn"
+# `cargo fuzz` sets `--cfg fuzzing` for the fuzz targets in `fuzz/`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 # The node agent, the page server, the block device and the guest agent all need unsafe, for

@@ -1,0 +1,58 @@
+[package]
+name = "hive-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace, so the main one never builds the fuzz targets and `cargo fuzz` never builds the
+# main one.
+[workspace]
+members = ["."]
+
+[dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
+bytes = "1.12"
+hive-comb = { path = "../crates/hive-comb" }
+hive-nectar = { path = "../crates/hive-nectar" }
+hive-proto = { path = "../crates/hive-proto" }
+libfuzzer-sys = "0.4"
+tokio = { version = "1.53", default-features = false, features = ["io-util", "macros", "rt", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel"
+path = "fuzz_targets/channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal"
+path = "fuzz_targets/wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blobs"
+path = "fuzz_targets/blobs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "erofs"
+path = "fuzz_targets/erofs.rs"
+test = false
+doc = false
+bench = false
