@@ -4,6 +4,10 @@ Notable changes, newest first. The minor version is the number of milestones fin
 
 ## Unreleased
 
+## 0.0.56
+
+The handshake under the fuzzer, and an OCI index read once.
+
 - The nightly fuzzing job has a sixth target, the handshake that opens a guest channel. Fed any bytes as the guest or as the node, the side holding the secret must refuse them. With the secret on both sides, any hello must either fail on both or leave them agreeing on the version, the shared capabilities and the next secret. On a GitHub runner it ran 1,010,736 inputs in ten minutes, alongside the other five, with nothing found.
 - Importing an OCI layout reads each inner index once. An index may name the same inner index many times, and indexes nest four deep, so a layout of a few kilobytes that names one index 64 times at each level made the importer read 64 to the fourth, some 17 million, blobs before reaching the image. On server3 at a load of 53 to 80, a test layout like that imported in 423.11 s on main and in 123 ms with the change. At 16, 24 and 32 names a level, main took 2.60, 8.78 and 28.06 s, and the change 91, 126 and 224 ms.
 
