@@ -263,12 +263,13 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
     };
     // The end of the tar is only known once the parser has read past it, so the copy runs a MiB
     // behind the parser and the end-of-archive blocks are never sent.
-    let mut tee = Tee { from: &mut plain, to: Lagged { out, buf: Vec::new(), sent: 0 } };
+    let to = Lagged { out, buf: Vec::new(), sent: 0 };
+    let mut tee = Tee { from: &mut plain, to, at: 0, skip: Vec::new() };
     let mut dirs = Dirs::new();
     let mut end = 0;
     {
         let mut archive = tar::Archive::new(&mut tee);
-        for entry in archive.entries()? {
+        for entry in archive.entries_with_seek()? {
             let mut entry = entry?;
             let path = clean(&entry.path()?);
             // Every directory above a path is listed in full, so a long one costs the square of
@@ -496,13 +497,41 @@ impl Dirs {
 struct Tee<'a, R: Read + ?Sized, W: Write> {
     from: &'a mut R,
     to: W,
+    /// How many bytes have passed.
+    at: u64,
+    /// What [`Seek`] reads through, kept from one seek to the next.
+    skip: Vec<u8>,
 }
 
 impl<R: Read + ?Sized, W: Write> Read for Tee<'_, R, W> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.from.read(buf)?;
         self.to.write_all(&buf[..n])?;
+        self.at += n as u64;
         Ok(n)
+    }
+}
+
+/// Forward from where it is, by reading through. The tar reader skips what an entry holds with
+/// this when it can, and without it zeroes 32 KiB of stack for every entry.
+impl<R: Read + ?Sized, W: Write> Seek for Tee<'_, R, W> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let SeekFrom::Current(left @ 0..) = to else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "a tee only seeks forward"));
+        };
+        let mut left = left.unsigned_abs();
+        let mut skip = std::mem::take(&mut self.skip);
+        skip.resize(64 << 10, 0);
+        while left > 0 {
+            let want = skip.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            let n = self.read(&mut skip[..want])?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            left -= n as u64;
+        }
+        self.skip = skip;
+        Ok(self.at)
     }
 }
 
