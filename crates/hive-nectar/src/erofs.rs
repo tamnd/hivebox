@@ -12,7 +12,7 @@
 //! `mkfs.erofs` to invent with the time of the build. Owners stay as the image has them, and the node
 //! maps them with an idmapped mount instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -296,7 +296,8 @@ pub fn prepare<W: Write>(src: impl Read, out: W) -> io::Result<W> {
                 }
             }
             end = entry.raw_file_position() + stored.div_ceil(512) * 512;
-            dirs.add(&path, entry.header().entry_type().is_dir());
+            // The type byte itself, as the tar crate reads `\0` as `0` and mkfs.erofs does not.
+            dirs.add(&path, Kind::of(entry.header().as_old().linkflag[0]))?;
         }
     }
     // Whoever hashes `src` needs all of it, padding and anything after the gzip stream too.
@@ -335,10 +336,32 @@ fn clean(path: &Path) -> String {
 /// The longest path [`prepare`] takes, less one, as with the kernel's `PATH_MAX`.
 const PATH_MAX: usize = 4096;
 
+/// What an entry leaves at its path, as `mkfs.erofs` reads its type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Dir,
+    NotDir,
+    /// A type `mkfs.erofs` skips, which is any it does not know, the old `\0` for a file among
+    /// them.
+    Skipped,
+}
+
+impl Kind {
+    const fn of(ty: u8) -> Self {
+        match ty {
+            b'5' => Self::Dir,
+            b'0'..=b'4' | b'6' | b'7' => Self::NotDir,
+            _ => Self::Skipped,
+        }
+    }
+}
+
 /// The directories in a tar, as a tree of names, with whether the tar lists each one and whether
-/// it has anything in it.
+/// it has anything in it, and the names that hold something else, by the directory they are in.
+/// Those are kept apart from the tree, so a directory of one file does not cost a node of a map.
 struct Dirs {
     nodes: Vec<Dir>,
+    others: HashSet<(usize, Box<str>)>,
 }
 
 struct Dir {
@@ -355,35 +378,66 @@ impl Dir {
 
 impl Dirs {
     fn new() -> Self {
-        Self { nodes: vec![Dir::new()] }
+        Self { nodes: vec![Dir::new()], others: HashSet::new() }
     }
 
-    /// Notes an entry at `path`, as [`clean`] has it.
-    fn add(&mut self, path: &str, is_dir: bool) {
+    /// Notes an entry at `path`, as [`clean`] has it. A later entry replaces an earlier one, as
+    /// it does in `mkfs.erofs`, and one that is not a directory takes all that was under the name
+    /// with it, so none of that is listed. An AUFS whiteout is not a directory either.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if the path is under something not a directory, which `mkfs.erofs` fails on
+    /// only after it has made a meta file of 2 TiB, or the entry is a whiteout of no name.
+    fn add(&mut self, path: &str, kind: Kind) -> io::Result<()> {
+        let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{path} {what}"));
         let mut at = 0;
         self.nodes[at].implied = true;
         let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
         while let Some(part) = parts.next() {
-            let last = parts.peek().is_none();
-            if last && !is_dir {
-                break;
-            }
-            at = match self.nodes[at].children.get(part) {
-                Some(&next) => next,
-                None => {
-                    let next = self.nodes.len();
-                    self.nodes.push(Dir::new());
-                    self.nodes[at].children.insert(part.to_owned(), next);
-                    next
-                }
-            };
-            if !last {
+            if parts.peek().is_some() {
+                at = self
+                    .dir(at, part, false)
+                    .ok_or_else(|| bad("is under something not a directory"))?;
                 self.nodes[at].implied = true;
+                continue;
             }
+            let (name, kind) = match part.strip_prefix(".wh.") {
+                _ if kind == Kind::Skipped || part == ".wh..wh..opq" => return Ok(()),
+                Some("") => return Err(bad("is a whiteout of no name")),
+                Some(name) => (name, Kind::NotDir),
+                None => (part, kind),
+            };
+            if kind == Kind::NotDir {
+                self.nodes[at].children.remove(name);
+                self.others.insert((at, name.into()));
+                return Ok(());
+            }
+            at = self.dir(at, name, true).expect("a directory takes the place of anything");
         }
-        if is_dir {
+        if kind == Kind::Dir {
             self.nodes[at].listed = true;
         }
+        Ok(())
+    }
+
+    /// The directory `name` in `at`, made if there is none. Where something else is, it is
+    /// `None`, unless `replace` says a new directory takes its place.
+    fn dir(&mut self, at: usize, name: &str, replace: bool) -> Option<usize> {
+        if let Some(&next) = self.nodes[at].children.get(name) {
+            return Some(next);
+        }
+        let key = (at, Box::<str>::from(name));
+        if self.others.contains(&key) {
+            if !replace {
+                return None;
+            }
+            self.others.remove(&key);
+        }
+        let next = self.nodes.len();
+        self.nodes.push(Dir::new());
+        self.nodes[at].children.insert(key.1.into_string(), next);
+        Some(next)
     }
 
     /// Calls `f` with each directory something is in that the tar does not list, as `./` for the
@@ -691,7 +745,6 @@ mod tests {
             ("a/b/c/", tar::EntryType::Directory),
             ("a/b/f", tar::EntryType::Regular),
             ("a.b/d/e", tar::EntryType::Regular),
-            ("a/b", tar::EntryType::Regular),
             ("z/", tar::EntryType::Directory),
         ] {
             let mut h = tar::Header::new_gnu();
@@ -705,10 +758,60 @@ mod tests {
         let names: Vec<_> = archive
             .entries()
             .unwrap()
-            .skip(7)
+            .skip(6)
             .map(|e| e.unwrap().path().unwrap().display().to_string())
             .collect();
         assert_eq!(names, ["a/", "a-c/", "a.b/", "a.b/d/", "a/b/"]);
+    }
+
+    /// The directories `prepare` adds to a tar of `entries`, each a path and a type.
+    fn added(entries: &[(&str, u8)]) -> io::Result<Vec<String>> {
+        let mut b = tar::Builder::new(Vec::new());
+        for &(name, ty) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.as_old_mut().linkflag = [ty];
+            h.set_mode(0o644);
+            h.set_size(0);
+            b.append_data(&mut h, name, io::empty()).unwrap();
+        }
+        let out = prepare(&b.into_inner().unwrap()[..], Vec::new())?;
+        let mut archive = tar::Archive::new(&out[..]);
+        Ok(archive
+            .entries()
+            .unwrap()
+            .skip(entries.len())
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect())
+    }
+
+    #[test]
+    fn prepare_lists_nothing_under_a_name_a_later_entry_took() {
+        // A file, a whiteout or a link where a directory was takes what was in it, and nothing
+        // in there is listed again, or `mkfs.erofs` would make it with the time it ran.
+        for (ty, name) in [(b'0', "a/b"), (b'0', "a/.wh.b"), (b'2', "a/b"), (b'1', "a/b")] {
+            let got = added(&[("a/b/c/", b'5'), ("a/b/c/d/e", b'0'), (name, ty)]).unwrap();
+            assert_eq!(got, ["./", "a/"], "{name} of type {}", ty as char);
+        }
+        // A directory where a file was is a new one.
+        let got = added(&[("a/b", b'0'), ("a/b/", b'5'), ("a/b/c/d", b'0')]).unwrap();
+        assert_eq!(got, ["./", "a/", "a/b/c/"]);
+        // A type mkfs.erofs skips, the old one for a file among them, takes nothing.
+        let got = added(&[("a/b/c", b'0'), ("a/b", b'\0'), ("a/.wh..wh..opq", b'0')]).unwrap();
+        assert_eq!(got, ["./", "a/", "a/b/"]);
+    }
+
+    #[test]
+    fn prepare_refuses_a_path_under_something_not_a_directory() {
+        for ty in *b"0123467" {
+            let e = added(&[("a/b", ty), ("a/b/c", b'0')]).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "type {}", ty as char);
+        }
+        let e = added(&[("a/.wh.b", b'0'), ("a/b/c/", b'5')]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let e = added(&[("a/.wh.", b'0')]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // Once a directory is there again, what is under it is fine.
+        assert!(added(&[("a/b", b'0'), ("a/b/", b'5'), ("a/b/c", b'0')]).is_ok());
     }
 
     #[test]
