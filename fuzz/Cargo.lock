@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "hive-blockd"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "futures",
  "libc",
@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cell"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "futures",
  "hive-types",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cell-oci"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "futures",
  "hive-cell",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cell-plugin"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "futures",
  "hive-cell",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cell-qemu"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "futures",
  "hive-cell",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cell-wasm"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "bytes",
  "futures",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "hive-comb"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "blake3",
  "bytes",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "hive-drone"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "bytes",
  "futures",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "hive-guard"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "aya",
  "hickory-proto",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "hive-nectar"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "base64",
  "blake3",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "hive-proto"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "blake3",
  "bytes",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "hive-rt"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "futures",
  "getrandom 0.4.3",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "hive-scout"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "blake3",
  "futures",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "hive-telemetry"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "blake3",
  "serde",
@@ -1326,11 +1326,11 @@ dependencies = [
 
 [[package]]
 name = "hive-types"
-version = "0.0.56"
+version = "0.0.57"
 
 [[package]]
 name = "hive-waggle"
-version = "0.0.56"
+version = "0.0.57"
 dependencies = [
  "blake3",
  "hive-types",
