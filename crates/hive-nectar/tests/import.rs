@@ -10,6 +10,8 @@ use hive_nectar::cas::{Chunked, Cuts};
 use hive_nectar::erofs::{Builder, DEFAULT_CHUNK_SIZE, Mkfs, Writer, superblock};
 use hive_nectar::oci::{Importer, Platform, load_manifest};
 use hive_nectar::{BlobStore, Cache, PosixStore};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 struct Scratch(PathBuf);
 
@@ -155,6 +157,53 @@ async fn an_oci_image_is_imported_once_and_fetched_whole() {
         );
     }
     assert_eq!(cache.usage().pinned, held.len());
+}
+
+/// A layout whose index names one inner index many times, and that one the next many times, four
+/// levels down. Walking each inner index every time it is named would read 64 to the fourth, some
+/// 17 million, blobs before the manifest at the end of the top index. Walked once, it is four.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_that_names_one_index_many_times_is_walked_once() {
+    const FAN: usize = 64;
+    const INDEX: &str = "application/vnd.oci.image.index.v1+json";
+    let s = Scratch::new();
+    let layout = s.0.join("layout");
+    let blobs = layout.join("blobs").join("sha256");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let put = |value: serde_json::Value| {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let hex = format!("{:x}", Sha256::digest(&bytes));
+        std::fs::write(blobs.join(&hex), bytes).unwrap();
+        format!("sha256:{hex}")
+    };
+    let index = |list: Vec<serde_json::Value>| json!({ "schemaVersion": 2, "manifests": list });
+
+    let src = s.0.join("rootfs.tar");
+    tar(&src, 1_700_000_000);
+    let bytes = std::fs::read(&src).unwrap();
+    let layer = format!("sha256:{:x}", Sha256::digest(&bytes));
+    std::fs::write(blobs.join(&layer[7..]), bytes).unwrap();
+    let config = put(json!({ "rootfs": { "diff_ids": [layer] } }));
+    let manifest = put(json!({
+        "schemaVersion": 2,
+        "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": config },
+        "layers": [{ "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer }],
+    }));
+    let mut inner = put(index(Vec::new()));
+    for _ in 0..3 {
+        inner = put(index(vec![json!({ "mediaType": INDEX, "digest": inner }); FAN]));
+    }
+    let mut top = vec![json!({ "mediaType": INDEX, "digest": inner }); FAN];
+    let image = "application/vnd.oci.image.manifest.v1+json";
+    top.push(json!({ "mediaType": image, "digest": manifest }));
+    std::fs::write(layout.join("index.json"), serde_json::to_vec(&index(top)).unwrap()).unwrap();
+
+    let store = PosixStore::open(s.0.join("store")).unwrap();
+    let importer = Importer::new(builder(), s.0.join("work")).unwrap();
+    let t = Instant::now();
+    let got = importer.import_layout(&store, &layout, &Platform::default()).await.unwrap();
+    println!("imported through {FAN} to the fourth paths in {:.2?}", t.elapsed());
+    assert_eq!((got.built, got.reused, got.manifest.layers.len()), (1, 0, 1));
 }
 
 /// A tar of `files`, each a name and its bytes.

@@ -6,7 +6,7 @@
 //! are remembered by that digest, so an image that shares a base with one imported before only
 //! builds the layers that are new.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -524,7 +524,8 @@ fn read_image(
 ) -> io::Result<(OciManifest, ConfigFile, Option<String>)> {
     let index: Index = json(&std::fs::read(layout.join("index.json"))?)?;
     let mut source = None;
-    let found = pick(layout, &index, platform, 0, &mut source)?.ok_or_else(|| {
+    let mut walked = HashSet::new();
+    let found = pick(layout, &index, platform, 0, &mut source, &mut walked)?.ok_or_else(|| {
         bad(format!("{} has no image for {}/{}", layout.display(), platform.os, platform.arch))
     })?;
     let manifest: OciManifest = json(&read_blob(layout, &found)?)?;
@@ -533,13 +534,17 @@ fn read_image(
 }
 
 /// Walks an index, and the indexes inside it, for the first manifest that is for `platform`, or
-/// says nothing about platforms, and whose blob is in the layout.
+/// says nothing about platforms, and whose blob is in the layout. Each inner index is walked once,
+/// and `walked` holds the ones that have been. An index may name the same inner index many times,
+/// and over four levels of that, walking each one every time it is named reads millions of blobs
+/// from a layout of a few kilobytes.
 fn pick(
     layout: &Path,
     index: &Index,
     platform: &Platform,
     depth: usize,
     source: &mut Option<String>,
+    walked: &mut HashSet<String>,
 ) -> io::Result<Option<String>> {
     if depth > 4 {
         return Err(bad("indexes nest too deep".into()));
@@ -562,8 +567,11 @@ fn pick(
             continue;
         }
         if INDEX.contains(&d.media_type.as_str()) {
+            if !walked.insert(d.digest.clone()) {
+                continue;
+            }
             let inner: Index = json(&read_blob(layout, &d.digest)?)?;
-            if let Some(found) = pick(layout, &inner, platform, depth + 1, source)? {
+            if let Some(found) = pick(layout, &inner, platform, depth + 1, source, walked)? {
                 return Ok(Some(found));
             }
         } else if MANIFEST.contains(&d.media_type.as_str()) {
